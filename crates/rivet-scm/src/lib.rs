@@ -5,7 +5,10 @@
 //! command. Fetching, checkout, and cleaning are opt-in operations so a
 //! status inspection cannot mutate a developer's working tree by accident.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::process::Command;
@@ -27,6 +30,9 @@ pub struct GitPrepareOptions {
     pub revision: Option<String>,
     pub clean: bool,
     pub clean_ignored: bool,
+    /// Reference resolved by the hosting layer; the secret never enters this
+    /// serializable request object.
+    pub credential_id: Option<String>,
 }
 
 impl Default for GitPrepareOptions {
@@ -37,7 +43,47 @@ impl Default for GitPrepareOptions {
             revision: None,
             clean: false,
             clean_ignored: false,
+            credential_id: None,
         }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct GitHttpCredential {
+    username: String,
+    secret: String,
+}
+
+impl GitHttpCredential {
+    pub fn new(username: impl Into<String>, secret: impl Into<String>) -> Result<Self, ScmError> {
+        let username = username.into();
+        let secret = secret.into();
+        if username.is_empty() {
+            return Err(ScmError::InvalidCredential(
+                "username cannot be empty".into(),
+            ));
+        }
+        if secret.is_empty() {
+            return Err(ScmError::InvalidCredential("secret cannot be empty".into()));
+        }
+        Ok(Self { username, secret })
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn secret(&self) -> &str {
+        &self.secret
+    }
+}
+
+impl fmt::Debug for GitHttpCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitHttpCredential")
+            .field("username", &self.username)
+            .finish_non_exhaustive()
     }
 }
 
@@ -55,6 +101,8 @@ pub enum ScmError {
     },
     #[error("Git {operation} returned invalid UTF-8 output")]
     InvalidOutput { operation: &'static str },
+    #[error("invalid Git credential: {0}")]
+    InvalidCredential(String),
     #[error("filesystem error: {0}")]
     Filesystem(#[from] std::io::Error),
 }
@@ -94,20 +142,25 @@ impl GitRepository {
 
     pub async fn inspect(&self) -> Result<GitSnapshot, ScmError> {
         let revision = self
-            .run(["rev-parse", "--verify", "HEAD"], "inspect revision")
+            .run(["rev-parse", "--verify", "HEAD"], "inspect revision", None)
             .await?
             .stdout_trimmed("inspect revision")?;
         let branch = self
             .run(
                 ["symbolic-ref", "--quiet", "--short", "HEAD"],
                 "inspect branch",
+                None,
             )
             .await
             .ok()
             .and_then(|output| output.stdout_trimmed("inspect branch").ok())
             .filter(|value| !value.is_empty());
         let remote = self
-            .run(["config", "--get", "remote.origin.url"], "inspect remote")
+            .run(
+                ["config", "--get", "remote.origin.url"],
+                "inspect remote",
+                None,
+            )
             .await
             .ok()
             .and_then(|output| output.stdout_trimmed("inspect remote").ok())
@@ -116,6 +169,7 @@ impl GitRepository {
             .run(
                 ["status", "--porcelain=v1", "--untracked-files=all"],
                 "inspect status",
+                None,
             )
             .await?
             .stdout_text("inspect status")?;
@@ -136,15 +190,23 @@ impl GitRepository {
     }
 
     pub async fn fetch(&self, remote: &str) -> Result<(), ScmError> {
+        self.fetch_with_credential(remote, None).await
+    }
+
+    pub async fn fetch_with_credential(
+        &self,
+        remote: &str,
+        credential: Option<&GitHttpCredential>,
+    ) -> Result<(), ScmError> {
         validate_argument(remote, "remote")?;
-        self.run(["fetch", "--prune", remote], "fetch")
+        self.run(["fetch", "--prune", remote], "fetch", credential)
             .await
             .map(|_| ())
     }
 
     pub async fn checkout(&self, revision: &str) -> Result<(), ScmError> {
         validate_argument(revision, "revision")?;
-        self.run(["checkout", "--detach", revision], "checkout")
+        self.run(["checkout", "--detach", revision], "checkout", None)
             .await
             .map(|_| ())
     }
@@ -155,12 +217,21 @@ impl GitRepository {
         } else {
             ["clean", "-fd"]
         };
-        self.run(args, "clean").await.map(|_| ())
+        self.run(args, "clean", None).await.map(|_| ())
     }
 
     pub async fn prepare(&self, options: &GitPrepareOptions) -> Result<GitSnapshot, ScmError> {
+        self.prepare_with_credential(options, None).await
+    }
+
+    pub async fn prepare_with_credential(
+        &self,
+        options: &GitPrepareOptions,
+        credential: Option<&GitHttpCredential>,
+    ) -> Result<GitSnapshot, ScmError> {
         if options.fetch {
-            self.fetch(&options.remote).await?;
+            self.fetch_with_credential(&options.remote, credential)
+                .await?;
         }
         if let Some(revision) = options.revision.as_deref() {
             self.checkout(revision).await?;
@@ -175,15 +246,18 @@ impl GitRepository {
         &self,
         args: [&str; N],
         operation: &'static str,
+        credential: Option<&GitHttpCredential>,
     ) -> Result<GitCommandOutput, ScmError> {
         let output = Command::new("git")
             .args(args)
             .current_dir(&self.root)
+            .envs(git_auth_environment(credential))
             .output()
             .await
             .map_err(ScmError::Filesystem)?;
         if !output.status.success() {
-            let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let message =
+                redact_credential(String::from_utf8_lossy(&output.stderr).trim(), credential);
             return Err(ScmError::Command {
                 operation,
                 code: output.status.code(),
@@ -221,6 +295,34 @@ impl GitCommandOutput {
     fn stdout_trimmed(&self, operation: &'static str) -> Result<String, ScmError> {
         Ok(self.stdout_text(operation)?.trim().to_owned())
     }
+}
+
+fn git_auth_environment(credential: Option<&GitHttpCredential>) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::new();
+    let Some(credential) = credential else {
+        return environment;
+    };
+    let encoded = STANDARD.encode(format!("{}:{}", credential.username, credential.secret));
+    environment.insert("GIT_CONFIG_COUNT".into(), "2".into());
+    environment.insert("GIT_CONFIG_KEY_0".into(), "http.extraHeader".into());
+    environment.insert(
+        "GIT_CONFIG_VALUE_0".into(),
+        format!("Authorization: Basic {encoded}"),
+    );
+    environment.insert("GIT_CONFIG_KEY_1".into(), "credential.helper".into());
+    environment.insert("GIT_CONFIG_VALUE_1".into(), String::new());
+    environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+    environment
+}
+
+fn redact_credential(message: &str, credential: Option<&GitHttpCredential>) -> String {
+    let Some(credential) = credential else {
+        return message.to_owned();
+    };
+    let encoded = STANDARD.encode(format!("{}:{}", credential.username, credential.secret));
+    message
+        .replace(&credential.secret, "[redacted]")
+        .replace(&encoded, "[redacted]")
 }
 
 fn parse_stdout(operation: &'static str, stdout: &[u8]) -> Result<String, ScmError> {
@@ -330,6 +432,7 @@ mod tests {
             .prepare(&GitPrepareOptions {
                 revision: Some(first_revision.clone()),
                 clean: true,
+                credential_id: None,
                 ..GitPrepareOptions::default()
             })
             .await
@@ -347,5 +450,43 @@ mod tests {
             GitRepository::open(dir.path()).await,
             Err(ScmError::NotGitRepository(_))
         ));
+    }
+
+    #[test]
+    fn builds_ephemeral_git_auth_and_redacts_secret_material() {
+        let credential =
+            GitHttpCredential::new("oauth2", "fixture-token-value").expect("credential");
+        let environment = git_auth_environment(Some(&credential));
+        let encoded = STANDARD.encode("oauth2:fixture-token-value");
+
+        assert_eq!(
+            environment.get("GIT_CONFIG_COUNT").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            environment.get("GIT_CONFIG_KEY_0").map(String::as_str),
+            Some("http.extraHeader")
+        );
+        assert_eq!(
+            environment.get("GIT_CONFIG_KEY_1").map(String::as_str),
+            Some("credential.helper")
+        );
+        assert_eq!(
+            environment.get("GIT_CONFIG_VALUE_0").map(String::as_str),
+            Some(format!("Authorization: Basic {encoded}").as_str())
+        );
+        assert_eq!(
+            environment.get("GIT_TERMINAL_PROMPT").map(String::as_str),
+            Some("0")
+        );
+
+        let redacted = redact_credential(
+            &format!("server rejected fixture-token-value ({encoded})"),
+            Some(&credential),
+        );
+        assert!(!redacted.contains("fixture-token-value"));
+        assert!(!redacted.contains(&encoded));
+        assert!(redacted.contains("[redacted]"));
+        assert!(!format!("{credential:?}").contains("fixture-token-value"));
     }
 }
