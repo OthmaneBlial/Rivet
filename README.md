@@ -1,8 +1,18 @@
 # Rivet
 
 Rivet is a Rust-first CI/CD automation platform being built independently
-from Jenkins. Jenkins is kept under `base/jenkins/` as a local behavioral and
-architectural reference only; that directory is intentionally ignored by Git.
+from Jenkins.
+
+## Delivery progress
+
+**29% verified** · `██████░░░░░░░░░░░░`<br>
+Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
+not against a claim of Jenkins feature parity. The percentage only counts
+behavior backed by current tests or an exercised local workflow; incomplete
+and unverified work remains at zero until it passes its gate.
+
+Last verified update: **2026-09-13** · native pipeline execution, FIFO queue,
+SQLite history, CLI workflow, and headless API milestone.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -21,7 +31,6 @@ crates/
   rivet-cli/        local operator interface and first runnable slice
 apps/desktop/       Tauri client (next vertical slice)
 compat/             measured Jenkins/Rivet compatibility data
-base/jenkins/       ignored local reference checkout
 ```
 
 ## Validate the current slice
