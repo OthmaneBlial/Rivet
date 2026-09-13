@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **56 / 100 points**.
+The current verified total is **58 / 100 points**.
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
@@ -18,7 +18,7 @@ The current verified total is **56 / 100 points**.
 | CLI operator workflow | 3 | partial | project/run/history, parameterized builds, artifact listing, retry, and schedule management work; richer cancellation and inspection remain |
 | Tauri desktop control room | 10 | partial | native bundle, embedded engine health, rendered light-default/dark-toggle UX, artifact/retry views, schedule controls, online/offline recovery, and real client build flow pass; final Tauri-window flow remains |
 | Git/SCM integration | 8 | partial | direct Git inspect/checkout/fetch/clean operations, REST/CLI surfaces, explicit build-admission preparation, and persisted build source identity pass; credentials and provider hooks remain |
-| Triggers and scheduling | 5 | partial | manual/API entry points plus validated persistent UTC cron schedules and server dispatch pass; webhooks, repository events, and upstream triggers remain |
+| Triggers and scheduling | 5 | partial | manual/API entry points, validated persistent UTC cron schedules/server dispatch, and signed generic webhook delivery pass; provider repository events and upstream triggers remain |
 | Remote agents | 10 | planned | authenticated versioned protocol, heartbeat, assignment, reconnect, failure handling |
 | Container execution | 4 | planned | isolated Docker mode with cleanup, timeout, cancellation, artifact extraction |
 | Artifacts | 4 | partial | local workspace collection, upload/download, checksums, metadata, and a storage boundary pass; retention and remote backends remain |
@@ -38,6 +38,6 @@ by evidence, and “verified” receives the full workstream weight. A local bui
 scaffold, passing unrelated test, or interface alone does not complete a gate.
 
 The next gates are the final Tauri-window flow inside the packaged app, API
-deployment hardening, the SCM credential/provider boundary, and webhook
-verification: add provider hooks and test clean checkout behavior without
-exposing credentials to logs or persisted state.
+deployment hardening, the SCM credential/provider boundary, and provider
+webhook adapters/repository-event mapping. Test clean checkout behavior
+without exposing credentials to logs or persisted state.

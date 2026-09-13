@@ -74,14 +74,21 @@
       "feature": "Git checkout and webhooks",
       "status": "partial",
       "evidence": ["crates/rivet-scm/src/lib.rs", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
-      "notes": "Explicit local fetch, detached revision checkout, and clean preparation are supported at build admission; provider credentials and webhooks remain planned."
+      "notes": "Explicit local fetch, detached revision checkout, and clean preparation are supported at build admission; provider credentials and provider-specific webhook adapters remain planned."
     },
     {
       "category": "Triggers",
       "feature": "Manual/API builds and persistent UTC cron schedules",
       "status": "partial",
       "evidence": ["crates/rivet-core/src/schedule.rs", "crates/rivet-storage/migrations/006_schedules.sql", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
-      "notes": "Five-field cron expressions are validated, persisted, atomically claimed, dispatched into real builds, and exposed through API, CLI, and desktop controls; webhook, repository-event, and upstream triggers remain planned."
+      "notes": "Five-field cron expressions are validated, persisted, atomically claimed, dispatched into real builds, and exposed through API, CLI, and desktop controls; provider repository-event and upstream trigger mapping remain planned."
+    },
+    {
+      "category": "Triggers",
+      "feature": "Signed generic webhook delivery",
+      "status": "partial",
+      "evidence": ["crates/rivet-server/src/lib.rs", "crates/rivet-storage/migrations/007_webhook_deliveries.sql", "crates/rivet-cli/src/main.rs"],
+      "notes": "The generic endpoint verifies HMAC-SHA256 over the raw request body, atomically deduplicates event IDs, and queues one real build; provider-specific payload adapters and repository-event mapping remain planned."
     },
     {
       "category": "Agents",

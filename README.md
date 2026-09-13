@@ -5,7 +5,7 @@ from Jenkins.
 
 ## Delivery progress
 
-**56% verified** · `███████████▍░░░░░░░░`<br>
+**58% verified** · `███████████▋░░░░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -18,8 +18,8 @@ event replay, quiet engine offline recovery, explicit Git preparation at build
 admission, parameterized builds, local artifact storage, protected server
 transport, build retry, pre-execution queue cancellation, build artifact
 downloads, and a light-default desktop theme with an accessible dark-mode
-toggle, persistent UTC cron schedules, server dispatch, and desktop schedule
-controls milestone.
+toggle, persistent UTC cron schedules, server dispatch, desktop schedule
+controls, and signed generic webhook delivery with idempotent redelivery.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -46,6 +46,9 @@ compat/             measured Jenkins/Rivet compatibility data
 cargo test --workspace
 cargo fmt --all -- --check
 ```
+
+Validation is intentionally local for this repository; there is no GitHub
+Actions workflow to consume hosted CI minutes.
 
 ## Run a local build
 
@@ -95,6 +98,34 @@ operation for fetch/checkout/clean workflows. The server returns
 fetching, revision checkout, and workspace cleaning; the default remains
 inspection-only. Clients read durable state from the build resource and
 subscribe to live events separately.
+
+Generic webhook delivery is available at `POST /api/v1/webhooks/generic`. The
+server verifies `X-Rivet-Signature: sha256=<hex HMAC-SHA256 of the raw body>`
+before accepting this payload shape:
+
+```json
+{
+  "event_id": "provider-delivery-123",
+  "project": "rivet",
+  "revision": "main",
+  "remote": "origin",
+  "fetch": true,
+  "parameters": { "TARGET": "release" }
+}
+```
+
+Configure the signing key through a private file; Rivet trims the file's final
+newline, keeps the value in memory, and never stores or prints it:
+
+```sh
+chmod 600 /secure/path/rivet.webhook.secret
+cargo run -p rivet -- --data-dir .rivet server \
+  --webhook-secret-file /secure/path/rivet.webhook.secret
+```
+
+The same `event_id` can be retried safely: the first request queues one build,
+and later deliveries return a deduplicated response without creating another
+build. A non-loopback server still requires the separate Bearer token.
 
 The CLI exposes the same explicit SCM boundary, for example:
 
