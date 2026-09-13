@@ -5,8 +5,8 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **86 / 100 points** (**86.31 weighted evidence
-points**, displayed conservatively as 85%).
+The current verified total is **86 / 100 points** (**86.91 weighted evidence
+points**, displayed conservatively as 86%).
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
@@ -29,7 +29,7 @@ points**, displayed conservatively as 85%).
 | Extension protocol | 4 | partial | versioned manifest, WASM/subprocess kind model, declared permission vocabulary, bounded length-prefixed JSON framing, direct-argument subprocess host, bounded local catalog discovery/API, desktop extension model, and a root-confined subprocess lifecycle manager with per-request permission enforcement pass; WASM runtime and server/desktop lifecycle UI remain |
 | Jenkins migration analyzer | 3 | partial | bounded Jenkinsfile analysis, headless API delivery, rendered desktop report, and valid drafts for deterministic quoted shell steps pass; full Groovy parsing, plugin semantics, and broad generated Rivetfile conversion remain |
 | Differential compatibility harness | 2 | partial | bounded JSON snapshots, explicit semantic normalization/comparison, mismatch exit status, and a checked-in regression fixture pass; live Jenkins/Rivet capture adapters and a permanent live regression corpus remain |
-| Release and operations | 2 | planned | packaging, observability, upgrades, recovery, security and load gates |
+| Release and operations | 2 | partial | local release gate, optimized CLI artifact, desktop web/native checks, and versioned SHA-256 manifest pass; signed installers, observability, upgrades, recovery, security, and load gates remain |
 
 ## Progress policy
 

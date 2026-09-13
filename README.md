@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **86% verified** · `██████████████████░░`<br>
-Weighted evidence score: **86.31 / 100** · displayed conservatively as the
+Weighted evidence score: **86.91 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -47,6 +47,18 @@ the same remote attempt after restart and richer retry policy remain future
 gates. Authenticated deployments persist bounded success/failure audit records
 without request bodies or Bearer values and expose them only to administrators;
 user sessions and external identity providers remain future gates.
+
+The repository includes a local-only release gate. It runs the workspace tests,
+builds the optimized CLI, builds the desktop web client, checks the native
+Tauri host, copies the CLI into a temporary release directory, and writes a
+versioned SHA-256 manifest:
+
+```sh
+./scripts/local-release-check.sh
+```
+
+This produces a locally verifiable artifact, not a signed installer, store
+submission, or hosted CI result.
 
 Rivet's extension surface is intentionally a separate, versioned contract.
 `rivet-extension-protocol` validates WASM or direct-subprocess manifests,

@@ -3032,6 +3032,7 @@ dependencies = [
 name = "rivet-auth"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "getrandom 0.3.4",
  "hex",
  "serde",
@@ -3077,6 +3078,17 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tokio",
+]
+
+[[package]]
+name = "rivet-extension-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -3132,6 +3144,7 @@ dependencies = [
  "rivet-auth",
  "rivet-core",
  "rivet-credentials",
+ "rivet-extension-protocol",
  "rivet-migration",
  "rivet-runner",
  "rivet-scm",
