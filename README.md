@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.64 / 100** · displayed conservatively as the
+Weighted evidence score: **92.67 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -295,8 +295,9 @@ Only `.json` regular files are considered. Manifests are validated for
 protocol version, relative entrypoint, unique ID, and declared permissions;
 the catalog does not execute or auto-grant an extension.
 
-The versioned API currently exposes health, projects, queued builds, build
-details, persisted logs, cancellation, a live queue snapshot, durable replay,
+The versioned API currently exposes public liveness at `/api/v1/health` and a
+public SQLite-backed readiness probe at `/api/v1/ready`, plus projects, queued
+builds, build details, persisted logs, cancellation, a live queue snapshot, durable replay,
 and a per-build WebSocket event stream under `/api/v1/`. It also exposes
 persisted UTC cron schedules with create/list/pause/resume/delete operations,
 automatic server dispatch, Git repository inspection, and an explicit prepare

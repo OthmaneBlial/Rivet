@@ -396,6 +396,13 @@ impl Storage {
         self.cache_root.as_ref().clone()
     }
 
+    /// Run a read-only probe used by deployment readiness checks.
+    pub fn health_check(&self) -> Result<(), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        connection.query_row("SELECT 1", [], |_| Ok(()))?;
+        Ok(())
+    }
+
     pub fn create_project(
         &self,
         project: &Project,

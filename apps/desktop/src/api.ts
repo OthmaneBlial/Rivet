@@ -46,6 +46,13 @@ export interface HealthResponse {
   timestamp: string;
 }
 
+export interface ReadinessResponse {
+  status: string;
+  service: string;
+  storage: string;
+  timestamp: string;
+}
+
 export interface ScmPrepareOptions {
   remote?: string;
   fetch?: boolean;
@@ -154,6 +161,10 @@ function createRequestId(): string {
 
 export function health(): Promise<HealthResponse> {
   return request<HealthResponse>("/api/v1/health");
+}
+
+export function readiness(): Promise<ReadinessResponse> {
+  return request<ReadinessResponse>("/api/v1/ready");
 }
 
 export function projects(): Promise<Project[]> {

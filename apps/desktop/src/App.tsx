@@ -25,6 +25,7 @@ import {
   projects,
   queueStats as fetchQueueStats,
   queueBuild,
+  readiness,
   retryBuild,
   resumeQueue,
   startExtension,
@@ -200,6 +201,7 @@ function App() {
 
   const loadProjects = useCallback(async () => {
     try {
+      await readiness();
       const result = await projects();
       setProjectsList(result);
       setProjectName((current) => current || result[0]?.name || "");

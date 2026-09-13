@@ -393,6 +393,14 @@ struct HealthResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct ReadinessResponse {
+    status: &'static str,
+    service: &'static str,
+    storage: &'static str,
+    timestamp: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
 struct AuthMeResponse {
     id: String,
     role: rivet_auth::Role,
@@ -566,6 +574,7 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
     let cors = cors_layer(allowed_origins)?;
     Ok(Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/ready", get(readiness))
         .route("/api/v1/auth/me", get(auth_me))
         .route("/api/v1/auth/sessions", post(create_session))
         .route(
@@ -1308,7 +1317,7 @@ async fn authenticate(
         request.extensions_mut().insert(Principal::local_admin());
         return next.run(request).await;
     }
-    if request.uri().path() == "/api/v1/health" {
+    if matches!(request.uri().path(), "/api/v1/health" | "/api/v1/ready") {
         return next.run(request).await;
     }
     let principal = request
@@ -1456,6 +1465,34 @@ async fn health() -> Json<HealthResponse> {
         service: "rivet-server",
         timestamp: Utc::now(),
     })
+}
+
+async fn readiness(State(state): State<AppState>) -> Response {
+    match state.storage.health_check() {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ReadinessResponse {
+                status: "ready",
+                service: "rivet-server",
+                storage: "ok",
+                timestamp: Utc::now(),
+            }),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(?error, "Rivet readiness storage probe failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ReadinessResponse {
+                    status: "not_ready",
+                    service: "rivet-server",
+                    storage: "unavailable",
+                    timestamp: Utc::now(),
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn analyze_jenkinsfile(
@@ -4834,6 +4871,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readiness_route_probes_storage_without_exposing_details() {
+        let app = router(AppState::new(Storage::open_in_memory().expect("storage")));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/ready")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 8 * 1024)
+                .await
+                .expect("body"),
+        )
+        .expect("JSON");
+        assert_eq!(payload["status"], "ready");
+        assert_eq!(payload["service"], "rivet-server");
+        assert_eq!(payload["storage"], "ok");
+        assert!(payload.get("error").is_none());
+    }
+
+    #[tokio::test]
     async fn request_id_is_propagated_or_safely_regenerated() {
         let app = router(AppState::new(Storage::open_in_memory().expect("storage")));
         let response = app
@@ -6306,6 +6368,21 @@ agent = { os = "macos", arch = "aarch64", labels = ["recovery"] }
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let readiness = router(AppState::with_token(
+            Storage::open_in_memory().expect("storage"),
+            "rivet-test-token",
+        ));
+        let response = readiness
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/ready")
                     .body(Body::empty())
                     .expect("request"),
             )
