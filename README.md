@@ -5,7 +5,7 @@ from Jenkins.
 
 ## Delivery progress
 
-**39% verified** · `███████░░░░░░░░░░░`<br>
+**40% verified** · `████████░░░░░░░░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -13,7 +13,7 @@ and unverified work remains at zero until it passes its gate.
 
 Last verified update: **2026-09-13** · native pipeline execution, FIFO queue,
 SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
-inspection milestone.
+inspection plus persisted build-source identity milestone.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -54,8 +54,9 @@ cargo run -p rivet -- logs rivet --build 1
 ```
 
 The build command uses the Rust queue, real child processes, live event
-projection, and SQLite history. Press Ctrl-C during a running step to exercise
-the cancellation path.
+projection, and SQLite history. For Git repositories, the build record also
+captures the commit, reference, remote, and dirty state observed at admission.
+Press Ctrl-C during a running step to exercise the cancellation path.
 
 ## Run headless
 

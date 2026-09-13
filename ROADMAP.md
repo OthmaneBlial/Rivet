@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **39 / 100 points**.
+The current verified total is **40 / 100 points**.
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
@@ -17,7 +17,7 @@ The current verified total is **39 / 100 points**.
 | API and live transport | 6 | partial | REST/loopback WebSocket work; auth, replay, and deployment hardening remain |
 | CLI operator workflow | 3 | partial | project/run/history work; richer cancellation and inspection remain |
 | Tauri desktop control room | 10 | partial | native bundle, embedded engine health, rendered UX and real client build flow pass; final Tauri-window flow remains |
-| Git/SCM integration | 8 | partial | direct Git inspect/checkout/fetch/clean operations and REST/CLI surfaces pass; credentials, provider hooks, and build identity remain |
+| Git/SCM integration | 8 | partial | direct Git inspect/checkout/fetch/clean operations, REST/CLI surfaces, and persisted build source identity pass; credentials and provider hooks remain |
 | Triggers and scheduling | 5 | planned | manual, webhook, API, cron, upstream triggers with deterministic tests |
 | Remote agents | 10 | planned | authenticated versioned protocol, heartbeat, assignment, reconnect, failure handling |
 | Container execution | 4 | planned | isolated Docker mode with cleanup, timeout, cancellation, artifact extraction |

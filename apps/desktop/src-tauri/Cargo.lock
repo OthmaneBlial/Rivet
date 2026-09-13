@@ -2725,6 +2725,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rivet-scm"
+version = "0.1.0"
+dependencies = [
+ "rivet-core",
+ "serde",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "rivet-server"
 version = "0.1.0"
 dependencies = [
@@ -2733,6 +2743,7 @@ dependencies = [
  "futures-util",
  "rivet-core",
  "rivet-runner",
+ "rivet-scm",
  "rivet-storage",
  "serde",
  "serde_json",
