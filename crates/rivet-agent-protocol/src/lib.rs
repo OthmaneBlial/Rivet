@@ -236,6 +236,17 @@ pub enum AgentMessage {
         protocol_version: u16,
         build_id: BuildId,
     },
+    ArtifactsReady {
+        protocol_version: u16,
+        build_id: BuildId,
+        transfer: WorkspaceTransfer,
+    },
+    ArtifactChunk {
+        protocol_version: u16,
+        build_id: BuildId,
+        sequence: u32,
+        data: Vec<u8>,
+    },
     Event {
         protocol_version: u16,
         event: BuildEvent,
@@ -289,6 +300,12 @@ impl AgentMessage {
             | Self::WorkspaceReady {
                 protocol_version, ..
             }
+            | Self::ArtifactsReady {
+                protocol_version, ..
+            }
+            | Self::ArtifactChunk {
+                protocol_version, ..
+            }
             | Self::Event {
                 protocol_version, ..
             }
@@ -308,7 +325,10 @@ impl AgentMessage {
         }
         .and_then(|()| match self {
             Self::Assign { workspace, .. } => workspace.validate(),
-            Self::WorkspaceChunk { data, .. } if data.len() > MAX_WORKSPACE_CHUNK_BYTES => {
+            Self::ArtifactsReady { transfer, .. } => transfer.validate(),
+            Self::WorkspaceChunk { data, .. } | Self::ArtifactChunk { data, .. }
+                if data.len() > MAX_WORKSPACE_CHUNK_BYTES =>
+            {
                 Err(ProtocolError::WorkspaceChunkTooLarge)
             }
             _ => Ok(()),
@@ -334,6 +354,12 @@ impl AgentMessage {
                 protocol_version, ..
             }
             | Self::WorkspaceReady {
+                protocol_version, ..
+            }
+            | Self::ArtifactsReady {
+                protocol_version, ..
+            }
+            | Self::ArtifactChunk {
                 protocol_version, ..
             }
             | Self::Event {

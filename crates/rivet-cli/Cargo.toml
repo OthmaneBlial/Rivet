@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
+globset.workspace = true
 hex.workspace = true
 futures-util = "0.3"
 rivet-core = { path = "../rivet-core" }
@@ -27,3 +28,4 @@ tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "sig
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = "0.29"
 uuid.workspace = true
+walkdir.workspace = true

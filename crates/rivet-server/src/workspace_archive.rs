@@ -1,8 +1,12 @@
 use rivet_agent_protocol::WorkspaceTransfer;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs;
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use tar::Builder;
+use tar::{Archive, Builder};
 use thiserror::Error;
 use walkdir::{DirEntry, WalkDir};
 
@@ -29,6 +33,14 @@ pub enum WorkspaceArchiveError {
     TooLarge,
     #[error("could not create workspace archive: {0}")]
     Archive(#[from] std::io::Error),
+    #[error("workspace archive path is unsafe: {0}")]
+    UnsafeArchivePath(PathBuf),
+    #[error("workspace archive contains an unsupported entry: {0}")]
+    UnsupportedArchiveEntry(PathBuf),
+    #[error("workspace archive contains a duplicate entry: {0}")]
+    DuplicateArchivePath(PathBuf),
+    #[error("workspace archive contains {actual} entries; expected {expected}")]
+    EntryCountMismatch { actual: u32, expected: u32 },
 }
 
 pub fn archive_workspace(root: &Path) -> Result<WorkspaceArchive, WorkspaceArchiveError> {
@@ -93,6 +105,75 @@ pub fn archive_workspace(root: &Path) -> Result<WorkspaceArchive, WorkspaceArchi
     Ok(WorkspaceArchive { bytes, transfer })
 }
 
+#[cfg(test)]
+fn extract_archive(
+    bytes: &[u8],
+    destination: &Path,
+    expected_entries: u32,
+) -> Result<(), WorkspaceArchiveError> {
+    extract_archive_reader(Cursor::new(bytes), destination, expected_entries)
+}
+
+pub fn extract_archive_file(
+    archive_path: &Path,
+    destination: &Path,
+    expected_entries: u32,
+) -> Result<(), WorkspaceArchiveError> {
+    let file = fs::File::open(archive_path)?;
+    extract_archive_reader(file, destination, expected_entries)
+}
+
+fn extract_archive_reader<R: Read>(
+    reader: R,
+    destination: &Path,
+    expected_entries: u32,
+) -> Result<(), WorkspaceArchiveError> {
+    fs::create_dir_all(destination)?;
+    let mut archive = Archive::new(reader);
+    let mut entries = 0_u32;
+    let mut seen = HashSet::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        entries = entries.saturating_add(1);
+        if entries > MAX_ARCHIVE_ENTRIES {
+            return Err(WorkspaceArchiveError::TooManyEntries);
+        }
+        let relative = entry.path()?.into_owned();
+        if !is_safe_archive_path(&relative) {
+            return Err(WorkspaceArchiveError::UnsafeArchivePath(relative));
+        }
+        if !seen.insert(relative.clone()) {
+            return Err(WorkspaceArchiveError::DuplicateArchivePath(relative));
+        }
+        let target = destination.join(&relative);
+        if entry.header().entry_type().is_dir() {
+            fs::create_dir_all(target)?;
+        } else if entry.header().entry_type().is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            entry.unpack(target)?;
+        } else {
+            return Err(WorkspaceArchiveError::UnsupportedArchiveEntry(relative));
+        }
+    }
+    if entries != expected_entries {
+        return Err(WorkspaceArchiveError::EntryCountMismatch {
+            actual: entries,
+            expected: expected_entries,
+        });
+    }
+    Ok(())
+}
+
+fn is_safe_archive_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
 fn is_internal_entry(entry: &DirEntry, root: &Path) -> bool {
     if entry.path() == root {
         return false;
@@ -154,6 +235,27 @@ mod tests {
         assert!(matches!(
             archive_workspace(directory.path()),
             Err(WorkspaceArchiveError::SymbolicLink(path)) if path == Path::new("link.txt")
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_archive_entries() {
+        let destination = tempdir().expect("destination");
+        let mut bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("link.txt").expect("path");
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_link_name("outside.txt").expect("link");
+            header.set_size(0);
+            header.set_cksum();
+            builder.append(&header, &b""[..]).expect("symlink entry");
+            builder.finish().expect("finish");
+        }
+        assert!(matches!(
+            extract_archive(&bytes, destination.path(), 1),
+            Err(WorkspaceArchiveError::UnsupportedArchiveEntry(path)) if path == Path::new("link.txt")
         ));
     }
 }

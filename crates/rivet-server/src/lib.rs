@@ -15,7 +15,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use rivet_agent_protocol::{
-    AgentMessage, AgentRequirements, MAX_WORKSPACE_CHUNK_BYTES, PROTOCOL_VERSION,
+    AgentMessage, AgentRequirements, MAX_WORKSPACE_CHUNK_BYTES, PROTOCOL_VERSION, WorkspaceTransfer,
 };
 use rivet_core::{
     BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, Pipeline, Project, ScheduleId,
@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::time::{Duration, MissedTickBehavior};
@@ -829,6 +830,8 @@ async fn dispatch_agent_message(
         }
         AgentMessage::AssignmentAccepted { build_id, .. }
         | AgentMessage::WorkspaceReady { build_id, .. }
+        | AgentMessage::ArtifactsReady { build_id, .. }
+        | AgentMessage::ArtifactChunk { build_id, .. }
         | AgentMessage::Log { build_id, .. }
         | AgentMessage::Finished { build_id, .. } => {
             route_agent_build_message(state, lease.agent_id, build_id, message).await?;
@@ -1451,7 +1454,7 @@ async fn enqueue_project_build(
                 remote_state.clone(),
                 reservation.clone(),
                 plan,
-                pipeline,
+                pipeline.clone(),
                 remote_workspace.expect("remote workspace was resolved"),
                 parameters,
                 cancellation,
@@ -1468,6 +1471,9 @@ async fn enqueue_project_build(
                         timestamp: Utc::now(),
                     })
                     .await;
+            }
+            if let Err(error) = cleanup_remote_artifact_root(reservation.build_id) {
+                tracing::warn!(?error, build_id = %reservation.build_id, "could not clean remote artifact staging");
             }
             remote_state
                 .remote_messages
@@ -1547,6 +1553,18 @@ enum RemoteBuildError {
     UnsupportedMessage(BuildId),
     #[error("remote operation cancelled")]
     Cancelled,
+    #[error("remote artifact transfer failed: {0}")]
+    Artifact(String),
+}
+
+struct RemoteArtifactReceiver {
+    transfer: WorkspaceTransfer,
+    archive_path: PathBuf,
+    extraction_root: PathBuf,
+    file: tokio::fs::File,
+    digest: Sha256,
+    received_bytes: u64,
+    expected_sequence: u32,
 }
 
 async fn run_remote_build(
@@ -1564,6 +1582,9 @@ async fn run_remote_build(
     let mut ready = false;
     let mut active_stages = HashSet::new();
     let mut active_steps = HashSet::new();
+    let artifact_pipeline = pipeline.clone();
+    let mut artifact_receiver = None;
+    let mut artifacts_complete = artifact_pipeline.artifacts.is_empty();
     let archive_task = tokio::task::spawn_blocking(move || archive_workspace(&workspace));
     let archive = tokio::select! {
         result = archive_task => match result {
@@ -1592,7 +1613,7 @@ async fn run_remote_build(
         build_id: plan.build_id,
         project_id: plan.project_id,
         plan: plan.clone(),
-        pipeline,
+        pipeline: pipeline.clone(),
         parameters,
         workspace: archive.transfer,
     };
@@ -1693,10 +1714,110 @@ async fn run_remote_build(
                         }
                         ready = true;
                     }
+                    AgentMessage::ArtifactsReady { build_id, transfer, .. }
+                        if build_id == plan.build_id =>
+                    {
+                        if !ready
+                            || artifact_pipeline.artifacts.is_empty()
+                            || artifact_receiver.is_some()
+                            || artifacts_complete
+                        {
+                            return Err(RemoteBuildError::InvalidEvent {
+                                build_id: plan.build_id,
+                                reason: "artifact transfer arrived in an invalid state".into(),
+                            });
+                        }
+                        let receiver = start_remote_artifact_receiver(build_id, transfer).await?;
+                        if receiver.transfer.total_bytes == 0 {
+                            complete_remote_artifacts(
+                                &state,
+                                receiver,
+                                &artifact_pipeline,
+                                build_id,
+                            )
+                            .await?;
+                            artifacts_complete = true;
+                        } else {
+                            artifact_receiver = Some(receiver);
+                        }
+                    }
+                    AgentMessage::ArtifactChunk {
+                        build_id,
+                        sequence,
+                        data,
+                        ..
+                    } if build_id == plan.build_id => {
+                        let Some(receiver) = artifact_receiver.as_mut() else {
+                            return Err(RemoteBuildError::InvalidEvent {
+                                build_id: plan.build_id,
+                                reason: "artifact chunk arrived without an artifact transfer"
+                                    .into(),
+                            });
+                        };
+                        if sequence != receiver.expected_sequence {
+                            return Err(RemoteBuildError::InvalidEvent {
+                                build_id: plan.build_id,
+                                reason: format!(
+                                    "artifact chunk sequence {sequence} arrived; expected {}",
+                                    receiver.expected_sequence
+                                ),
+                            });
+                        }
+                        receiver.received_bytes = receiver
+                            .received_bytes
+                            .checked_add(data.len() as u64)
+                            .ok_or_else(|| {
+                                RemoteBuildError::Artifact("artifact transfer size overflow".into())
+                            })?;
+                        if receiver.received_bytes > receiver.transfer.total_bytes {
+                            return Err(RemoteBuildError::Artifact(
+                                "artifact transfer exceeded its declared size".into(),
+                            ));
+                        }
+                        receiver.digest.update(&data);
+                        receiver
+                            .file
+                            .write_all(&data)
+                            .await
+                            .map_err(|error| RemoteBuildError::Artifact(error.to_string()))?;
+                        receiver.expected_sequence = receiver
+                            .expected_sequence
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                RemoteBuildError::Artifact("artifact chunk sequence overflow".into())
+                            })?;
+                        if receiver.received_bytes == receiver.transfer.total_bytes {
+                            let receiver = artifact_receiver
+                                .take()
+                                .expect("artifact receiver exists while completing transfer");
+                            complete_remote_artifacts(
+                                &state,
+                                receiver,
+                                &artifact_pipeline,
+                                build_id,
+                            )
+                            .await?;
+                            artifacts_complete = true;
+                        }
+                    }
                     AgentMessage::Event { event, .. } => {
                         validate_remote_event(&event, &plan, accepted, ready)?;
                         track_remote_activity(&event, &mut active_stages, &mut active_steps);
                         let terminal = matches!(event, BuildEvent::BuildFinished { .. });
+                        if matches!(
+                            &event,
+                            BuildEvent::BuildFinished {
+                                status: BuildStatus::Passed,
+                                ..
+                            }
+                        ) && !artifacts_complete
+                        {
+                            return Err(RemoteBuildError::InvalidEvent {
+                                build_id: plan.build_id,
+                                reason: "passed build arrived before artifact transfer completed"
+                                    .into(),
+                            });
+                        }
                         events.send(event).await.map_err(|_| RemoteBuildError::EventChannelClosed)?;
                         if terminal {
                             return Ok(());
@@ -1728,6 +1849,8 @@ async fn run_remote_build(
                     }
                     AgentMessage::AssignmentAccepted { build_id, .. }
                     | AgentMessage::WorkspaceReady { build_id, .. }
+                    | AgentMessage::ArtifactsReady { build_id, .. }
+                    | AgentMessage::ArtifactChunk { build_id, .. }
                     | AgentMessage::Finished { build_id, .. }
                     | AgentMessage::Error { build_id: Some(build_id), .. }
                     | AgentMessage::Log { build_id, .. } => {
@@ -1753,6 +1876,105 @@ async fn run_remote_build(
             }
         }
     }
+}
+
+async fn start_remote_artifact_receiver(
+    build_id: BuildId,
+    transfer: WorkspaceTransfer,
+) -> Result<RemoteArtifactReceiver, RemoteBuildError> {
+    transfer
+        .validate()
+        .map_err(|error| RemoteBuildError::Artifact(error.to_string()))?;
+    let staging_root = remote_artifact_root(build_id);
+    if std::fs::symlink_metadata(&staging_root).is_ok() {
+        return Err(RemoteBuildError::Artifact(format!(
+            "artifact staging path already exists: {}",
+            staging_root.display()
+        )));
+    }
+    tokio::fs::create_dir_all(&staging_root)
+        .await
+        .map_err(|error| RemoteBuildError::Artifact(error.to_string()))?;
+    let archive_path = staging_root.join("artifacts.tar");
+    let file = tokio::fs::File::create(&archive_path)
+        .await
+        .map_err(|error| RemoteBuildError::Artifact(error.to_string()))?;
+    Ok(RemoteArtifactReceiver {
+        transfer,
+        archive_path,
+        extraction_root: staging_root.join("workspace"),
+        file,
+        digest: Sha256::new(),
+        received_bytes: 0,
+        expected_sequence: 0,
+    })
+}
+
+async fn complete_remote_artifacts(
+    state: &AppState,
+    mut receiver: RemoteArtifactReceiver,
+    pipeline: &Pipeline,
+    build_id: BuildId,
+) -> Result<(), RemoteBuildError> {
+    receiver
+        .file
+        .flush()
+        .await
+        .map_err(|error| RemoteBuildError::Artifact(error.to_string()))?;
+    let actual = hex::encode(receiver.digest.finalize());
+    if actual != receiver.transfer.sha256 {
+        return Err(RemoteBuildError::Artifact(format!(
+            "artifact checksum mismatch: received {actual}, expected {}",
+            receiver.transfer.sha256
+        )));
+    }
+    let archive_path = receiver.archive_path;
+    let extraction_root = receiver.extraction_root;
+    let expected_entries = receiver.transfer.file_count;
+    drop(receiver.file);
+
+    let storage = state.storage.clone();
+    let mut pipeline = pipeline.clone();
+    pipeline.workspace = None;
+    let task = tokio::task::spawn_blocking(move || {
+        workspace_archive::extract_archive_file(&archive_path, &extraction_root, expected_entries)
+            .map_err(|error| error.to_string())?;
+        storage
+            .collect_artifacts(build_id, &pipeline, &extraction_root)
+            .map_err(|error| error.to_string())?;
+        Ok::<(), String>(())
+    });
+    let result = match task.await {
+        Ok(result) => result,
+        Err(error) => Err(format!("artifact staging task failed: {error}")),
+    };
+    if let Err(error) = cleanup_remote_artifact_root(build_id) {
+        tracing::warn!(?error, build_id = %build_id, "could not clean remote artifact staging");
+    }
+    result.map_err(RemoteBuildError::Artifact)
+}
+
+fn remote_artifact_root(build_id: BuildId) -> PathBuf {
+    std::env::temp_dir().join(format!("rivet-remote-artifacts-{build_id}"))
+}
+
+fn cleanup_remote_artifact_root(build_id: BuildId) -> Result<(), String> {
+    let path = remote_artifact_root(build_id);
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to remove symlink artifact staging path: {}",
+            path.display()
+        ));
+    }
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(&path).map_err(|error| error.to_string())?;
+    } else {
+        std::fs::remove_file(&path).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 async fn send_remote_message(

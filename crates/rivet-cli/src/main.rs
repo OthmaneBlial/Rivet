@@ -1,9 +1,11 @@
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
+use globset::{Glob, GlobSetBuilder};
 use rivet_agent_protocol::{
     AgentCapabilities, AgentHeartbeat, AgentId, AgentMessage, AgentRegistration,
-    MAX_WORKSPACE_CHUNK_BYTES, PROTOCOL_VERSION,
+    MAX_WORKSPACE_BYTES, MAX_WORKSPACE_CHUNK_BYTES, MAX_WORKSPACE_FILES, PROTOCOL_VERSION,
+    WorkspaceTransfer,
 };
 use rivet_core::{
     BuildEvent, BuildStatus, CronExpression, ExecutionPlan, LogStream, Pipeline, Project,
@@ -28,6 +30,7 @@ use tokio_tungstenite::tungstenite::Message as AgentSocketMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_util::sync::CancellationToken;
+use walkdir::{DirEntry, WalkDir};
 
 type AgentSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -601,13 +604,12 @@ async fn run_agent_assignment(
             }
             message = event_receiver.recv() => {
                 if let Some(event) = message {
-                    terminal_event_sent |= matches!(event, BuildEvent::BuildFinished { .. });
-                    send_agent_socket_message(
+                    terminal_event_sent |= send_execution_event(
                         socket,
-                        AgentMessage::Event {
-                            protocol_version: PROTOCOL_VERSION,
-                            event,
-                        },
+                        event,
+                        build_id,
+                        &execution_pipeline,
+                        &build_workspace,
                     ).await?;
                 }
             }
@@ -630,13 +632,12 @@ async fn run_agent_assignment(
             }
             result = &mut execution => {
                 while let Some(event) = event_receiver.recv().await {
-                    terminal_event_sent |= matches!(event, BuildEvent::BuildFinished { .. });
-                    send_agent_socket_message(
+                    terminal_event_sent |= send_execution_event(
                         socket,
-                        AgentMessage::Event {
-                            protocol_version: PROTOCOL_VERSION,
-                            event,
-                        },
+                        event,
+                        build_id,
+                        &execution_pipeline,
+                        &build_workspace,
                     ).await?;
                 }
                 if let Err(error) = result {
@@ -657,6 +658,176 @@ async fn run_agent_assignment(
             }
         }
     }
+}
+
+async fn send_execution_event(
+    socket: &mut AgentSocket,
+    event: BuildEvent,
+    build_id: uuid::Uuid,
+    pipeline: &Pipeline,
+    workspace: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if matches!(
+        event,
+        BuildEvent::BuildFinished {
+            status: BuildStatus::Passed,
+            ..
+        }
+    ) && !pipeline.artifacts.is_empty()
+    {
+        if let Err(error) = send_artifact_archive(socket, build_id, pipeline, workspace).await {
+            send_agent_socket_message(
+                socket,
+                AgentMessage::Error {
+                    protocol_version: PROTOCOL_VERSION,
+                    build_id: Some(build_id),
+                    code: "artifact_collection_failed".into(),
+                    message: error.to_string(),
+                },
+            )
+            .await?;
+            return Ok(false);
+        }
+    }
+    let terminal = matches!(event, BuildEvent::BuildFinished { .. });
+    send_agent_socket_message(
+        socket,
+        AgentMessage::Event {
+            protocol_version: PROTOCOL_VERSION,
+            event,
+        },
+    )
+    .await?;
+    Ok(terminal)
+}
+
+async fn send_artifact_archive(
+    socket: &mut AgentSocket,
+    build_id: uuid::Uuid,
+    pipeline: &Pipeline,
+    workspace: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pipeline_for_archive = pipeline.clone();
+    let workspace_for_archive = workspace.to_path_buf();
+    let archive = match tokio::task::spawn_blocking(move || {
+        archive_artifacts(&pipeline_for_archive, &workspace_for_archive)
+    })
+    .await
+    {
+        Ok(Ok(archive)) => archive,
+        Ok(Err(error)) => return Err(std::io::Error::other(error).into()),
+        Err(error) => return Err(std::io::Error::other(error.to_string()).into()),
+    };
+    send_agent_socket_message(
+        socket,
+        AgentMessage::ArtifactsReady {
+            protocol_version: PROTOCOL_VERSION,
+            build_id,
+            transfer: archive.transfer,
+        },
+    )
+    .await?;
+    for (sequence, data) in archive.bytes.chunks(MAX_WORKSPACE_CHUNK_BYTES).enumerate() {
+        let sequence =
+            u32::try_from(sequence).map_err(|_| "artifact archive has too many chunks")?;
+        send_agent_socket_message(
+            socket,
+            AgentMessage::ArtifactChunk {
+                protocol_version: PROTOCOL_VERSION,
+                build_id,
+                sequence,
+                data: data.to_vec(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+struct ArtifactArchive {
+    bytes: Vec<u8>,
+    transfer: WorkspaceTransfer,
+}
+
+fn archive_artifacts(pipeline: &Pipeline, workspace: &Path) -> Result<ArtifactArchive, String> {
+    let root = fs::canonicalize(workspace).map_err(|error| error.to_string())?;
+    if !root.is_dir() {
+        return Err(format!(
+            "artifact workspace is not a directory: {}",
+            root.display()
+        ));
+    }
+    let mut files = BTreeMap::new();
+    for specification in &pipeline.artifacts {
+        let mut matcher_builder = GlobSetBuilder::new();
+        for pattern in &specification.paths {
+            matcher_builder.add(Glob::new(pattern).map_err(|error| error.to_string())?);
+        }
+        let matcher = matcher_builder.build().map_err(|error| error.to_string())?;
+        let mut found = false;
+        for entry in WalkDir::new(&root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !is_internal_artifact_entry(entry, &root))
+        {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(&root)
+                .map_err(|error| error.to_string())?
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            if matcher.is_match(&relative) {
+                found = true;
+                files.insert(relative, entry.path().to_path_buf());
+            }
+        }
+        if !found && !specification.allow_empty {
+            return Err(format!(
+                "artifact {:?} matched no files for pattern {:?}",
+                specification.name,
+                specification.paths.join(", ")
+            ));
+        }
+    }
+    if files.len() > MAX_WORKSPACE_FILES as usize {
+        return Err("artifact archive contains too many files".into());
+    }
+    let mut builder = tar::Builder::new(Vec::new());
+    for (relative, path) in &files {
+        builder
+            .append_path_with_name(path, relative)
+            .map_err(|error| error.to_string())?;
+    }
+    let bytes = builder.into_inner().map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_WORKSPACE_BYTES {
+        return Err("artifact archive exceeds the protocol size limit".into());
+    }
+    let transfer = WorkspaceTransfer {
+        total_bytes: bytes.len() as u64,
+        file_count: files.len() as u32,
+        sha256: hex::encode(Sha256::digest(&bytes)),
+    };
+    transfer.validate().map_err(|error| error.to_string())?;
+    Ok(ArtifactArchive { bytes, transfer })
+}
+
+fn is_internal_artifact_entry(entry: &DirEntry, root: &Path) -> bool {
+    if entry.path() == root {
+        return false;
+    }
+    let Some(first) = entry
+        .path()
+        .strip_prefix(root)
+        .ok()
+        .and_then(|path| path.components().next())
+    else {
+        return false;
+    };
+    matches!(first.as_os_str().to_str(), Some(".git" | ".rivet"))
 }
 
 async fn receive_workspace_archive(

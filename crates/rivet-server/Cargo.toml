@@ -22,7 +22,7 @@ sha2.workspace = true
 subtle.workspace = true
 tar = "0.4"
 thiserror.workspace = true
-tokio = { version = "1.47", features = ["net", "rt", "sync", "time"] }
+tokio = { version = "1.47", features = ["fs", "net", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tracing.workspace = true
