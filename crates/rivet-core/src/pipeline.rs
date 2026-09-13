@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -67,6 +67,11 @@ pub struct CacheSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Stage {
     pub name: String,
+    /// Stage names that must complete successfully before this stage starts.
+    /// An empty list preserves the declaration-order behavior for independent
+    /// stages while keeping the execution graph explicit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
     pub steps: Vec<Step>,
 }
 
@@ -181,6 +186,14 @@ pub enum PipelineError {
     EmptyStage(String),
     #[error("duplicate stage name {0:?}")]
     DuplicateStage(String),
+    #[error("stage {stage:?} depends on unknown stage {dependency:?}")]
+    UnknownStageDependency { stage: String, dependency: String },
+    #[error("stage {stage:?} depends on itself")]
+    StageDependsOnSelf { stage: String },
+    #[error("stage {stage:?} declares duplicate dependency {dependency:?}")]
+    DuplicateStageDependency { stage: String, dependency: String },
+    #[error("stage dependencies contain a cycle")]
+    StageDependencyCycle,
     #[error("step {step:?} in stage {stage:?} cannot be empty")]
     EmptyStep { stage: String, step: String },
     #[error("duplicate step name {step:?} in stage {stage:?}")]
@@ -669,7 +682,71 @@ impl Pipeline {
             }
         }
 
+        self.stage_order_unchecked()?;
+
         Ok(())
+    }
+
+    /// Return a stable topological order for a validated pipeline. Independent
+    /// stages retain their declaration order, while a dependency may refer to
+    /// a stage declared later in the TOML file.
+    pub fn stage_order(&self) -> Result<Vec<usize>, PipelineError> {
+        self.validate()?;
+        self.stage_order_unchecked()
+    }
+
+    fn stage_order_unchecked(&self) -> Result<Vec<usize>, PipelineError> {
+        let stage_indexes = self
+            .stages
+            .iter()
+            .enumerate()
+            .map(|(index, stage)| (stage.name.as_str(), index))
+            .collect::<BTreeMap<_, _>>();
+        let mut indegrees = vec![0_usize; self.stages.len()];
+        let mut dependents = vec![Vec::<usize>::new(); self.stages.len()];
+        for (index, stage) in self.stages.iter().enumerate() {
+            let mut dependencies = BTreeSet::new();
+            for dependency in &stage.depends_on {
+                if dependency == &stage.name {
+                    return Err(PipelineError::StageDependsOnSelf {
+                        stage: stage.name.clone(),
+                    });
+                }
+                let Some(&dependency_index) = stage_indexes.get(dependency.as_str()) else {
+                    return Err(PipelineError::UnknownStageDependency {
+                        stage: stage.name.clone(),
+                        dependency: dependency.clone(),
+                    });
+                };
+                if !dependencies.insert(dependency_index) {
+                    return Err(PipelineError::DuplicateStageDependency {
+                        stage: stage.name.clone(),
+                        dependency: dependency.clone(),
+                    });
+                }
+                indegrees[index] += 1;
+                dependents[dependency_index].push(index);
+            }
+        }
+
+        let mut ready = (0..self.stages.len())
+            .filter(|index| indegrees[*index] == 0)
+            .collect::<BTreeSet<_>>();
+        let mut order = Vec::with_capacity(self.stages.len());
+        while let Some(&index) = ready.first() {
+            ready.remove(&index);
+            order.push(index);
+            for dependent in &dependents[index] {
+                indegrees[*dependent] -= 1;
+                if indegrees[*dependent] == 0 {
+                    ready.insert(*dependent);
+                }
+            }
+        }
+        if order.len() != self.stages.len() {
+            return Err(PipelineError::StageDependencyCycle);
+        }
+        Ok(order)
     }
 
     pub fn resolve_parameters(
@@ -823,6 +900,82 @@ timeout_seconds = 60
         assert_eq!(pipeline.stages[0].steps[0].args, ["test"]);
         assert_eq!(pipeline.workspace, None);
         assert!(pipeline.environment.is_empty());
+    }
+
+    #[test]
+    fn validates_and_orders_stage_dependencies_as_a_stable_dag() {
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "dag"
+[[stages]]
+name = "Deploy"
+depends_on = ["Build"]
+[[stages.steps]]
+name = "deploy"
+program = "true"
+[[stages]]
+name = "Build"
+depends_on = ["Test"]
+[[stages.steps]]
+name = "build"
+program = "true"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "test"
+program = "true"
+[[stages]]
+name = "Independent"
+[[stages.steps]]
+name = "lint"
+program = "true"
+"#,
+        )
+        .expect("DAG pipeline");
+        assert_eq!(
+            pipeline.stage_order().expect("topological order"),
+            [2, 1, 0, 3]
+        );
+
+        let cycle = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "cycle"
+[[stages]]
+name = "A"
+depends_on = ["B"]
+[[stages.steps]]
+name = "a"
+program = "true"
+[[stages]]
+name = "B"
+depends_on = ["A"]
+[[stages.steps]]
+name = "b"
+program = "true"
+"#,
+        )
+        .expect_err("cycles must be rejected");
+        assert!(matches!(cycle, PipelineError::StageDependencyCycle));
+
+        let unknown = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "unknown-dependency"
+[[stages]]
+name = "Build"
+depends_on = ["Missing"]
+[[stages.steps]]
+name = "build"
+program = "true"
+"#,
+        )
+        .expect_err("unknown dependencies must be rejected");
+        assert!(matches!(
+            unknown,
+            PipelineError::UnknownStageDependency { .. }
+        ));
     }
 
     #[test]

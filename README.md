@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.44 / 100** · displayed conservatively as the
+Weighted evidence score: **92.47 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -105,9 +105,10 @@ capabilities are not exposed to WASM modules.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
-arrays, validated repository-scoped workspaces, persisted domain-safe IDs, and
-typed build events. It is not Jenkins parity and does not claim production
-readiness yet.
+arrays, validated repository-scoped workspaces, dependency-checked stage DAGs,
+stable topological execution order, persisted domain-safe IDs, and typed build
+events. Parallel stage execution and conditional graph branches remain future
+work; this is not Jenkins parity and does not claim production readiness yet.
 
 ## Workspace
 

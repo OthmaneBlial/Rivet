@@ -569,6 +569,49 @@ args = ["-c", "printf second; test \"$(cat order.txt)\" = first"]
     }
 
     #[tokio::test]
+    async fn executes_dependency_order_even_when_stages_are_declared_out_of_order() {
+        let dir = tempdir().expect("tempdir");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "dependency-order"
+[[stages]]
+name = "Build"
+depends_on = ["Test"]
+[[stages.steps]]
+name = "read-test-marker"
+program = "sh"
+args = ["-c", "test -f test.marker; touch build.marker"]
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "write-test-marker"
+program = "touch"
+args = ["test.marker"]
+"#,
+        )
+        .expect("dependency pipeline");
+        let plan =
+            ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        assert_eq!(
+            plan.stages
+                .iter()
+                .map(|stage| stage.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Test", "Build"]
+        );
+        assert_eq!(plan.stages[1].depends_on, vec![plan.stages[0].id]);
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let status = execute_pipeline(&plan, &pipeline, dir.path(), CancellationToken::new(), tx)
+            .await
+            .expect("runner");
+        assert_eq!(status, BuildStatus::Passed);
+        while rx.recv().await.is_some() {}
+        assert!(dir.path().join("build.marker").is_file());
+    }
+
+    #[tokio::test]
     async fn exposes_resolved_build_parameters_to_direct_processes() {
         let dir = tempdir().expect("tempdir");
         let pipeline = Pipeline::from_toml_str(

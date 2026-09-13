@@ -543,6 +543,7 @@ pub fn generate_rivetfile_draft(source: &str) -> Result<RivetfileDraft, Migratio
             }
             Some(Stage {
                 name: stage.name,
+                depends_on: Vec::new(),
                 steps: stage.steps,
             })
         })

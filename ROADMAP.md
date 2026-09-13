@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **92 / 100 points** (**92.44 weighted evidence
+The current verified total is **92 / 100 points** (**92.47 weighted evidence
 points**, displayed conservatively as 92%).
 
 | Workstream | Weight | Current state | Gate for completion |
@@ -13,7 +13,7 @@ points**, displayed conservatively as 92%).
 | Foundation and domain contracts | 4 | verified | Rust workspace, IDs, explicit state transitions, tests |
 | Pipeline definition and validation | 4 | verified | Versioned `Rivetfile.toml`, direct command arrays, validation tests |
 | Native process runner | 6 | verified | stdout/stderr streaming, timeout, cancellation, process-group cleanup tests |
-| Queue and scheduler | 6 | partial | FIFO tie ordering, bounded priorities, global/per-project limits, live telemetry, priority-ordered queue snapshots with a rendered queue control room, pre-execution cancellation, authenticated pause/resume administration, and executor/CPU/memory-aware remote resource reservations pass; DAG scheduling and richer local resource dimensions remain |
+| Queue and scheduler | 6 | partial | FIFO tie ordering, bounded priorities, global/per-project limits, live telemetry, priority-ordered queue snapshots with a rendered queue control room, pre-execution cancellation, authenticated pause/resume administration, executor/CPU/memory-aware remote resource reservations, and dependency-ordered stage graph admission pass; parallel DAG scheduling and richer local resource dimensions remain |
 | SQLite persistence | 6 | verified | Migration, build graph projection, reopen/history test |
 | API and live transport | 6 | partial | REST/loopback WebSocket, durable event replay, queue telemetry, build retry, schedule endpoints/dispatch, graceful SIGINT/SIGTERM shutdown, safe request IDs with structured method/route/status tracing, exact CORS allow-list, body limits, security headers, and policy-backed identity/project authorization pass; deployment operations remain |
 | CLI operator workflow | 3 | partial | project/run/history, parameterized builds, artifact listing, retry, schedule management, and detailed build inspection work; richer cancellation remains |

@@ -47,7 +47,7 @@
       "feature": "Priority queue with FIFO ties and global/per-project limits",
       "status": "partial",
       "evidence": ["crates/rivet-runner/src/scheduler.rs"],
-      "notes": "Higher bounded priorities run before older lower-priority work while equal priorities retain FIFO order; queued cancellation and authenticated pause/resume administration are handled before execution. Remote executor, CPU, and memory requirements are validated, matched against explicit agent capacity, and reserved atomically; DAG scheduling and richer local resource dimensions remain planned."
+      "notes": "Higher bounded priorities run before older lower-priority work while equal priorities retain FIFO order; queued cancellation and authenticated pause/resume administration are handled before execution. Remote executor, CPU, and memory requirements are validated, matched against explicit agent capacity, and reserved atomically. Stage dependencies are validated for unknown references, duplicates, self-dependencies, and cycles, then executed in stable topological order; parallel DAG scheduling and richer local resource dimensions remain planned."
     },
     {
       "category": "Artifacts",
