@@ -8,7 +8,7 @@ mod pipeline;
 mod process;
 mod scheduler;
 
-pub use cache::{CacheError, CacheStore};
+pub use cache::{CacheError, CachePruneResult, CacheStore};
 pub use pipeline::{
     RunnerError, execute_pipeline, execute_pipeline_with_parameters,
     execute_pipeline_with_parameters_and_cache,

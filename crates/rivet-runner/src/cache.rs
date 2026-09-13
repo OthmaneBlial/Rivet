@@ -21,6 +21,13 @@ pub struct CacheStore {
     root: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachePruneResult {
+    pub removed_entries: usize,
+    pub removed_bytes: u64,
+    pub remaining_bytes: u64,
+}
+
 impl CacheStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -106,6 +113,73 @@ impl CacheStore {
             let _ = fs::remove_file(&temporary_path);
         }
         result
+    }
+
+    /// Remove oldest regular cache archives until the store is within the
+    /// requested byte budget. Symlinks, non-archive files, and in-progress
+    /// temporary files are never followed or removed.
+    pub fn prune(&self, max_bytes: u64) -> Result<CachePruneResult, CacheError> {
+        let metadata = match fs::symlink_metadata(&self.root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(CachePruneResult {
+                    removed_entries: 0,
+                    removed_bytes: 0,
+                    remaining_bytes: 0,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cache root is not a regular directory: {}",
+                    self.root.display()
+                ),
+            )
+            .into());
+        }
+        set_private_permissions(&self.root)?;
+        let mut archives = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("tar") {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
+            archives.push((
+                metadata.len(),
+                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                path,
+            ));
+        }
+        archives.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.2.cmp(&right.2)));
+        let mut remaining_bytes = archives.iter().map(|(size, _, _)| *size).sum::<u64>();
+        let mut result = CachePruneResult {
+            removed_entries: 0,
+            removed_bytes: 0,
+            remaining_bytes,
+        };
+        for (size, _, path) in archives {
+            if remaining_bytes <= max_bytes {
+                break;
+            }
+            let current = fs::symlink_metadata(&path)?;
+            if current.file_type().is_symlink() || !current.is_file() {
+                continue;
+            }
+            fs::remove_file(&path)?;
+            remaining_bytes = remaining_bytes.saturating_sub(size);
+            result.removed_entries += 1;
+            result.removed_bytes += size;
+            result.remaining_bytes = remaining_bytes;
+        }
+        Ok(result)
     }
 
     fn archive_path(&self, project_id: ProjectId, spec: &CacheSpec) -> PathBuf {
@@ -301,6 +375,33 @@ program = "true"
             "fallback"
         );
         assert!(!store.archive_path(project_id, &primary).exists());
+    }
+
+    #[test]
+    fn prune_removes_oldest_archives_without_following_symlinks() {
+        let directory = tempdir().expect("tempdir");
+        let cache_root = directory.path().join("cache");
+        let outside = directory.path().join("outside.tar");
+        let store = CacheStore::new(&cache_root);
+        store.ensure_root().expect("cache root");
+        let oldest = cache_root.join("oldest.tar");
+        let newest = cache_root.join("newest.tar");
+        fs::write(&oldest, vec![0_u8; 10]).expect("oldest archive");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&newest, vec![1_u8; 20]).expect("newest archive");
+        fs::write(&outside, b"outside").expect("outside file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, cache_root.join("linked.tar")).expect("cache symlink");
+
+        let result = store.prune(20).expect("prune");
+        assert_eq!(result.removed_entries, 1);
+        assert_eq!(result.removed_bytes, 10);
+        assert_eq!(result.remaining_bytes, 20);
+        assert!(!oldest.exists());
+        assert!(newest.exists());
+        assert!(outside.exists());
+        #[cfg(unix)]
+        assert!(cache_root.join("linked.tar").exists());
     }
 
     #[test]

@@ -18,7 +18,7 @@ use rivet_core::{
 use rivet_credentials::CredentialVault;
 use rivet_migration::{analyze_jenkinsfile_file, generate_rivetfile_draft_file};
 use rivet_runner::execute_pipeline_with_parameters;
-use rivet_runner::{QueueHandle, Scheduler};
+use rivet_runner::{CacheStore, QueueHandle, Scheduler};
 use rivet_scm::{GitHttpCredential, GitPrepareOptions, GitRepository, ScmError};
 use rivet_storage::Storage;
 use sha2::{Digest, Sha256};
@@ -159,6 +159,11 @@ enum Command {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    /// Inspect and prune the local CI cache.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
     /// Analyze a Jenkinsfile without executing Groovy or plugin code.
     Analyze {
         #[command(subcommand)]
@@ -268,6 +273,15 @@ enum AuthTokenCommand {
         id: String,
         #[arg(long)]
         policy_file: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CacheCommand {
+    /// Remove oldest cache archives until they fit under a byte budget.
+    Prune {
+        #[arg(long, value_name = "BYTES")]
+        max_bytes: u64,
     },
 }
 
@@ -480,6 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Schedule { command } => manage_schedule(&cli.data_dir, command)?,
         Command::Credential { command } => manage_credentials(&cli.data_dir, command)?,
         Command::Auth { command } => manage_auth(command)?,
+        Command::Cache { command } => manage_cache(&cli.data_dir, command)?,
         Command::Analyze { command } => analyze_file(command)?,
         Command::Compat { command } => compare_compatibility(command)?,
         Command::Agent(args) => run_agent(args).await?,
@@ -1595,6 +1610,27 @@ fn manage_auth(command: AuthCommand) -> Result<(), Box<dyn std::error::Error>> {
             AuthPolicy::from_document(document.clone())?;
             write_auth_policy(&policy_file, &document)?;
             println!("Revoked token {id}");
+        }
+    }
+    Ok(())
+}
+
+fn manage_cache(data_dir: &Path, command: CacheCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        CacheCommand::Prune { max_bytes } => {
+            let storage = open_storage(data_dir)?;
+            let result = CacheStore::new(storage.cache_root()).prune(max_bytes)?;
+            println!(
+                "removed {} entr{} ({} bytes); {} bytes remain",
+                result.removed_entries,
+                if result.removed_entries == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                result.removed_bytes,
+                result.remaining_bytes
+            );
         }
     }
     Ok(())
