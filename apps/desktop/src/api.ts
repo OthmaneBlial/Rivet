@@ -8,9 +8,13 @@ import type {
   QueueStats,
   ScheduleRecord,
 } from "./types";
+import { invoke } from "@tauri-apps/api/core";
 
 export const ENGINE_ORIGIN =
   import.meta.env.VITE_RIVET_ENGINE_URL ?? "http://127.0.0.1:7878";
+
+let activeEngineOrigin = ENGINE_ORIGIN;
+let engineOriginPromise: Promise<string> | null = null;
 
 export const ENGINE_OFFLINE_MESSAGE =
   "Engine offline — start the local engine to connect.";
@@ -34,22 +38,53 @@ export interface BuildRequestOptions {
   parameters?: Record<string, string>;
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  let response: Response;
-  try {
-    response = await fetch(`${ENGINE_ORIGIN}${path}`, {
-      ...init,
-      headers: {
-        "content-type": "application/json",
-        ...init?.headers,
-      },
-    });
-  } catch (cause) {
-    if (cause instanceof DOMException && cause.name === "AbortError") {
-      throw cause;
-    }
-    throw new Error(ENGINE_OFFLINE_MESSAGE);
+function runningInsideTauri(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+export async function initializeEngineOrigin(): Promise<string> {
+  if (!runningInsideTauri()) return activeEngineOrigin;
+  if (!engineOriginPromise) {
+    engineOriginPromise = invoke<string>("engine_origin")
+      .then((origin) => {
+        const parsed = new URL(origin);
+        if (parsed.protocol !== "http:" || parsed.hostname !== "127.0.0.1") {
+          throw new Error("The embedded engine must use a loopback HTTP origin.");
+        }
+        activeEngineOrigin = parsed.origin;
+        return activeEngineOrigin;
+      })
+      .catch(() => activeEngineOrigin);
   }
+  return engineOriginPromise;
+}
+
+export function getEngineOrigin(): string {
+  return activeEngineOrigin;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const engineOrigin = await initializeEngineOrigin();
+  let response: Response | undefined;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      response = await fetch(`${engineOrigin}${path}`, {
+        ...init,
+        headers: {
+          "content-type": "application/json",
+          ...init?.headers,
+        },
+      });
+      break;
+    } catch (cause) {
+      if (cause instanceof DOMException && cause.name === "AbortError") {
+        throw cause;
+      }
+      if (attempt === 2) throw new Error(ENGINE_OFFLINE_MESSAGE);
+      await new Promise((resolve) => window.setTimeout(resolve, 150 * (attempt + 1)));
+    }
+  }
+  if (!response) throw new Error(ENGINE_OFFLINE_MESSAGE);
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
     try {
@@ -179,12 +214,12 @@ export function createProject(input: {
 export function eventUrl(project: string, number: number): string {
   const url = new URL(
     `/api/v1/projects/${encodeURIComponent(project)}/builds/${number}/events`,
-    ENGINE_ORIGIN,
+    activeEngineOrigin,
   );
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
 }
 
 export function artifactUrl(project: string, number: number, artifactId: string): string {
-  return `${ENGINE_ORIGIN}/api/v1/projects/${encodeURIComponent(project)}/builds/${number}/artifacts/${encodeURIComponent(artifactId)}`;
+  return `${activeEngineOrigin}/api/v1/projects/${encodeURIComponent(project)}/builds/${number}/artifacts/${encodeURIComponent(artifactId)}`;
 }

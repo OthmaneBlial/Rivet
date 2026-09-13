@@ -8,9 +8,10 @@ import {
   deleteSchedule,
   artifactUrl,
   artifacts,
-  ENGINE_ORIGIN,
   ENGINE_OFFLINE_MESSAGE,
   eventUrl,
+  getEngineOrigin,
+  initializeEngineOrigin,
   logs,
   projects,
   queueStats as fetchQueueStats,
@@ -197,6 +198,7 @@ function App() {
   }, []);
 
   useEffect(() => {
+    void initializeEngineOrigin();
     void loadProjects();
   }, [loadProjects]);
 
@@ -402,7 +404,7 @@ function App() {
             <div>
               <span className="overline">Engine</span>
               <strong>Rust core</strong>
-              <small>{ENGINE_ORIGIN.replace("http://", "")}</small>
+            <small>{getEngineOrigin().replace("http://", "")}</small>
             </div>
           </div>
           <span className="build-stamp">RIVET 0.1.0 · LOCAL</span>

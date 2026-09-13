@@ -15,3 +15,4 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 rivet-server = { path = "../../../crates/rivet-server" }
 tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["net"] }

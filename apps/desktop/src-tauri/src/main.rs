@@ -3,17 +3,47 @@
 use std::net::SocketAddr;
 use tauri::Manager;
 
-const ENGINE_BIND: &str = "127.0.0.1:7878";
+struct EngineState {
+    origin: String,
+}
+
+#[tauri::command]
+fn engine_origin(state: tauri::State<'_, EngineState>) -> String {
+    state.origin.clone()
+}
 
 fn main() {
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![engine_origin])
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let database = data_dir.join("rivet.db");
-            let bind: SocketAddr = ENGINE_BIND.parse().expect("static engine address");
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            listener.set_nonblocking(true)?;
+            let bind: SocketAddr = listener.local_addr()?;
+            let origin = format!("http://{bind}");
+            app.manage(EngineState { origin });
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = rivet_server::serve(database, bind).await {
+                let listener = match tokio::net::TcpListener::from_std(listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        eprintln!("Rivet local engine listener failed: {error}");
+                        return;
+                    }
+                };
+                if let Err(error) = rivet_server::serve_with_listener(
+                    database,
+                    rivet_server::ServerConfig {
+                        bind,
+                        auth_token: None,
+                        webhook_secret: None,
+                        allowed_origins: Vec::new(),
+                    },
+                    listener,
+                )
+                .await
+                {
                     eprintln!("Rivet local engine stopped: {error}");
                 }
             });
