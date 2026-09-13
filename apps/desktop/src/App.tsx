@@ -42,6 +42,19 @@ const STATUS_LABEL: Record<BuildStatus, string> = {
   cancelled: "Cancelled",
 };
 
+type Theme = "light" | "dark";
+
+const THEME_STORAGE_KEY = "rivet-theme";
+
+function initialTheme(): Theme {
+  if (typeof window === "undefined") return "light";
+  try {
+    return window.localStorage.getItem(THEME_STORAGE_KEY) === "dark" ? "dark" : "light";
+  } catch {
+    return "light";
+  }
+}
+
 function RivetMark({ className = "" }: { className?: string }) {
   return (
     <svg className={`rivet-mark ${className}`} viewBox="0 0 48 48" aria-hidden="true" focusable="false">
@@ -84,6 +97,7 @@ function shortRevision(revision: string): string {
 }
 
 function App() {
+  const [theme, setTheme] = useState<Theme>(initialTheme);
   const [engineOnline, setEngineOnline] = useState(false);
   const [projectsList, setProjectsList] = useState<Project[]>([]);
   const [projectName, setProjectName] = useState("");
@@ -264,6 +278,16 @@ function App() {
   const successRate = buildList.length ? Math.round((passed / buildList.length) * 100) : 0;
   const isRunning = details?.build.status === "running" || details?.build.status === "queued";
 
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch {
+      // The theme still applies when storage is unavailable.
+    }
+  }, [theme]);
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -320,6 +344,17 @@ function App() {
               <span className="pulse" />
               {engineOnline ? "Engine online" : "Engine offline"}
             </div>
+            <button
+              className="button button-quiet theme-toggle"
+              type="button"
+              aria-pressed={theme === "dark"}
+              aria-label={theme === "light" ? "Switch to dark mode" : "Switch to light mode"}
+              title={theme === "light" ? "Switch to dark mode" : "Switch to light mode"}
+              onClick={() => setTheme((current) => current === "light" ? "dark" : "light")}
+            >
+              <span className="theme-toggle-icon" aria-hidden="true">{theme === "light" ? "☾" : "☀"}</span>
+              <span className="theme-toggle-label">{theme === "light" ? "Dark" : "Light"}</span>
+            </button>
             <button className="button button-quiet" onClick={() => setShowCreate(true)}>
               <span>＋</span> New project
             </button>

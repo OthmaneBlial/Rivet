@@ -5,7 +5,7 @@ from Jenkins.
 
 ## Delivery progress
 
-**51% verified** · `██████████░░░░░░░░░░`<br>
+**52% verified** · `██████████▍░░░░░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -16,7 +16,9 @@ SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
 inspection, persisted build-source identity, live queue telemetry, durable
 event replay, quiet engine offline recovery, explicit Git preparation at build
 admission, parameterized builds, local artifact storage, protected server
-transport, build retry, and pre-execution queue cancellation milestone.
+transport, build retry, pre-execution queue cancellation, build artifact
+downloads, and a light-default desktop theme with an accessible dark-mode
+toggle milestone.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
