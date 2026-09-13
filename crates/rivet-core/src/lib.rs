@@ -16,6 +16,7 @@ pub use model::{
     StageStatus, StepId, StepStatus,
 };
 pub use pipeline::{
-    CacheSpec, ParameterSpec, Pipeline, PipelineError, REDACTED_PARAMETER_VALUE, Stage, Step,
+    CacheSpec, ContainerSpec, ParameterSpec, Pipeline, PipelineError, REDACTED_PARAMETER_VALUE,
+    Stage, Step,
 };
 pub use schedule::{CronExpression, CronExpressionError};

@@ -65,6 +65,13 @@ pub struct Step {
     pub working_dir: Option<PathBuf>,
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub container: Option<ContainerSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerSpec {
+    pub image: String,
 }
 
 #[derive(Debug, Error)]
@@ -94,6 +101,10 @@ pub enum PipelineError {
     EmptyProgram { stage: String, step: String },
     #[error("step {step:?} in stage {stage:?} has an invalid timeout")]
     InvalidTimeout { stage: String, step: String },
+    #[error("step {step:?} in stage {stage:?} has no container image")]
+    EmptyContainerImage { stage: String, step: String },
+    #[error("container image for step {step:?} in stage {stage:?} is invalid")]
+    InvalidContainerImage { stage: String, step: String },
     #[error("workspace escapes the repository root: {0}")]
     WorkspaceOutsideRepository(PathBuf),
     #[error("workspace does not exist: {0}")]
@@ -305,6 +316,24 @@ impl Pipeline {
                         stage: stage.name.clone(),
                         step: step.name.clone(),
                     });
+                }
+                if let Some(container) = &step.container {
+                    if container.image.trim().is_empty() {
+                        return Err(PipelineError::EmptyContainerImage {
+                            stage: stage.name.clone(),
+                            step: step.name.clone(),
+                        });
+                    }
+                    if container
+                        .image
+                        .chars()
+                        .any(|character| character.is_whitespace() || character.is_control())
+                    {
+                        return Err(PipelineError::InvalidContainerImage {
+                            stage: stage.name.clone(),
+                            step: step.name.clone(),
+                        });
+                    }
                 }
             }
         }
