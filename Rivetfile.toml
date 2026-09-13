@@ -1,0 +1,17 @@
+version = 1
+name = "rivet"
+
+[[stages]]
+name = "Validate"
+
+[[stages.steps]]
+name = "format"
+program = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+timeout_seconds = 120
+
+[[stages.steps]]
+name = "test"
+program = "cargo"
+args = ["test", "--workspace"]
+timeout_seconds = 600

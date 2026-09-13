@@ -1,0 +1,18 @@
+[package]
+name = "rivet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rivet"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+rivet-core = { path = "../rivet-core" }
+rivet-runner = { path = "../rivet-runner" }
+rivet-storage = { path = "../rivet-storage" }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid.workspace = true

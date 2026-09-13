@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "product": "rivet",
+  "reference": "base/jenkins",
+  "statuses": [
+    "supported",
+    "mostly-supported",
+    "partial",
+    "planned",
+    "unsupported",
+    "intentionally-different"
+  ],
+  "features": [
+    {
+      "category": "Pipeline",
+      "feature": "Versioned TOML pipeline definition",
+      "status": "supported",
+      "evidence": ["crates/rivet-core/src/pipeline.rs"]
+    },
+    {
+      "category": "Pipeline",
+      "feature": "Sequential stages and direct executable steps",
+      "status": "supported",
+      "evidence": ["crates/rivet-runner/src/pipeline.rs"]
+    },
+    {
+      "category": "Builds",
+      "feature": "Persistent build history and stage/step state",
+      "status": "supported",
+      "evidence": ["crates/rivet-storage/migrations/001_initial.sql"]
+    },
+    {
+      "category": "Logs",
+      "feature": "Timestamped stdout and stderr streaming",
+      "status": "supported",
+      "evidence": ["crates/rivet-runner/src/process.rs"]
+    },
+    {
+      "category": "Queue",
+      "feature": "FIFO queue with global and per-project limits",
+      "status": "partial",
+      "evidence": ["crates/rivet-runner/src/scheduler.rs"],
+      "notes": "Priority, resource requirements, and observable queue administration remain planned."
+    },
+    {
+      "category": "Execution",
+      "feature": "Cancellation, timeout, and process-group cleanup",
+      "status": "partial",
+      "evidence": ["crates/rivet-runner/src/process.rs"],
+      "notes": "Validated locally on Unix; remote agents and container execution are planned."
+    },
+    {
+      "category": "Jenkinsfile",
+      "feature": "Jenkinsfile parsing",
+      "status": "planned",
+      "evidence": []
+    },
+    {
+      "category": "SCM",
+      "feature": "Git checkout and webhooks",
+      "status": "planned",
+      "evidence": []
+    },
+    {
+      "category": "Agents",
+      "feature": "Remote authenticated agents",
+      "status": "planned",
+      "evidence": []
+    },
+    {
+      "category": "Plugins",
+      "feature": "Jenkins plugin ABI compatibility",
+      "status": "intentionally-different",
+      "evidence": [],
+      "notes": "Rivet will define a versioned extension protocol instead of reproducing the Java plugin ABI."
+    }
+  ]
+}

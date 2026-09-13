@@ -1,0 +1,25 @@
+# Jenkins is a local reference checkout, never part of Rivet's source tree.
+/base/
+
+# Rust build output
+/target/
+
+# Local application state and credentials
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+/secrets/
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Desktop frontend output
+/apps/desktop/node_modules/
+/apps/desktop/dist/
+/apps/desktop/src-tauri/target/
+/apps/desktop/src-tauri/gen/
