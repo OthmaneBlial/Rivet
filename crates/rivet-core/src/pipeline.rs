@@ -12,6 +12,8 @@ pub struct Pipeline {
     pub workspace: Option<PathBuf>,
     #[serde(default)]
     pub parameters: Vec<ParameterSpec>,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactSpec>,
     pub stages: Vec<Stage>,
 }
 
@@ -20,6 +22,14 @@ pub struct ParameterSpec {
     pub name: String,
     #[serde(default)]
     pub default: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactSpec {
+    pub name: String,
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub allow_empty: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,6 +99,16 @@ pub enum PipelineError {
     UnknownParameter(String),
     #[error("required parameter {0:?} was not provided")]
     MissingParameter(String),
+    #[error("artifact name cannot be empty")]
+    EmptyArtifactName,
+    #[error("artifact name {0:?} contains a path separator")]
+    InvalidArtifactName(String),
+    #[error("artifact {0:?} must declare at least one path")]
+    EmptyArtifactPaths(String),
+    #[error("artifact {artifact:?} has an invalid path {path:?}")]
+    InvalidArtifactPath { artifact: String, path: String },
+    #[error("duplicate artifact name {0:?}")]
+    DuplicateArtifact(String),
 }
 
 impl Pipeline {
@@ -132,6 +152,37 @@ impl Pipeline {
             }
             if !parameter_names.insert(parameter.name.as_str()) {
                 return Err(PipelineError::DuplicateParameter(parameter.name.clone()));
+            }
+        }
+
+        let mut artifact_names = HashSet::new();
+        for artifact in &self.artifacts {
+            if artifact.name.trim().is_empty() {
+                return Err(PipelineError::EmptyArtifactName);
+            }
+            if artifact.name.contains('/') || artifact.name.contains('\\') {
+                return Err(PipelineError::InvalidArtifactName(artifact.name.clone()));
+            }
+            if !artifact_names.insert(artifact.name.as_str()) {
+                return Err(PipelineError::DuplicateArtifact(artifact.name.clone()));
+            }
+            if artifact.paths.is_empty() {
+                return Err(PipelineError::EmptyArtifactPaths(artifact.name.clone()));
+            }
+            for path in &artifact.paths {
+                let path_value = Path::new(path);
+                if path.trim().is_empty()
+                    || path.contains('\0')
+                    || path_value.is_absolute()
+                    || path_value
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    return Err(PipelineError::InvalidArtifactPath {
+                        artifact: artifact.name.clone(),
+                        path: path.clone(),
+                    });
+                }
             }
         }
 
@@ -345,6 +396,48 @@ program = "true"
         assert!(matches!(
             result,
             Err(PipelineError::ReservedParameterName(name)) if name == "RIVET_BUILD_ID"
+        ));
+    }
+
+    #[test]
+    fn validates_workspace_scoped_artifact_patterns() {
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "artifacts"
+
+[[artifacts]]
+name = "bundle"
+paths = ["dist/**", "manifest.json"]
+
+[[stages]]
+name = "Build"
+[[stages.steps]]
+name = "compile"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+        assert_eq!(pipeline.artifacts[0].paths, ["dist/**", "manifest.json"]);
+
+        let invalid = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "unsafe-artifacts"
+[[artifacts]]
+name = "bundle"
+paths = ["../outside/**"]
+[[stages]]
+name = "Build"
+[[stages.steps]]
+name = "compile"
+program = "true"
+"#,
+        );
+        assert!(matches!(
+            invalid,
+            Err(PipelineError::InvalidArtifactPath { artifact, path })
+                if artifact == "bundle" && path == "../outside/**"
         ));
     }
 
