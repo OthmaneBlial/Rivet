@@ -456,9 +456,10 @@ the shared Rust runner, and persists the agent's typed build events and output.
 Cancellation is propagated to the agent, and declared artifacts return through
 the same bounded transfer with checksum verification before local storage.
 After an agent disconnect, the server makes one bounded replacement attempt and
-persists a terminal failed state when no replacement is available. Durable
-recovery across a server restart, exactly-once guarantees, and cross-restart
-retry recovery remain future gates.
+persists a terminal failed state when no replacement is available. Non-secret
+remote attempts can also be preserved and redispatched with the same build
+identity after a server restart; transport-level exactly-once guarantees and
+cross-restart retry recovery remain future gates.
 
 Connect a worker for heartbeat and capability discovery:
 

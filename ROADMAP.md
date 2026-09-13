@@ -40,8 +40,8 @@ scaffold, passing unrelated test, or interface alone does not complete a gate.
 
 The next gates are richer extension capability wiring, the final Tauri-window
 flow inside the packaged app, API
-deployment hardening, resuming remote attempts across server restart and
-cross-restart retry recovery, broader host-key/keychain policy coverage, user
+deployment hardening, transport-level exactly-once delivery and cross-restart
+retry recovery, broader host-key/keychain policy coverage, user
 accounts and external identity providers, live compatibility capture adapters
 and a permanent differential regression corpus, broader repository-event
 mapping, upstream triggers, full Groovy/plugin migration
