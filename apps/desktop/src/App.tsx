@@ -106,15 +106,18 @@ function initialTheme(): Theme {
 
 function RivetMark({ className = "" }: { className?: string }) {
   return (
-    <svg className={`rivet-mark ${className}`} viewBox="0 0 72 72" aria-hidden="true" focusable="false">
-      <circle className="rivet-mark-shadow" cx="36" cy="38" r="28" />
-      <circle className="rivet-mark-shell" cx="34" cy="34" r="28" />
-      <circle className="rivet-mark-shell-line" cx="34" cy="34" r="22" />
-      <path className="rivet-mark-r" d="M21 52V17h14.7c11.2 0 17.2 4.6 17.2 12.2 0 5.4-2.8 9.3-8.1 11.5L53 52H42.1l-7.2-9.7h-4V52zm9.9-18.3h4.4c5.3 0 7.8-1.9 7.8-5.3 0-3.5-2.5-5.1-7.8-5.1h-4.4z" />
-      <path className="rivet-mark-rail" d="M12 48 27 61M48 8l10 10" />
-      <circle className="rivet-mark-node" cx="57" cy="13" r="6" />
-      <circle className="rivet-mark-node-core" cx="57" cy="13" r="2" />
-      <path className="rivet-mark-notch" d="M53.5 9.5 60.5 16.5" />
+    <svg className={`rivet-mark ${className}`} viewBox="0 0 80 80" aria-hidden="true" focusable="false">
+      <path className="rivet-mark-shadow" d="M22 8h30l18 18v30L55 73H22L7 58V23z" />
+      <path className="rivet-mark-shell" d="M19 5h30l18 18v30L52 70H19L4 55V20z" />
+      <path className="rivet-mark-edge" d="M19 5v12M49 5v18h18M67 53l-15 17M19 70V55H4" />
+      <circle className="rivet-mark-core" cx="37" cy="39" r="22" />
+      <circle className="rivet-mark-fastener" cx="18" cy="19" r="2.5" />
+      <circle className="rivet-mark-fastener" cx="57" cy="58" r="2.5" />
+      <path className="rivet-mark-r" d="M26 54V24h12.3c9.8 0 15 3.6 15 10 0 4.2-2.1 7.2-6.3 8.8L54 54h-8.5l-6.8-9H33v9zm7-15.2h5c3.3 0 5.1-1.3 5.1-4s-1.8-3.8-5.1-3.8H33z" />
+      <path className="rivet-mark-rail" d="M9 45 20 56h9M53 20 65 8" />
+      <circle className="rivet-mark-node" cx="68" cy="6" r="6" />
+      <circle className="rivet-mark-node-core" cx="68" cy="6" r="2" />
+      <path className="rivet-mark-notch" d="m64.5 2.5 7 7" />
     </svg>
   );
 }

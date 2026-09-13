@@ -96,17 +96,19 @@ button { color: inherit; }
 .sidebar { position: relative; display: flex; flex: 0 0 248px; flex-direction: column; min-height: 100vh; padding: 30px 18px 22px; border-right: 1px solid var(--line); background: var(--sidebar-surface); }
 .sidebar::after { content: ""; position: absolute; top: 0; right: -1px; width: 1px; height: 154px; background: linear-gradient(var(--amber), transparent); opacity: .8; }
 .brand-lockup { display: flex; align-items: center; gap: 9px; padding: 0 10px 34px; }
-.brand-glyph { display: grid; width: 48px; height: 48px; place-items: center; color: var(--amber-bright); }
+.brand-glyph { display: grid; width: 54px; height: 54px; place-items: center; color: var(--amber-bright); filter: drop-shadow(0 8px 14px rgba(0, 115, 111, .08)); }
 .rivet-mark { display: block; width: 100%; height: 100%; overflow: visible; }
-.rivet-mark-shadow { fill: rgba(36,51,58,.13); transform: translate(3px, 4px); }
-.rivet-mark-shell { fill: var(--ink-soft); stroke: var(--amber); stroke-width: 1.7; }
-.rivet-mark-shell-line { fill: none; stroke: var(--amber); stroke-width: 1; stroke-dasharray: 2 3; opacity: .6; }
-.rivet-mark-r { fill: var(--white); }
-.rivet-mark-rail { fill: none; stroke: var(--cyan); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; opacity: .95; }
-.rivet-mark-node { fill: var(--cyan); stroke: var(--ink-soft); stroke-width: 1.5; }
+.rivet-mark-shadow { fill: rgba(36,51,58,.14); transform: translate(3px, 4px); }
+.rivet-mark-shell { fill: var(--ink-soft); stroke: var(--amber); stroke-width: 1.8; stroke-linejoin: round; }
+.rivet-mark-edge { fill: none; stroke: var(--amber-bright); stroke-width: 1.1; stroke-linecap: round; opacity: .7; }
+.rivet-mark-core { fill: var(--panel-raised); stroke: var(--cyan); stroke-width: 1.7; }
+.rivet-mark-fastener { fill: var(--amber); stroke: var(--panel-raised); stroke-width: 1.2; }
+.rivet-mark-r { fill: var(--amber); }
+.rivet-mark-rail { fill: none; stroke: var(--cyan); stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; opacity: .95; }
+.rivet-mark-node { fill: var(--cyan); stroke: var(--ink-soft); stroke-width: 1.7; }
 .rivet-mark-node-core { fill: var(--amber-bright); }
 .rivet-mark-notch { fill: none; stroke: var(--white); stroke-width: 1.1; stroke-linecap: round; opacity: .72; }
-.brand-name { letter-spacing: -.04em; font-size: 18px; font-weight: 700; }
+.brand-name { letter-spacing: -.055em; font-size: 21px; font-weight: 700; }
 .brand-caption { margin-top: 3px; color: var(--faint); font: 9px/1 "Azeret Mono", monospace; letter-spacing: .11em; text-transform: uppercase; }
 .overline, .eyebrow { color: var(--muted); font: 10px/1.3 "Azeret Mono", monospace; letter-spacing: .12em; text-transform: uppercase; }
 .workspace-switcher { position: relative; display: grid; gap: 8px; margin: 0 6px 30px; padding: 14px 14px 15px; border: 1px solid var(--line); background: linear-gradient(135deg, rgba(99,221,211,.05), transparent 60%); }
