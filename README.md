@@ -189,9 +189,9 @@ accounts, sessions, and external identity providers remain future gates.
 Recorded Jenkins/Rivet behavior snapshots can be compared locally with the
 same explicit normalizer used by future live adapters:
 
-\`\`\`sh
+```sh
 cargo run -p rivet -- compat compare ./compat/fixtures/sequential-build.json
-\`\`\`
+```
 
 The command exits non-zero when normalized stage, step, parameter, artifact, or
 log semantics differ. The checked-in fixture exercises provider status spelling,
