@@ -28,7 +28,8 @@ use rivet_extension_protocol::{ExtensionCatalog, ExtensionCatalogError, Extensio
 use rivet_runner::{QueueHandle, QueueStats, Scheduler};
 use rivet_scm::{GitHttpCredential, GitPrepareOptions, GitRepository, GitSnapshot, ScmError};
 use rivet_storage::{
-    ArtifactRecord, BuildDetails, BuildRecord, LogRecord, ScheduleRecord, Storage, StorageError,
+    ArtifactRecord, AuditEventRecord, BuildDetails, BuildRecord, LogRecord, ScheduleRecord,
+    Storage, StorageError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -338,6 +339,7 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
     Ok(Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/auth/me", get(auth_me))
+        .route("/api/v1/audit", get(list_audit))
         .route("/api/v1/extensions", get(list_extensions))
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/agents/match", post(match_agents))
@@ -757,6 +759,14 @@ async fn auth_me(Extension(principal): Extension<Principal>) -> Json<AuthMeRespo
     })
 }
 
+async fn list_audit(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<AuditEventRecord>>, ApiError> {
+    require_global(&principal, Permission::Administer)?;
+    Ok(Json(state.storage.list_audit_events(100)?))
+}
+
 async fn authenticate(
     State(state): State<AppState>,
     mut request: axum::http::Request<Body>,
@@ -788,9 +798,16 @@ async fn authenticate(
                 })
         });
     if let Some(principal) = principal {
+        record_auth_audit(
+            &state.storage,
+            Some(principal.id()),
+            request.uri().path(),
+            "success",
+        );
         request.extensions_mut().insert(principal);
         next.run(request).await
     } else {
+        record_auth_audit(&state.storage, None, request.uri().path(), "failure");
         let mut response = (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "authentication required" })),
@@ -800,6 +817,14 @@ async fn authenticate(
             .headers_mut()
             .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         response
+    }
+}
+
+fn record_auth_audit(storage: &Storage, actor_id: Option<&str>, resource: &str, outcome: &str) {
+    if let Err(error) =
+        storage.append_audit_event(Utc::now(), actor_id, "auth.authenticate", resource, outcome)
+    {
+        tracing::warn!(?error, "could not persist authentication audit event");
     }
 }
 
@@ -3602,6 +3627,56 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authentication_audit_is_private_and_never_contains_the_token() {
+        let raw_token = "audit-admin-fixture-token";
+        let state = AppState::with_token(Storage::open_in_memory().expect("storage"), raw_token);
+        let app = router(state);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .body(Body::empty())
+                    .expect("unauthorized request"),
+            )
+            .await
+            .expect("unauthorized response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let audit_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/audit")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {raw_token}"),
+                    )
+                    .body(Body::empty())
+                    .expect("audit request"),
+            )
+            .await
+            .expect("audit response");
+        assert_eq!(audit_response.status(), StatusCode::OK);
+        let body = to_bytes(audit_response.into_body(), 64 * 1024)
+            .await
+            .expect("audit body");
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(!body_text.contains(raw_token));
+        let events: Vec<AuditEventRecord> = serde_json::from_slice(&body).expect("audit JSON");
+        assert!(events.iter().any(|event| {
+            event.action == "auth.authenticate"
+                && event.outcome == "failure"
+                && event.actor_id.is_none()
+        }));
+        assert!(events.iter().any(|event| {
+            event.action == "auth.authenticate"
+                && event.outcome == "success"
+                && event.actor_id.as_deref() == Some("legacy-token")
+        }));
     }
 
     #[tokio::test]

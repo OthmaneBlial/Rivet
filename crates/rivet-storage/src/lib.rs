@@ -22,6 +22,9 @@ use thiserror::Error;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+const MAX_AUDIT_PAGE_SIZE: usize = 1000;
+const MAX_AUDIT_FIELD_BYTES: usize = 256;
+
 #[derive(Clone)]
 pub struct Storage {
     connection: Arc<Mutex<Connection>>,
@@ -99,6 +102,8 @@ pub enum StorageError {
     InvalidScheduleEnabled(i64),
     #[error("webhook delivery {0} does not exist")]
     MissingWebhookDelivery(String),
+    #[error("audit {field} is empty, too long, or contains control characters")]
+    InvalidAuditField { field: &'static str },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,6 +195,16 @@ pub struct WebhookDeliveryRecord {
     pub build_number: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditEventRecord {
+    pub sequence: i64,
+    pub timestamp: DateTime<Utc>,
+    pub actor_id: Option<String>,
+    pub action: String,
+    pub resource: String,
+    pub outcome: String,
+}
+
 impl Storage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
@@ -250,6 +265,11 @@ impl Storage {
             &connection,
             7,
             Some(include_str!("../migrations/007_webhook_deliveries.sql")),
+        )?;
+        apply_migration(
+            &connection,
+            8,
+            Some(include_str!("../migrations/008_audit_events.sql")),
         )?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -556,6 +576,44 @@ impl Storage {
             params![event_id],
         )?;
         Ok(())
+    }
+
+    /// Append a bounded audit record. Authentication material and request
+    /// bodies are intentionally not accepted by this API; callers provide a
+    /// short actor, action, resource, and outcome only.
+    pub fn append_audit_event(
+        &self,
+        timestamp: DateTime<Utc>,
+        actor_id: Option<&str>,
+        action: &str,
+        resource: &str,
+        outcome: &str,
+    ) -> Result<i64, StorageError> {
+        if let Some(actor_id) = actor_id {
+            validate_audit_field(actor_id, "actor_id")?;
+        }
+        validate_audit_field(action, "action")?;
+        validate_audit_field(resource, "resource")?;
+        validate_audit_field(outcome, "outcome")?;
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        connection.execute(
+            "INSERT INTO audit_events(timestamp, actor_id, action, resource, outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![timestamp.to_rfc3339(), actor_id, action, resource, outcome,],
+        )?;
+        Ok(connection.last_insert_rowid())
+    }
+
+    pub fn list_audit_events(&self, limit: usize) -> Result<Vec<AuditEventRecord>, StorageError> {
+        let limit = limit.min(MAX_AUDIT_PAGE_SIZE);
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT sequence, timestamp, actor_id, action, resource, outcome
+             FROM audit_events ORDER BY sequence DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit as i64], raw_audit_event)?;
+        rows.map(|row| row.map_err(StorageError::from).and_then(parse_audit_event))
+            .collect()
     }
 
     pub fn create_build(
@@ -1155,6 +1213,39 @@ type RawSchedule = (
     String,
 );
 type RawWebhookDelivery = (String, String, String, Option<String>, Option<i64>);
+type RawAuditEvent = (i64, String, Option<String>, String, String, String);
+
+fn validate_audit_field(value: &str, field: &'static str) -> Result<(), StorageError> {
+    if value.trim().is_empty()
+        || value.len() > MAX_AUDIT_FIELD_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(StorageError::InvalidAuditField { field });
+    }
+    Ok(())
+}
+
+fn raw_audit_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAuditEvent> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
+fn parse_audit_event(raw: RawAuditEvent) -> Result<AuditEventRecord, StorageError> {
+    Ok(AuditEventRecord {
+        sequence: raw.0,
+        timestamp: parse_timestamp(&raw.1)?,
+        actor_id: raw.2,
+        action: raw.3,
+        resource: raw.4,
+        outcome: raw.5,
+    })
+}
 
 fn parse_project(raw: RawProject) -> Result<Project, StorageError> {
     Ok(Project {
@@ -1809,6 +1900,62 @@ program = "true"
                 .build_number,
             Some(build.number)
         );
+    }
+
+    #[test]
+    fn audit_events_are_bounded_ordered_and_reopenable() {
+        let directory = tempdir().expect("tempdir");
+        let database = directory.path().join("rivet.db");
+        let storage = Storage::open(&database).expect("open");
+        let first_at = Utc
+            .with_ymd_and_hms(2026, 9, 13, 12, 0, 0)
+            .single()
+            .expect("first timestamp");
+        let second_at = first_at + chrono::Duration::seconds(1);
+        assert_eq!(
+            storage
+                .append_audit_event(
+                    first_at,
+                    Some("operator"),
+                    "auth.authenticate",
+                    "/api/v1/queue",
+                    "success",
+                )
+                .expect("first event"),
+            1
+        );
+        storage
+            .append_audit_event(
+                second_at,
+                None,
+                "auth.authenticate",
+                "/api/v1/auth/me",
+                "failure",
+            )
+            .expect("second event");
+        assert!(matches!(
+            storage.append_audit_event(
+                second_at,
+                None,
+                "auth\n.authenticate",
+                "/api/v1/auth/me",
+                "failure",
+            ),
+            Err(StorageError::InvalidAuditField { field: "action" })
+        ));
+
+        let events = storage.list_audit_events(1).expect("latest events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 2);
+        assert_eq!(events[0].actor_id, None);
+        assert_eq!(events[0].outcome, "failure");
+
+        drop(storage);
+        let reopened = Storage::open(&database).expect("reopen");
+        let events = reopened.list_audit_events(10).expect("reopened events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].actor_id.as_deref(), Some("operator"));
+        assert_eq!(events[1].timestamp, first_at);
     }
 
     #[test]
