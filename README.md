@@ -143,7 +143,8 @@ policy file. It stores only token digests, never raw Bearer tokens:
       "id": "operator",
       "sha256": "<64 lowercase hex characters>",
       "role": "operator",
-      "projects": ["rivet"]
+      "projects": ["rivet"],
+      "expires_at": "2026-12-31T23:59:59Z"
     }
   ]
 }
@@ -162,6 +163,7 @@ revoking the old token during rotation:
 ```sh
 cargo run -p rivet -- auth token create operator \
   --role operator --project rivet \
+  --expires-at 2026-12-31T23:59:59Z \
   --policy-file /secure/path/rivet.auth.json \
   --token-file /secure/path/rivet.operator.token
 cargo run -p rivet -- auth token list \
@@ -171,8 +173,9 @@ cargo run -p rivet -- auth token revoke old-operator \
 ```
 
 The token value is not printed by the command and is not recoverable from the
-policy. User accounts, sessions, expiration, audit history, and external
-identity providers remain future gates.
+policy. The optional RFC3339 `expires_at` value is enforced at request time;
+legacy records without it remain non-expiring. User accounts, sessions, audit
+history, and external identity providers remain future gates.
 
 Extension manifests can be loaded by the headless server from an explicit
 local directory:

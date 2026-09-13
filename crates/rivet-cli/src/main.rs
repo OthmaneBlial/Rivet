@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
 use globset::{Glob, GlobSetBuilder};
@@ -248,6 +248,9 @@ enum AuthTokenCommand {
         policy_file: PathBuf,
         #[arg(long)]
         token_file: PathBuf,
+        /// Optional RFC3339 expiry, for example 2026-12-31T23:59:59Z.
+        #[arg(long)]
+        expires_at: Option<String>,
     },
     /// List token IDs, roles, and project scopes without revealing tokens.
     List {
@@ -1505,6 +1508,7 @@ fn manage_auth(command: AuthCommand) -> Result<(), Box<dyn std::error::Error>> {
             projects,
             policy_file,
             token_file,
+            expires_at,
         } => {
             if policy_file == token_file {
                 return Err("policy file and token file must be different paths".into());
@@ -1512,11 +1516,13 @@ fn manage_auth(command: AuthCommand) -> Result<(), Box<dyn std::error::Error>> {
             let mut document = load_auth_policy_for_create(&policy_file)?;
             let token = generate_token()?;
             let role: AuthRole = role.into();
+            let expires_at = parse_token_expiry(expires_at.as_deref())?;
             document.tokens.push(ApiTokenRecord {
                 id: id.clone(),
                 sha256: token_digest(&token),
                 role,
                 projects,
+                expires_at,
             });
             AuthPolicy::from_document(document.clone())?;
 
@@ -1536,7 +1542,14 @@ fn manage_auth(command: AuthCommand) -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     token.projects.join(",")
                 };
-                println!("{}\t{:?}\t{}", token.id, token.role, projects);
+                let expires_at = token
+                    .expires_at
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_else(|| "never".to_owned());
+                println!(
+                    "{}\t{:?}\t{}\t{}",
+                    token.id, token.role, projects, expires_at
+                );
             }
         }
         AuthTokenCommand::Revoke { id, policy_file } => {
@@ -1558,6 +1571,21 @@ fn manage_auth(command: AuthCommand) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+fn parse_token_expiry(
+    value: Option<&str>,
+) -> Result<Option<DateTime<Utc>>, Box<dyn std::error::Error>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let expiry = DateTime::parse_from_rfc3339(value)
+        .map_err(|error| format!("invalid token expiry {value:?}: {error}"))?
+        .with_timezone(&Utc);
+    if expiry <= Utc::now() {
+        return Err("token expiry must be in the future".into());
+    }
+    Ok(Some(expiry))
 }
 
 fn load_auth_policy_for_create(

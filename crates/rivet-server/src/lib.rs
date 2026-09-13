@@ -3614,6 +3614,7 @@ mod tests {
                 sha256: hex::encode(Sha256::digest(raw_token.as_bytes())),
                 role: Role::Operator,
                 projects: vec!["demo".into()],
+                expires_at: None,
             }],
         })
         .expect("policy");
@@ -3689,6 +3690,7 @@ mod tests {
                 sha256: hex::encode(Sha256::digest(raw_token.as_bytes())),
                 role: Role::Operator,
                 projects: vec!["allowed".into()],
+                expires_at: None,
             }],
         })
         .expect("policy");

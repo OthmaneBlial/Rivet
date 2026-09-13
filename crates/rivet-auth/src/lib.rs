@@ -4,6 +4,7 @@
 //! supplied at runtime, hashed for comparison, and never represented by a
 //! persisted or debug-printable value in this crate.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -78,6 +79,8 @@ pub struct ApiTokenRecord {
     pub role: Role,
     #[serde(default)]
     pub projects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -196,6 +199,10 @@ impl AuthPolicy {
     }
 
     pub fn authenticate(&self, token: &str) -> Option<Principal> {
+        self.authenticate_at(token, Utc::now())
+    }
+
+    pub fn authenticate_at(&self, token: &str, now: DateTime<Utc>) -> Option<Principal> {
         if token.is_empty() {
             return None;
         }
@@ -204,7 +211,10 @@ impl AuthPolicy {
             .tokens
             .iter()
             .zip(&self.digests)
-            .find(|(_, digest)| bool::from(candidate.as_slice().ct_eq(digest.as_slice())))
+            .find(|(record, digest)| {
+                record.expires_at.is_none_or(|expires_at| expires_at > now)
+                    && bool::from(candidate.as_slice().ct_eq(digest.as_slice()))
+            })
             .map(|(record, _)| Principal {
                 id: record.id.clone(),
                 role: record.role,
@@ -270,6 +280,7 @@ mod tests {
                 sha256: hex::encode(Sha256::digest(TOKEN.as_bytes())),
                 role: Role::Operator,
                 projects: vec!["demo".into()],
+                expires_at: None,
             }],
         })
         .expect("policy")
@@ -297,6 +308,7 @@ mod tests {
                 sha256: hex::encode(Sha256::digest(b"admin-token")),
                 role: Role::Admin,
                 projects: vec![],
+                expires_at: None,
             }],
         })
         .expect("admin policy")
@@ -312,6 +324,7 @@ mod tests {
                 sha256: hex::encode(Sha256::digest(b"agent-token")),
                 role: Role::Agent,
                 projects: vec![],
+                expires_at: None,
             }],
         })
         .expect("agent policy")
@@ -336,12 +349,14 @@ mod tests {
                         sha256: DIGEST.into(),
                         role: Role::Viewer,
                         projects: vec![],
+                        expires_at: None,
                     },
                     ApiTokenRecord {
                         id: "duplicate".into(),
                         sha256: DIGEST.into(),
                         role: Role::Viewer,
                         projects: vec![],
+                        expires_at: None,
                     }
                 ],
             }),
@@ -355,6 +370,7 @@ mod tests {
                     sha256: "not-a-digest".into(),
                     role: Role::Viewer,
                     projects: vec![],
+                    expires_at: None,
                 }],
             }),
             Err(AuthError::InvalidTokenDigest(_))
@@ -372,5 +388,45 @@ mod tests {
             token_digest(&first),
             hex::encode(Sha256::digest(first.as_bytes()))
         );
+    }
+
+    #[test]
+    fn expired_tokens_are_rejected_without_breaking_legacy_policy_json() {
+        let now = Utc::now();
+        let policy = AuthPolicy::from_document(AuthPolicyDocument {
+            version: AUTH_POLICY_VERSION,
+            tokens: vec![
+                ApiTokenRecord {
+                    id: "expired".into(),
+                    sha256: token_digest("expired-token"),
+                    role: Role::Viewer,
+                    projects: vec![],
+                    expires_at: Some(now - chrono::Duration::seconds(1)),
+                },
+                ApiTokenRecord {
+                    id: "future".into(),
+                    sha256: token_digest("future-token"),
+                    role: Role::Viewer,
+                    projects: vec![],
+                    expires_at: Some(now + chrono::Duration::seconds(60)),
+                },
+            ],
+        })
+        .expect("expiring policy");
+        assert!(policy.authenticate_at("expired-token", now).is_none());
+        assert_eq!(
+            policy
+                .authenticate_at("future-token", now)
+                .expect("future token")
+                .id(),
+            "future"
+        );
+
+        let legacy: ApiTokenRecord = serde_json::from_str(&format!(
+            "{{\"id\":\"legacy\",\"sha256\":\"{}\",\"role\":\"viewer\",\"projects\":[]}}",
+            token_digest("legacy-token")
+        ))
+        .expect("legacy token record");
+        assert!(legacy.expires_at.is_none());
     }
 }

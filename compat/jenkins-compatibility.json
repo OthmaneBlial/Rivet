@@ -124,7 +124,7 @@
       "feature": "Protected server API transport",
       "status": "partial",
       "evidence": ["crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
-      "notes": "Optional in-memory Bearer-token protection, mandatory authentication for non-loopback binds, exact CORS origins, request limits, baseline security headers, and a private policy file with digest-backed roles, project-scoped route authorization, and local token creation/listing/revocation are supported; user accounts, sessions, expiration, audit history, and external identity providers remain planned."
+      "notes": "Optional in-memory Bearer-token protection, mandatory authentication for non-loopback binds, exact CORS origins, request limits, baseline security headers, and a private policy file with digest-backed roles, project-scoped route authorization, local token creation/listing/revocation, and optional RFC3339 expiration enforcement are supported; user accounts, sessions, audit history, and external identity providers remain planned."
     },
     {
       "category": "Security",
