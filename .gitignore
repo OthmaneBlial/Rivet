@@ -4,6 +4,7 @@
 /target/
 
 # Local application state and credentials
+/.rivet/
 *.db
 *.db-shm
 *.db-wal

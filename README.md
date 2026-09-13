@@ -5,7 +5,7 @@ from Jenkins.
 
 ## Delivery progress
 
-**44% verified** · `█████████░░░░░░░░░░░`<br>
+**47% verified** · `█████████░░░░░░░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -15,7 +15,7 @@ Last verified update: **2026-09-13** · native pipeline execution, FIFO queue,
 SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
 inspection, persisted build-source identity, live queue telemetry, durable
 event replay, quiet engine offline recovery, and explicit Git preparation at
-build admission milestone.
+build admission, parameterized builds, and local artifact storage milestone.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -100,6 +100,23 @@ program = "cargo"
 args = ["test"]
 timeout_seconds = 300
 ```
+
+Build parameters and local artifacts are also explicit:
+
+```toml
+[[parameters]]
+name = "TARGET"
+default = "debug"
+
+[[artifacts]]
+name = "bundle"
+paths = ["dist/**"]
+```
+
+Parameters are resolved and persisted per build, then exposed to direct
+processes as environment variables. Artifact files stay inside the pipeline
+workspace, are copied to local Rivet storage with a SHA-256 checksum, and are
+available through the build artifacts API or `rivet artifacts`.
 
 Shell parsing is not implicit. A later pipeline feature may add an explicit
 shell step with a documented threat boundary; direct process execution is the

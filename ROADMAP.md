@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **44 / 100 points**.
+The current verified total is **47 / 100 points**.
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
@@ -21,7 +21,7 @@ The current verified total is **44 / 100 points**.
 | Triggers and scheduling | 5 | planned | manual, webhook, API, cron, upstream triggers with deterministic tests |
 | Remote agents | 10 | planned | authenticated versioned protocol, heartbeat, assignment, reconnect, failure handling |
 | Container execution | 4 | planned | isolated Docker mode with cleanup, timeout, cancellation, artifact extraction |
-| Artifacts | 4 | planned | upload/download, checksums, retention, metadata, pluggable storage boundary |
+| Artifacts | 4 | partial | local workspace collection, upload/download, checksums, metadata, and a storage boundary pass; retention and remote backends remain |
 | CI cache | 3 | planned | safe keys, fallback behavior, corruption regression tests |
 | Secrets and credentials | 6 | planned | encryption/access boundary, masking, non-serialization, threat documentation |
 | Authentication and authorization | 4 | planned | users, sessions, tokens, roles, project permissions |

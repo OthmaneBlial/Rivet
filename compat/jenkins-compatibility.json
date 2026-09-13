@@ -43,6 +43,13 @@
       "notes": "Priority, resource requirements, and observable queue administration remain planned."
     },
     {
+      "category": "Artifacts",
+      "feature": "Build artifact collection, checksums, and download",
+      "status": "partial",
+      "evidence": ["crates/rivet-core/src/pipeline.rs", "crates/rivet-storage/src/lib.rs", "crates/rivet-server/src/lib.rs"],
+      "notes": "Local workspace artifacts are copied into build-scoped storage and exposed through the API; retention policies and remote object stores remain planned."
+    },
+    {
       "category": "Execution",
       "feature": "Cancellation, timeout, and process-group cleanup",
       "status": "partial",
