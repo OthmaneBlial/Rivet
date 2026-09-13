@@ -34,7 +34,7 @@
       "feature": "Retry completed builds with preserved parameters",
       "status": "partial",
       "evidence": ["crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
-      "notes": "A retry creates a new build and reuses persisted parameters; richer retry policies and attempt grouping remain planned."
+      "notes": "A retry creates a new build and reuses persisted non-secret parameters; secret parameters require explicit replacement values, while richer retry policies and attempt grouping remain planned."
     },
     {
       "category": "Logs",
@@ -103,6 +103,13 @@
       "status": "partial",
       "evidence": ["crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
       "notes": "Optional in-memory Bearer-token protection, mandatory authentication for non-loopback binds, exact CORS origins, request limits, and baseline security headers are supported; user identity, roles, and project permissions remain planned."
+    },
+    {
+      "category": "Security",
+      "feature": "Secret parameter redaction and log masking",
+      "status": "partial",
+      "evidence": ["crates/rivet-core/src/pipeline.rs", "crates/rivet-storage/src/lib.rs", "crates/rivet-runner/src/pipeline.rs", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
+      "notes": "Secret parameters require runtime input without defaults, are redacted in persisted build/API data, masked in emitted process output, and must be supplied again for retries; encrypted storage, credential ownership, and access control remain planned."
     },
     {
       "category": "Plugins",

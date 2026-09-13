@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **60 / 100 points**.
+The current verified total is **63 / 100 points**.
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
@@ -23,7 +23,7 @@ The current verified total is **60 / 100 points**.
 | Container execution | 4 | planned | isolated Docker mode with cleanup, timeout, cancellation, artifact extraction |
 | Artifacts | 4 | partial | local workspace collection, upload/download, checksums, metadata, and a storage boundary pass; retention and remote backends remain |
 | CI cache | 3 | planned | safe keys, fallback behavior, corruption regression tests |
-| Secrets and credentials | 6 | planned | encryption/access boundary, masking, non-serialization, threat documentation |
+| Secrets and credentials | 6 | partial | secret parameters require explicit runtime values, persisted values/API responses are redacted, logs are masked, and retries require fresh secret input; encryption/access control and a credential store remain |
 | Authentication and authorization | 4 | partial | protected remote transport with private Bearer tokens passes; users, sessions, roles, and project permissions remain |
 | Extension protocol | 4 | planned | versioned WASM/subprocess/protocol boundary and frontend extension model |
 | Jenkins migration analyzer | 3 | planned | measured Jenkinsfile analysis with supported/partial/unsupported output |
@@ -39,6 +39,6 @@ scaffold, passing unrelated test, or interface alone does not complete a gate.
 
 The next gates are the final Tauri-window flow inside the packaged app, API
 deployment hardening, remote assignment/failure handling, the SCM
-credential/provider boundary, and provider webhook adapters/repository-event
-mapping. Test clean checkout behavior without exposing credentials to logs or
-persisted state.
+credential/provider boundary, provider webhook adapters/repository-event
+mapping, and an encrypted credential store. Test clean checkout behavior
+without exposing credentials to logs or persisted state.

@@ -5,7 +5,7 @@ from Jenkins.
 
 ## Delivery progress
 
-**60% verified** · `████████████░░░░░░░░`<br>
+**63% verified** · `████████████▋░░░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -19,10 +19,11 @@ admission, parameterized builds, local artifact storage, protected server
 transport, build retry, pre-execution queue cancellation, build artifact
 downloads, and a light-default desktop theme with an accessible dark-mode
 toggle, persistent UTC cron schedules, server dispatch, desktop schedule
-controls, and signed generic webhook delivery with idempotent redelivery.
-The server also exposes a versioned agent handshake/heartbeat registry with
-online and stale state, while remote build assignment remains intentionally
-unimplemented until its transport and failure semantics are complete.
+controls, signed generic webhook delivery with idempotent redelivery, and
+secret-parameter redaction/masking. The server also exposes a versioned agent
+handshake/heartbeat registry with online and stale state, while remote build
+assignment remains intentionally unimplemented until its transport and
+failure semantics are complete.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -156,8 +157,10 @@ cargo run -p rivet -- run rivet --fetch --revision main --clean
 Cleaning is never implicit.
 
 Completed builds can be retried without losing their original history. The
-retry creates a new build number and reuses the original resolved parameters
-unless the API caller supplies replacements.
+retry creates a new build number and reuses the original non-secret resolved
+parameters unless the API caller supplies replacements. Secret parameters must
+be supplied again explicitly with `--param NAME=VALUE` on the CLI or in the
+API request body.
 
 Schedules can also be managed from the CLI. Expressions use UTC and accept
 the familiar five-field form:
@@ -191,15 +194,22 @@ Build parameters and local artifacts are also explicit:
 name = "TARGET"
 default = "debug"
 
+[[parameters]]
+name = "DEPLOY_TOKEN"
+secret = true
+
 [[artifacts]]
 name = "bundle"
 paths = ["dist/**"]
 ```
 
-Parameters are resolved and persisted per build, then exposed to direct
-processes as environment variables. Artifact files stay inside the pipeline
-workspace, are copied to local Rivet storage with a SHA-256 checksum, and are
-available through the build artifacts API or `rivet artifacts`.
+Parameters are resolved per build and exposed to direct processes as
+environment variables. Non-secret values are persisted for history; secret
+parameters cannot define defaults, are represented as `[redacted]` in stored
+build data and API responses, and are replaced with `***` in emitted logs.
+Artifact files stay inside the pipeline workspace, are copied to local Rivet
+storage with a SHA-256 checksum, and are available through the build artifacts
+API or `rivet artifacts`.
 
 Shell parsing is not implicit. A later pipeline feature may add an explicit
 shell step with a documented threat boundary; direct process execution is the
