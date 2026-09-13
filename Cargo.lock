@@ -1120,6 +1120,7 @@ dependencies = [
  "hex",
  "rivet-agent-protocol",
  "rivet-auth",
+ "rivet-compat",
  "rivet-core",
  "rivet-credentials",
  "rivet-migration",
@@ -1162,6 +1163,15 @@ dependencies = [
  "subtle",
  "thiserror",
  "zeroize",
+]
+
+[[package]]
+name = "rivet-compat"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

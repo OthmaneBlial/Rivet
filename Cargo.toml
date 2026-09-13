@@ -4,6 +4,7 @@ members = [
     "crates/rivet-agent-protocol",
     "crates/rivet-extension-protocol",
     "crates/rivet-auth",
+    "crates/rivet-compat",
     "crates/rivet-credentials",
     "crates/rivet-migration",
     "crates/rivet-runner",

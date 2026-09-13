@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "scenario": "sequential-build",
+  "jenkins": {
+    "status": "SUCCESS",
+    "stages": [
+      {
+        "name": "Test",
+        "status": "SUCCESS",
+        "steps": [
+          { "name": "unit", "status": "SUCCESS", "exit_code": 0 }
+        ]
+      }
+    ],
+    "parameters": { "TARGET": "release", "TOKEN": "***" },
+    "artifacts": [
+      { "name": "bundle", "checksum": "sha256:ABCDEF" }
+    ],
+    "logs": ["unit tests passed\r\n"]
+  },
+  "rivet": {
+    "status": "passed",
+    "stages": [
+      {
+        "name": "Test",
+        "status": "passed",
+        "steps": [
+          { "name": "unit", "status": "passed", "exit_code": 0 }
+        ]
+      }
+    ],
+    "parameters": { "TARGET": "release", "TOKEN": "[redacted]" },
+    "artifacts": [
+      { "name": "bundle", "checksum": "abcdef" }
+    ],
+    "logs": ["unit tests passed\n"]
+  }
+}

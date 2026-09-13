@@ -10,6 +10,7 @@ use rivet_agent_protocol::{
 use rivet_auth::{
     ApiTokenRecord, AuthPolicy, AuthPolicyDocument, Role as AuthRole, generate_token, token_digest,
 };
+use rivet_compat::{BehaviorFixture, compare_fixture};
 use rivet_core::{
     BuildEvent, BuildStatus, CronExpression, ExecutionPlan, LogStream, Pipeline, Project,
     ScheduleId, SourceSnapshot,
@@ -163,6 +164,11 @@ enum Command {
         #[command(subcommand)]
         command: AnalyzeCommand,
     },
+    /// Compare recorded Jenkins/Rivet semantics locally.
+    Compat {
+        #[command(subcommand)]
+        command: CompatCommand,
+    },
     /// Connect this machine to a Rivet server as a build agent.
     Agent(AgentArgs),
 }
@@ -293,6 +299,12 @@ enum AnalyzeCommand {
         #[arg(long)]
         draft: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum CompatCommand {
+    /// Normalize and compare one exported behavior fixture.
+    Compare { fixture: PathBuf },
 }
 
 #[derive(Debug, Args)]
@@ -469,6 +481,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Credential { command } => manage_credentials(&cli.data_dir, command)?,
         Command::Auth { command } => manage_auth(command)?,
         Command::Analyze { command } => analyze_file(command)?,
+        Command::Compat { command } => compare_compatibility(command)?,
         Command::Agent(args) => run_agent(args).await?,
     }
     Ok(())
@@ -492,6 +505,20 @@ fn analyze_file(command: AnalyzeCommand) -> Result<(), Box<dyn std::error::Error
                 })
             };
             println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+    }
+    Ok(())
+}
+
+fn compare_compatibility(command: CompatCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        CompatCommand::Compare { fixture } => {
+            let fixture = BehaviorFixture::from_json(&fs::read(&fixture)?)?;
+            let report = compare_fixture(&fixture)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.matches {
+                return Err("compatibility fixture contains semantic differences".into());
+            }
         }
     }
     Ok(())
