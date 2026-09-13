@@ -21,10 +21,11 @@ downloads, and a light-default desktop theme with an accessible dark-mode
 toggle, persistent UTC cron schedules, server dispatch, desktop schedule
 controls, signed generic webhook delivery with idempotent redelivery,
 secret-parameter redaction/masking, and a packaged desktop launch with an
-ephemeral loopback engine origin. The server also exposes a versioned agent
-handshake/heartbeat registry with online and stale state, while remote build
-assignment remains intentionally unimplemented until its transport and
-failure semantics are complete.
+ephemeral loopback engine origin, plus project-scoped local CI cache restore and
+save. The server also exposes a versioned agent handshake/heartbeat registry
+with online and stale state, while remote build assignment remains
+intentionally unimplemented until its transport and failure semantics are
+complete.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -199,6 +200,11 @@ default = "debug"
 name = "DEPLOY_TOKEN"
 secret = true
 
+[[caches]]
+name = "rust-target"
+key = "rust-target-v1"
+paths = ["target"]
+
 [[artifacts]]
 name = "bundle"
 paths = ["dist/**"]
@@ -208,9 +214,12 @@ Parameters are resolved per build and exposed to direct processes as
 environment variables. Non-secret values are persisted for history; secret
 parameters cannot define defaults, are represented as `[redacted]` in stored
 build data and API responses, and are replaced with `***` in emitted logs.
-Artifact files stay inside the pipeline workspace, are copied to local Rivet
-storage with a SHA-256 checksum, and are available through the build artifacts
-API or `rivet artifacts`.
+Cache paths use an exact project-scoped key, restore before the first stage, and
+save only after a successful build to an atomic archive under Rivet's local
+data directory; a missing or corrupt cache never fails the build. Artifact
+files stay inside the pipeline workspace, are copied to local Rivet storage
+with a SHA-256 checksum, and are available through the build artifacts API or
+`rivet artifacts`.
 
 Shell parsing is not implicit. A later pipeline feature may add an explicit
 shell step with a documented threat boundary; direct process execution is the

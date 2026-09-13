@@ -22,7 +22,7 @@ The current verified total is **63 / 100 points**.
 | Remote agents | 10 | partial | authenticated versioned registration/heartbeat contract, capability matching vocabulary, reconnect-safe sessions, and stale detection pass; assignment, remote execution, transfer, and lost-job recovery remain |
 | Container execution | 4 | planned | isolated Docker mode with cleanup, timeout, cancellation, artifact extraction |
 | Artifacts | 4 | partial | local workspace collection, upload/download, checksums, metadata, and a storage boundary pass; retention and remote backends remain |
-| CI cache | 3 | planned | safe keys, fallback behavior, corruption regression tests |
+| CI cache | 3 | partial | validated exact project-scoped keys, safe relative paths, atomic local archive save/restore, and corrupt-entry recovery pass; fallback keys, eviction, and remote cache backends remain |
 | Secrets and credentials | 6 | partial | secret parameters require explicit runtime values, persisted values/API responses are redacted, logs are masked, and retries require fresh secret input; encryption/access control and a credential store remain |
 | Authentication and authorization | 4 | partial | protected remote transport with private Bearer tokens passes; users, sessions, roles, and project permissions remain |
 | Extension protocol | 4 | planned | versioned WASM/subprocess/protocol boundary and frontend extension model |

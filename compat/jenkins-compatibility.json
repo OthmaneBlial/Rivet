@@ -64,6 +64,13 @@
       "notes": "Validated locally on Unix; remote agents and container execution are planned."
     },
     {
+      "category": "Cache",
+      "feature": "Project-scoped local CI cache",
+      "status": "partial",
+      "evidence": ["crates/rivet-core/src/pipeline.rs", "crates/rivet-runner/src/cache.rs", "crates/rivet-runner/src/pipeline.rs", "crates/rivet-runner/src/scheduler.rs"],
+      "notes": "Exact relative cache paths are validated, entries are isolated by project and key, restored before execution, and saved atomically after success; fallback keys, eviction, and remote backends remain planned."
+    },
+    {
       "category": "Jenkinsfile",
       "feature": "Jenkinsfile parsing",
       "status": "planned",
