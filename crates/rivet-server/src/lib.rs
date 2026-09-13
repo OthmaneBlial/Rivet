@@ -227,6 +227,8 @@ impl IntoResponse for ApiError {
                 CredentialError::CredentialNotFound(_) => StatusCode::NOT_FOUND,
                 CredentialError::InvalidId(_)
                 | CredentialError::InvalidUsername
+                | CredentialError::InvalidProject(_)
+                | CredentialError::TooManyProjects
                 | CredentialError::EmptySecret
                 | CredentialError::WeakPassphrase => StatusCode::BAD_REQUEST,
                 CredentialError::SymlinkPath(_)

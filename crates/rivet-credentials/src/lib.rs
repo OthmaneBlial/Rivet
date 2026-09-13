@@ -27,6 +27,7 @@ const MIN_PASSPHRASE_BYTES: usize = 12;
 const MAX_ID_BYTES: usize = 64;
 const MAX_USERNAME_BYTES: usize = 256;
 const MAX_PROJECT_BYTES: usize = 256;
+const MAX_PROJECTS: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum CredentialError {
@@ -42,6 +43,10 @@ pub enum CredentialError {
     InvalidId(String),
     #[error("credential username is empty or too long")]
     InvalidUsername,
+    #[error("credential project scope is invalid: {0}")]
+    InvalidProject(String),
+    #[error("credential project scope contains too many projects")]
+    TooManyProjects,
     #[error("credential secret cannot be empty")]
     EmptySecret,
     #[error("credential was not found: {0}")]
@@ -312,7 +317,7 @@ impl CredentialVault {
         let secret = secret.into();
         let projects = projects
             .into_iter()
-            .map(Into::into)
+            .map(|project| project.into().trim().to_owned())
             .collect::<BTreeSet<_>>();
         validate_id(&id)?;
         validate_username(&username)?;
@@ -406,6 +411,9 @@ fn validate_username(username: &str) -> Result<(), CredentialError> {
 }
 
 fn validate_projects(projects: &BTreeSet<String>) -> Result<(), CredentialError> {
+    if projects.len() > MAX_PROJECTS {
+        return Err(CredentialError::TooManyProjects);
+    }
     for project in projects {
         validate_project(project)?;
     }
@@ -419,9 +427,7 @@ fn validate_project(project: &str) -> Result<(), CredentialError> {
         || project.contains('\\')
         || project.contains('\0')
     {
-        return Err(CredentialError::InvalidFormat(format!(
-            "credential project scope is invalid: {project:?}"
-        )));
+        return Err(CredentialError::InvalidProject(project.to_owned()));
     }
     Ok(())
 }
@@ -617,6 +623,30 @@ mod tests {
         let vault = CredentialVault::open(&path, PASSPHRASE).expect("reopen");
         assert!(vault.get_for_project("github", "release").is_ok());
         assert!(vault.get_for_project("github", "other").is_err());
+    }
+
+    #[test]
+    fn project_scopes_are_trimmed_and_bounded() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("credentials.vault");
+        let mut vault = CredentialVault::open_or_create(&path, PASSPHRASE).expect("create");
+        vault
+            .set_http_basic_for_projects("github", "oauth2", "secret", [" release "])
+            .expect("trim scope");
+        assert_eq!(vault.list()[0].projects, vec!["release"]);
+        assert!(matches!(
+            vault.set_http_basic_for_projects(
+                "too-many",
+                "oauth2",
+                "secret",
+                (0..=MAX_PROJECTS).map(|index| format!("project-{index}")),
+            ),
+            Err(CredentialError::TooManyProjects)
+        ));
+        assert!(matches!(
+            vault.set_http_basic_for_projects("invalid", "oauth2", "secret", ["bad/name"]),
+            Err(CredentialError::InvalidProject(_))
+        ));
     }
 
     #[test]
