@@ -1,6 +1,8 @@
+use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use rivet_core::{
-    BuildEvent, BuildStatus, ExecutionPlan, LogStream, Pipeline, Project, SourceSnapshot,
+    BuildEvent, BuildStatus, CronExpression, ExecutionPlan, LogStream, Pipeline, Project,
+    ScheduleId, SourceSnapshot,
 };
 use rivet_runner::{QueueHandle, Scheduler};
 use rivet_scm::{GitPrepareOptions, GitRepository, ScmError};
@@ -82,12 +84,39 @@ enum Command {
         #[command(subcommand)]
         command: ScmCommand,
     },
+    /// Manage persisted UTC cron schedules.
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum ProjectCommand {
     Create(CreateProject),
     List,
+}
+
+#[derive(Debug, Subcommand)]
+enum ScheduleCommand {
+    /// Create an enabled UTC cron schedule for a project.
+    Create {
+        project: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        expression: String,
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// List the project's persisted schedules.
+    List { project: String },
+    /// Enable a schedule by UUID.
+    Enable { project: String, id: ScheduleId },
+    /// Disable a schedule by UUID.
+    Disable { project: String, id: ScheduleId },
+    /// Delete a schedule by UUID.
+    Delete { project: String, id: ScheduleId },
 }
 
 #[derive(Debug, Args)]
@@ -162,6 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?
         }
         Command::Scm { command } => inspect_scm(command).await?,
+        Command::Schedule { command } => manage_schedule(&cli.data_dir, command)?,
     }
     Ok(())
 }
@@ -198,6 +228,111 @@ async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Erro
 
 fn open_storage(data_dir: &Path) -> Result<Storage, Box<dyn std::error::Error>> {
     Ok(Storage::open(data_dir.join("rivet.db"))?)
+}
+
+fn manage_schedule(
+    data_dir: &Path,
+    command: ScheduleCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = open_storage(data_dir)?;
+    match command {
+        ScheduleCommand::Create {
+            project,
+            name,
+            expression,
+            disabled,
+        } => {
+            let project_record = storage
+                .get_project_by_name(&project)?
+                .ok_or_else(|| format!("project not found: {project}"))?;
+            let name = validate_schedule_name(name)?;
+            let expression = CronExpression::parse(&expression)?;
+            let next_run_at = expression.next_after(Utc::now())?;
+            let schedule = storage.create_schedule(
+                project_record.id,
+                name,
+                expression.expression(),
+                !disabled,
+                next_run_at,
+            )?;
+            println!(
+                "Created schedule {} ({}) next {}",
+                schedule.name,
+                schedule.id,
+                schedule.next_run_at.to_rfc3339()
+            );
+        }
+        ScheduleCommand::List { project } => {
+            let project_record = storage
+                .get_project_by_name(&project)?
+                .ok_or_else(|| format!("project not found: {project}"))?;
+            for schedule in storage.list_schedules(project_record.id)? {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    schedule.id,
+                    if schedule.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    schedule.name,
+                    schedule.expression,
+                    schedule.next_run_at.to_rfc3339()
+                );
+            }
+        }
+        ScheduleCommand::Enable { project, id } => {
+            set_schedule_enabled(&storage, &project, id, true)?;
+        }
+        ScheduleCommand::Disable { project, id } => {
+            set_schedule_enabled(&storage, &project, id, false)?;
+        }
+        ScheduleCommand::Delete { project, id } => {
+            let project_record = storage
+                .get_project_by_name(&project)?
+                .ok_or_else(|| format!("project not found: {project}"))?;
+            if !storage.delete_schedule(project_record.id, id)? {
+                return Err(format!("schedule not found: {project} {id}").into());
+            }
+            println!("Deleted schedule {id}");
+        }
+    }
+    Ok(())
+}
+
+fn set_schedule_enabled(
+    storage: &Storage,
+    project: &str,
+    id: ScheduleId,
+    enabled: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let project_record = storage
+        .get_project_by_name(project)?
+        .ok_or_else(|| format!("project not found: {project}"))?;
+    let schedule = storage
+        .set_schedule_enabled(project_record.id, id, enabled)?
+        .ok_or_else(|| format!("schedule not found: {project} {id}"))?;
+    println!(
+        "Schedule {} {}",
+        schedule.id,
+        if schedule.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    Ok(())
+}
+
+fn validate_schedule_name(name: String) -> Result<String, Box<dyn std::error::Error>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("schedule name cannot be empty".into());
+    }
+    if name.contains('/') || name.contains('\\') || name.chars().any(char::is_control) {
+        return Err("schedule name cannot contain path separators or control characters".into());
+    }
+    Ok(name.to_owned())
 }
 
 fn read_auth_token(path: &Path) -> Result<String, Box<dyn std::error::Error>> {

@@ -9,6 +9,7 @@ name = "rivet"
 path = "src/main.rs"
 
 [dependencies]
+chrono.workspace = true
 clap.workspace = true
 rivet-core = { path = "../rivet-core" }
 rivet-runner = { path = "../rivet-runner" }
