@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **93% verified** · `███████████████████░`<br>
-Weighted evidence score: **93.87 / 100** · displayed conservatively as the
+Weighted evidence score: **93.93 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -708,7 +708,9 @@ constructs, source line numbers, and Rivet mapping guidance. The optional
 draft emits a valid Rivetfile for simple, explicitly quoted `sh`/`bat` steps
 and leaves ambiguous commands, credentials, plugins, and lifecycle behavior in
 warnings. It never executes Groovy or plugin code; complex migration semantics
-still need manual review.
+still need manual review. Generated declarative stages retain Jenkins'
+sequential order through explicit Rivet dependencies, and the fixture suite
+keeps unsupported approval stages visible instead of silently dropping them.
 
 Shell parsing is not implicit. A later pipeline feature may add an explicit
 shell step with a documented threat boundary; direct process execution is the

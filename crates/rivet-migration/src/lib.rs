@@ -530,25 +530,30 @@ pub fn generate_rivetfile_draft(source: &str) -> Result<RivetfileDraft, Migratio
     }
 
     let mut skipped_stages = Vec::new();
-    let stages = stage_drafts
-        .into_iter()
-        .filter_map(|stage| {
-            if stage.steps.is_empty() {
-                skipped_stages.push(stage.name.clone());
-                warnings.push(format!(
-                    "stage {:?}: no deterministic sh/bat step was generated",
-                    stage.name
-                ));
-                return None;
-            }
-            Some(Stage {
-                name: stage.name,
-                depends_on: Vec::new(),
-                condition: None,
-                steps: stage.steps,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut stages = Vec::new();
+    for stage in stage_drafts {
+        if stage.steps.is_empty() {
+            skipped_stages.push(stage.name.clone());
+            warnings.push(format!(
+                "stage {:?}: no deterministic sh/bat step was generated",
+                stage.name
+            ));
+            continue;
+        }
+        // Jenkins declarative stages are sequential unless `parallel` is
+        // explicit. Keep that contract visible in the generated Rivet DAG;
+        // independent stages are otherwise eligible for parallel execution.
+        let depends_on = stages
+            .last()
+            .map(|stage: &Stage| vec![stage.name.clone()])
+            .unwrap_or_default();
+        stages.push(Stage {
+            name: stage.name,
+            depends_on,
+            condition: None,
+            steps: stage.steps,
+        });
+    }
 
     let converted_steps = stages.iter().map(|stage| stage.steps.len()).sum();
     let rivetfile_toml = if stages.is_empty() {
@@ -918,6 +923,36 @@ pipeline {
         assert_eq!(pipeline.stages[0].steps[0].program, "sh");
         assert_eq!(pipeline.stages[0].steps[0].args, ["-c", "cargo build"]);
         assert!(draft.warnings.is_empty());
+    }
+
+    #[test]
+    fn fixture_conversion_preserves_jenkins_stage_order_and_unsupported_review() {
+        let source = include_str!("../fixtures/sequential-shell-pipeline.Jenkinsfile");
+        let draft = generate_rivetfile_draft(source).expect("fixture draft");
+
+        assert_eq!(draft.status, SupportLevel::Unsupported);
+        assert_eq!(draft.converted_steps, 2);
+        assert_eq!(draft.skipped_stages, ["Review"]);
+        assert!(
+            draft
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no deterministic"))
+        );
+
+        let rivetfile = draft.rivetfile_toml.expect("fixture Rivetfile");
+        let pipeline = rivet_core::Pipeline::from_toml_str(&rivetfile).expect("valid Rivetfile");
+        assert_eq!(
+            pipeline
+                .stages
+                .iter()
+                .map(|stage| stage.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Build", "Test"]
+        );
+        assert!(pipeline.stages[0].depends_on.is_empty());
+        assert_eq!(pipeline.stages[1].depends_on, ["Build"]);
+        assert_eq!(pipeline.stages[1].steps[0].args, ["-c", "cargo test"]);
     }
 
     #[test]
