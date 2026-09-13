@@ -4,9 +4,10 @@
 //! queueing, process supervision, and state projection remain in the shared
 //! crates so desktop and server modes execute the same code.
 
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -16,7 +17,7 @@ use rivet_core::{
 };
 use rivet_runner::{QueueHandle, QueueStats, Scheduler};
 use rivet_scm::{GitPrepareOptions, GitRepository, GitSnapshot, ScmError};
-use rivet_storage::{BuildDetails, BuildRecord, LogRecord, Storage, StorageError};
+use rivet_storage::{ArtifactRecord, BuildDetails, BuildRecord, LogRecord, Storage, StorageError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -55,6 +56,10 @@ enum ApiError {
     InvalidRepository(PathBuf),
     #[error("pipeline path is not a file: {0}")]
     InvalidPipeline(PathBuf),
+    #[error("artifact {0} was not found")]
+    ArtifactNotFound(uuid::Uuid),
+    #[error("could not read artifact: {0}")]
+    ArtifactRead(#[source] std::io::Error),
     #[error("{0}")]
     BadRequest(String),
     #[error(transparent)]
@@ -76,6 +81,8 @@ impl IntoResponse for ApiError {
             Self::InvalidRepository(_) | Self::InvalidPipeline(_) | Self::BadRequest(_) => {
                 StatusCode::BAD_REQUEST
             }
+            Self::ArtifactNotFound(_) => StatusCode::NOT_FOUND,
+            Self::ArtifactRead(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Scm(error) => match error {
                 rivet_scm::ScmError::InvalidRepository(_)
                 | rivet_scm::ScmError::NotGitRepository(_) => StatusCode::BAD_REQUEST,
@@ -139,6 +146,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/projects/{name}/builds/{number}/logs",
             get(get_logs),
+        )
+        .route(
+            "/api/v1/projects/{name}/builds/{number}/artifacts",
+            get(get_artifacts),
+        )
+        .route(
+            "/api/v1/projects/{name}/builds/{number}/artifacts/{artifact_id}",
+            get(download_artifact),
         )
         .route(
             "/api/v1/projects/{name}/builds/{number}/events",
@@ -312,6 +327,48 @@ async fn get_logs(
     Ok(Json(state.storage.logs(build.id)?))
 }
 
+async fn get_artifacts(
+    State(state): State<AppState>,
+    AxumPath((name, number)): AxumPath<(String, i64)>,
+) -> Result<Json<Vec<ArtifactRecord>>, ApiError> {
+    let project = project_by_name(&state.storage, &name)?;
+    let build = build_by_number(&state.storage, project.id, &name, number)?;
+    Ok(Json(state.storage.artifacts(build.id)?))
+}
+
+async fn download_artifact(
+    State(state): State<AppState>,
+    AxumPath((name, number, artifact_id)): AxumPath<(String, i64, uuid::Uuid)>,
+) -> Result<Response, ApiError> {
+    let project = project_by_name(&state.storage, &name)?;
+    let build = build_by_number(&state.storage, project.id, &name, number)?;
+    let Some((artifact, path)) = state.storage.artifact_file(artifact_id)? else {
+        return Err(ApiError::ArtifactNotFound(artifact_id));
+    };
+    if artifact.build_id != build.id {
+        return Err(ApiError::ArtifactNotFound(artifact_id));
+    }
+    let bytes = std::fs::read(path).map_err(ApiError::ArtifactRead)?;
+    let filename = artifact
+        .relative_path
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("artifact")
+        .replace(['"', '\r', '\n'], "_");
+    let mut response = Response::new(Body::from(bytes));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
+    Ok(response)
+}
+
 async fn queue_build(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
@@ -341,8 +398,16 @@ async fn queue_build(
     let (events, mut received_events) = mpsc::channel(512);
     let event_storage = state.storage.clone();
     let event_bus = state.events.clone();
+    let artifact_pipeline = pipeline.clone();
+    let artifact_workspace = repository_root.clone();
     tokio::spawn(async move {
         while let Some(event) = received_events.recv().await {
+            let event = finalize_artifacts(
+                &event_storage,
+                &artifact_pipeline,
+                &artifact_workspace,
+                event,
+            );
             if let Err(error) = event_storage.apply_event(&event) {
                 tracing::error!(?error, "could not project Rivet build event");
                 continue;
@@ -372,6 +437,31 @@ async fn queue_build(
             status: BuildStatus::Queued,
         }),
     ))
+}
+
+fn finalize_artifacts(
+    storage: &Storage,
+    pipeline: &Pipeline,
+    workspace: &Path,
+    event: BuildEvent,
+) -> BuildEvent {
+    let BuildEvent::BuildFinished {
+        build_id,
+        status: BuildStatus::Passed,
+        timestamp,
+    } = &event
+    else {
+        return event;
+    };
+    if let Err(error) = storage.collect_artifacts(*build_id, pipeline, workspace) {
+        tracing::error!(?error, %build_id, "artifact collection failed");
+        return BuildEvent::BuildFinished {
+            build_id: *build_id,
+            status: BuildStatus::Failed,
+            timestamp: *timestamp,
+        };
+    }
+    event
 }
 
 async fn capture_source_snapshot(

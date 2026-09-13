@@ -57,6 +57,12 @@ enum Command {
         #[arg(long)]
         build: i64,
     },
+    /// Show artifacts collected for a build.
+    Artifacts {
+        project: String,
+        #[arg(long)]
+        build: i64,
+    },
     /// Run the headless HTTP/WebSocket service.
     Server {
         #[arg(long, default_value = "127.0.0.1:7878")]
@@ -136,6 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Run(args) => run_project(&cli.data_dir, args).await?,
         Command::Builds { project } => list_builds(&cli.data_dir, &project)?,
         Command::Logs { project, build } => show_logs(&cli.data_dir, &project, build)?,
+        Command::Artifacts { project, build } => list_artifacts(&cli.data_dir, &project, build)?,
         Command::Server { bind } => {
             rivet_server::serve(cli.data_dir.join("rivet.db"), bind).await?
         }
@@ -259,8 +266,16 @@ async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::
 
     let (events, mut received_events) = mpsc::channel(512);
     let event_storage = storage.clone();
+    let artifact_pipeline = pipeline.clone();
+    let artifact_workspace = PathBuf::from(project.repository_path.clone());
     let event_consumer = tokio::spawn(async move {
         while let Some(event) = received_events.recv().await {
+            let event = finalize_artifacts(
+                &event_storage,
+                &artifact_pipeline,
+                &artifact_workspace,
+                event,
+            );
             print_event(&event);
             event_storage.apply_event(&event)?;
         }
@@ -282,12 +297,43 @@ async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::
     let status = wait_for_build(handle, cancellation).await?;
     let consume_result = event_consumer.await??;
     let _ = consume_result;
+    let status = storage
+        .list_builds(project.id)?
+        .into_iter()
+        .find(|record| record.id == build.id)
+        .map(|record| record.status)
+        .unwrap_or(status);
 
     println!("Build #{} {}", build.number, status_label(&status));
     if status != BuildStatus::Passed {
         return Err(format!("build finished {}", status_label(&status)).into());
     }
     Ok(())
+}
+
+fn finalize_artifacts(
+    storage: &Storage,
+    pipeline: &Pipeline,
+    workspace: &Path,
+    event: BuildEvent,
+) -> BuildEvent {
+    let BuildEvent::BuildFinished {
+        build_id,
+        status: BuildStatus::Passed,
+        timestamp,
+    } = &event
+    else {
+        return event;
+    };
+    if let Err(error) = storage.collect_artifacts(*build_id, pipeline, workspace) {
+        eprintln!("artifact collection failed for {build_id}: {error}");
+        return BuildEvent::BuildFinished {
+            build_id: *build_id,
+            status: BuildStatus::Failed,
+            timestamp: *timestamp,
+        };
+    }
+    event
 }
 
 fn parse_parameters(values: &[String]) -> Result<BTreeMap<String, String>, String> {
@@ -384,6 +430,29 @@ fn show_logs(data_dir: &Path, name: &str, number: i64) -> Result<(), Box<dyn std
             LogStream::System => "system",
         };
         println!("{} [{}] {}", log.timestamp.to_rfc3339(), stream, log.line);
+    }
+    Ok(())
+}
+
+fn list_artifacts(
+    data_dir: &Path,
+    name: &str,
+    number: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = open_storage(data_dir)?;
+    let project = storage
+        .get_project_by_name(name)?
+        .ok_or_else(|| format!("project not found: {name}"))?;
+    let build = storage
+        .list_builds(project.id)?
+        .into_iter()
+        .find(|build| build.number == number)
+        .ok_or_else(|| format!("build not found: {name} #{number}"))?;
+    for artifact in storage.artifacts(build.id)? {
+        println!(
+            "{}\t{}\t{} bytes\t{}",
+            artifact.name, artifact.relative_path, artifact.size_bytes, artifact.checksum
+        );
     }
     Ok(())
 }

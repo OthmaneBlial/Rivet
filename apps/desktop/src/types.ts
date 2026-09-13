@@ -83,6 +83,16 @@ export interface LogRecord {
   line: string;
 }
 
+export interface ArtifactRecord {
+  id: string;
+  build_id: string;
+  name: string;
+  relative_path: string;
+  size_bytes: number;
+  checksum: string;
+  created_at: string;
+}
+
 export interface QueueResponse {
   build: BuildRecord;
   status: BuildStatus;

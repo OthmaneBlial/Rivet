@@ -1,6 +1,7 @@
 import type {
   BuildDetails,
   BuildRecord,
+  ArtifactRecord,
   LogRecord,
   Project,
   QueueResponse,
@@ -89,6 +90,12 @@ export function logs(project: string, number: number): Promise<LogRecord[]> {
   );
 }
 
+export function artifacts(project: string, number: number): Promise<ArtifactRecord[]> {
+  return request<ArtifactRecord[]>(
+    `/api/v1/projects/${encodeURIComponent(project)}/builds/${number}/artifacts`,
+  );
+}
+
 export function queueBuild(
   project: string,
   options: {
@@ -127,4 +134,8 @@ export function eventUrl(project: string, number: number): string {
   );
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
+}
+
+export function artifactUrl(project: string, number: number, artifactId: string): string {
+  return `${ENGINE_ORIGIN}/api/v1/projects/${encodeURIComponent(project)}/builds/${number}/artifacts/${encodeURIComponent(artifactId)}`;
 }
