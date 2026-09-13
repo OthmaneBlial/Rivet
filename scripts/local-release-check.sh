@@ -10,24 +10,22 @@ fi
 
 cd "$repo_root"
 
-if [ -d .github/workflows ]; then
-    echo "release check refused: GitHub Actions workflows are not part of this project" >&2
-    exit 1
-fi
+echo "[1/7] checking local progress and repository boundaries"
+./scripts/local-progress-check.sh
 
-echo "[1/6] checking Rust formatting"
+echo "[2/7] checking Rust formatting"
 cargo fmt --all -- --check
 
-echo "[2/6] running the local Rust workspace tests"
+echo "[3/7] running the local Rust workspace tests"
 cargo test --workspace
 
-echo "[3/6] building the release CLI"
+echo "[4/7] building the release CLI"
 cargo build --release -p rivet
 
-echo "[4/6] building the desktop client"
+echo "[5/7] building the desktop client"
 (cd apps/desktop && npm run build)
 
-echo "[5/6] checking the native Tauri host"
+echo "[6/7] checking the native Tauri host"
 cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
 
 mkdir -p "$release_output"
@@ -42,7 +40,7 @@ else
     exit 1
 fi
 
-echo "[6/6] writing the local release manifest"
+echo "[7/7] writing the local release manifest"
 jq -n \
     --arg commit "$(git rev-parse HEAD)" \
     --arg generated_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \

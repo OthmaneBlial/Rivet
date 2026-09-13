@@ -58,6 +58,11 @@ versioned SHA-256 manifest:
 ./scripts/local-release-check.sh
 ```
 
+The release gate first runs `scripts/local-progress-check.sh`, which verifies
+that the README percentage matches the weighted evidence calculation, that
+`base/jenkins` remains ignored, and that no GitHub Actions workflow has been
+added.
+
 This produces a locally verifiable artifact, not a signed installer, store
 submission, or hosted CI result.
 
