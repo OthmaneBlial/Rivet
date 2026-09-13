@@ -78,6 +78,9 @@ enum Command {
         /// Read a Bearer token from a private file without persisting it.
         #[arg(long)]
         token_file: Option<PathBuf>,
+        /// Read the generic webhook HMAC secret from a private file.
+        #[arg(long)]
+        webhook_secret_file: Option<PathBuf>,
     },
     /// Inspect or explicitly prepare a local Git repository.
     Scm {
@@ -182,11 +185,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Logs { project, build } => show_logs(&cli.data_dir, &project, build)?,
         Command::Artifacts { project, build } => list_artifacts(&cli.data_dir, &project, build)?,
         Command::Retry { project, build } => retry_project(&cli.data_dir, &project, build).await?,
-        Command::Server { bind, token_file } => {
+        Command::Server {
+            bind,
+            token_file,
+            webhook_secret_file,
+        } => {
             let auth_token = token_file.as_deref().map(read_auth_token).transpose()?;
+            let webhook_secret = webhook_secret_file
+                .as_deref()
+                .map(read_webhook_secret)
+                .transpose()?;
             rivet_server::serve_with_config(
                 cli.data_dir.join("rivet.db"),
-                rivet_server::ServerConfig { bind, auth_token },
+                rivet_server::ServerConfig {
+                    bind,
+                    auth_token,
+                    webhook_secret,
+                },
             )
             .await?
         }
@@ -336,23 +351,31 @@ fn validate_schedule_name(name: String) -> Result<String, Box<dyn std::error::Er
 }
 
 fn read_auth_token(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    read_private_value(path, "token")
+}
+
+fn read_webhook_secret(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    read_private_value(path, "webhook secret")
+}
+
+fn read_private_value(path: &Path, label: &str) -> Result<String, Box<dyn std::error::Error>> {
     let metadata = fs::metadata(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(format!(
-                "token file must not be group- or world-readable: {}",
+                "{label} file must not be group- or world-readable: {}",
                 path.display()
             )
             .into());
         }
     }
-    let token = fs::read_to_string(path)?.trim().to_owned();
-    if token.is_empty() {
-        return Err(format!("token file is empty: {}", path.display()).into());
+    let value = fs::read_to_string(path)?.trim().to_owned();
+    if value.is_empty() {
+        return Err(format!("{label} file is empty: {}", path.display()).into());
     }
-    Ok(token)
+    Ok(value)
 }
 
 fn init_repository(data_dir: &Path, repository: &Path) -> Result<(), Box<dyn std::error::Error>> {
