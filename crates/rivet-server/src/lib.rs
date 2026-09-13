@@ -406,6 +406,42 @@ pub async fn serve_with_config(
     storage_path: impl AsRef<Path>,
     config: ServerConfig,
 ) -> Result<(), ServerError> {
+    validate_config(&config)?;
+    let listener = TcpListener::bind(config.bind).await?;
+    serve_with_listener(storage_path, config, listener).await
+}
+
+/// Serve Rivet on a listener that has already been bound by the caller.
+///
+/// Desktop clients use an ephemeral loopback listener so another local
+/// process cannot make the embedded engine fail merely by occupying port
+/// 7878. The actual origin is communicated through the desktop command
+/// bridge before the webview starts its API requests.
+pub async fn serve_with_listener(
+    storage_path: impl AsRef<Path>,
+    config: ServerConfig,
+    listener: TcpListener,
+) -> Result<(), ServerError> {
+    let bind = listener.local_addr()?;
+    let config = ServerConfig { bind, ..config };
+    validate_config(&config)?;
+    let state = AppState::with_security(
+        Storage::open(storage_path)?,
+        config.auth_token.as_deref(),
+        config.webhook_secret.as_deref(),
+    );
+    let allowed_origins = if config.allowed_origins.is_empty() {
+        default_allowed_origins()
+    } else {
+        config.allowed_origins
+    };
+    tracing::info!(bind = %bind, "Rivet server listening");
+    spawn_schedule_dispatcher(state.clone());
+    axum::serve(listener, router_with_origins(state, &allowed_origins)?).await?;
+    Ok(())
+}
+
+fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
     if !config.bind.ip().is_loopback() && config.auth_token.is_none() {
         return Err(ServerError::AuthRequired(config.bind));
     }
@@ -423,20 +459,6 @@ pub async fn serve_with_config(
     {
         return Err(ServerError::EmptyWebhookSecret);
     }
-    let state = AppState::with_security(
-        Storage::open(storage_path)?,
-        config.auth_token.as_deref(),
-        config.webhook_secret.as_deref(),
-    );
-    let allowed_origins = if config.allowed_origins.is_empty() {
-        default_allowed_origins()
-    } else {
-        config.allowed_origins
-    };
-    let listener = TcpListener::bind(config.bind).await?;
-    tracing::info!(bind = %config.bind, "Rivet server listening");
-    spawn_schedule_dispatcher(state.clone());
-    axum::serve(listener, router_with_origins(state, &allowed_origins)?).await?;
     Ok(())
 }
 
