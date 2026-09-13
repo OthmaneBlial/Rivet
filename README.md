@@ -5,7 +5,7 @@ from Jenkins.
 
 ## Delivery progress
 
-**70% verified** · `██████████████░░░░░░`<br>
+**71% verified** · `██████████████▏░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -27,9 +27,9 @@ and a bounded Jenkinsfile migration analyzer with line-level support findings
 plus safe drafts for deterministic shell steps, exposed through the headless
 API and rendered in the desktop control room. The server also exposes a
 versioned agent handshake/heartbeat registry with online/stale state, capacity-aware
-matching, a heartbeat CLI client, and a rendered fleet view. Remote build assignment
-remains intentionally unimplemented until its transport and failure semantics are
-complete.
+matching, a reconnecting heartbeat CLI client, and a rendered fleet view. Remote
+build assignment remains intentionally unimplemented until its transport and
+failure semantics are complete.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -164,9 +164,10 @@ cargo run -p rivet -- agent \
   --label build --executors 2
 ```
 
-The command is intentionally heartbeat-only until workspace transfer, remote
-process execution, cancellation, logs, artifacts, and lost-job recovery have
-their verified protocol paths.
+The command keeps its stable agent ID and reconnects with bounded backoff after a
+transport interruption. It is intentionally heartbeat-only until workspace
+transfer, remote process execution, cancellation, logs, artifacts, and lost-job
+recovery have their verified protocol paths.
 
 The CLI exposes the same explicit SCM boundary, for example:
 
