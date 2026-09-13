@@ -4,6 +4,8 @@ import {
   builds,
   cancelBuild,
   createProject,
+  createSchedule,
+  deleteSchedule,
   artifactUrl,
   artifacts,
   ENGINE_ORIGIN,
@@ -14,6 +16,8 @@ import {
   queueStats as fetchQueueStats,
   queueBuild,
   retryBuild,
+  schedules,
+  updateSchedule,
 } from "./api";
 import type {
   ArtifactRecord,
@@ -22,6 +26,7 @@ import type {
   BuildStatus,
   LogRecord,
   Project,
+  ScheduleRecord,
   StageDetails,
 } from "./types";
 
@@ -107,8 +112,10 @@ function App() {
   const [details, setDetails] = useState<BuildDetails | null>(null);
   const [logLines, setLogLines] = useState<LogRecord[]>([]);
   const [artifactList, setArtifactList] = useState<ArtifactRecord[]>([]);
+  const [scheduleList, setScheduleList] = useState<ScheduleRecord[]>([]);
   const [activeNav, setActiveNav] = useState("Pipelines");
   const [showCreate, setShowCreate] = useState(false);
+  const [showScheduleCreate, setShowScheduleCreate] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -139,6 +146,19 @@ function App() {
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not load builds");
+    }
+  }, [projectName]);
+
+  const loadScheduleList = useCallback(async () => {
+    if (!projectName) {
+      setScheduleList([]);
+      return;
+    }
+    try {
+      setScheduleList(await schedules(projectName));
+      setError(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not load schedules");
     }
   }, [projectName]);
 
@@ -180,6 +200,10 @@ function App() {
   useEffect(() => {
     void loadBuildList();
   }, [loadBuildList]);
+
+  useEffect(() => {
+    void loadScheduleList();
+  }, [loadScheduleList]);
 
   useEffect(() => {
     void loadBuildView();
@@ -268,6 +292,54 @@ function App() {
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not create project");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitSchedule(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!projectName) return;
+    const form = new FormData(event.currentTarget);
+    setBusy(true);
+    setError(null);
+    try {
+      await createSchedule(projectName, {
+        name: String(form.get("schedule_name") ?? ""),
+        expression: String(form.get("schedule_expression") ?? ""),
+      });
+      await loadScheduleList();
+      setShowScheduleCreate(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not create schedule");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleSchedule(schedule: ScheduleRecord) {
+    if (!projectName) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await updateSchedule(projectName, schedule.id, !schedule.enabled);
+      await loadScheduleList();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not update schedule");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeSchedule(schedule: ScheduleRecord) {
+    if (!projectName) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await deleteSchedule(projectName, schedule.id);
+      await loadScheduleList();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not delete schedule");
     } finally {
       setBusy(false);
     }
@@ -401,6 +473,16 @@ function App() {
               <MetricCard label="Last signal" value={latest ? formatTime(latest.finished_at ?? latest.started_at) : "—"} detail={latest ? duration(latest) : "Waiting for first run"} accent="neutral" />
             </section>
 
+            <SchedulePanel
+              schedules={scheduleList}
+              busy={busy || !engineOnline}
+              showCreate={showScheduleCreate}
+              onToggleCreate={() => setShowScheduleCreate((current) => !current)}
+              onSubmit={submitSchedule}
+              onToggle={toggleSchedule}
+              onDelete={removeSchedule}
+            />
+
             <section className="section-head">
               <div><span className="overline">Execution map</span><h2>{selectedProject?.name ?? "Pipeline"}</h2></div>
               <div className="section-actions">
@@ -457,6 +539,58 @@ function App() {
 
 function MetricCard({ label, value, detail, accent }: { label: string; value: string; detail: string; accent: string }) {
   return <div className={`metric-card metric-${accent}`}><span className="overline">{label}</span><strong>{value}</strong><span className="metric-detail"><i />{detail}</span></div>;
+}
+
+function SchedulePanel({
+  schedules: scheduleRecords,
+  busy,
+  showCreate,
+  onToggleCreate,
+  onSubmit,
+  onToggle,
+  onDelete,
+}: {
+  schedules: ScheduleRecord[];
+  busy: boolean;
+  showCreate: boolean;
+  onToggleCreate: () => void;
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
+  onToggle: (schedule: ScheduleRecord) => void;
+  onDelete: (schedule: ScheduleRecord) => void;
+}) {
+  return (
+    <section className="panel schedules-panel" aria-label="Build schedules">
+      <div className="panel-heading">
+        <div><span className="overline">Build triggers</span><h2>Schedules</h2></div>
+        <div className="schedule-heading-actions">
+          <span className="panel-count">{scheduleRecords.length.toString().padStart(2, "0")}</span>
+          <button className="button button-quiet" type="button" disabled={busy} onClick={onToggleCreate}>{showCreate ? "Close" : "＋ Add schedule"}</button>
+        </div>
+      </div>
+      {showCreate && (
+        <form className="schedule-form" onSubmit={onSubmit}>
+          <label>Schedule name<input name="schedule_name" required placeholder="nightly" /></label>
+          <label>Cron expression<input name="schedule_expression" required placeholder="0 2 * * *" /><small>UTC · 5 fields: minute hour day month weekday</small></label>
+          <button className="button button-primary" type="submit" disabled={busy}>{busy ? "Saving…" : "Save schedule"}</button>
+        </form>
+      )}
+      {scheduleRecords.length === 0 ? (
+        <EmptyState text={showCreate ? "Add a UTC cron expression to automate this pipeline." : "No schedules configured for this project."} />
+      ) : (
+        <div className="schedule-list">
+          {scheduleRecords.map((schedule) => (
+            <div className={`schedule-row ${schedule.enabled ? "" : "schedule-disabled"}`} key={schedule.id}>
+              <span className={`schedule-indicator ${schedule.enabled ? "enabled" : "disabled"}`} aria-hidden="true" />
+              <div className="schedule-copy"><strong>{schedule.name}</strong><small><code>{schedule.expression}</code> · next {formatTime(schedule.next_run_at)}</small></div>
+              <span className="schedule-status">{schedule.enabled ? "active" : "paused"}</span>
+              <button className="button button-quiet schedule-action" type="button" disabled={busy} onClick={() => onToggle(schedule)}>{schedule.enabled ? "Pause" : "Resume"}</button>
+              <button className="schedule-delete" type="button" disabled={busy} aria-label={`Delete schedule ${schedule.name}`} onClick={() => onDelete(schedule)}>×</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
 }
 
 function StageRail({ stages }: { stages: StageDetails[] }) {

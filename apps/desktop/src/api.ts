@@ -6,6 +6,7 @@ import type {
   Project,
   QueueResponse,
   QueueStats,
+  ScheduleRecord,
 } from "./types";
 
 export const ENGINE_ORIGIN =
@@ -59,7 +60,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new Error(message);
   }
-  return (await response.json()) as T;
+  const payload = await response.text();
+  return (payload ? JSON.parse(payload) : undefined) as T;
 }
 
 export function health(): Promise<HealthResponse> {
@@ -98,6 +100,40 @@ export function logs(project: string, number: number): Promise<LogRecord[]> {
 export function artifacts(project: string, number: number): Promise<ArtifactRecord[]> {
   return request<ArtifactRecord[]>(
     `/api/v1/projects/${encodeURIComponent(project)}/builds/${number}/artifacts`,
+  );
+}
+
+export function schedules(project: string): Promise<ScheduleRecord[]> {
+  return request<ScheduleRecord[]>(
+    `/api/v1/projects/${encodeURIComponent(project)}/schedules`,
+  );
+}
+
+export function createSchedule(
+  project: string,
+  input: { name: string; expression: string; enabled?: boolean },
+): Promise<ScheduleRecord> {
+  return request<ScheduleRecord>(
+    `/api/v1/projects/${encodeURIComponent(project)}/schedules`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+export function updateSchedule(
+  project: string,
+  id: string,
+  enabled: boolean,
+): Promise<ScheduleRecord> {
+  return request<ScheduleRecord>(
+    `/api/v1/projects/${encodeURIComponent(project)}/schedules/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify({ enabled }) },
+  );
+}
+
+export function deleteSchedule(project: string, id: string): Promise<void> {
+  return request<void>(
+    `/api/v1/projects/${encodeURIComponent(project)}/schedules/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
   );
 }
 

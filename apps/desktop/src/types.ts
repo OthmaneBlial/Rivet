@@ -93,6 +93,17 @@ export interface ArtifactRecord {
   created_at: string;
 }
 
+export interface ScheduleRecord {
+  id: string;
+  project_id: string;
+  name: string;
+  expression: string;
+  enabled: boolean;
+  next_run_at: string;
+  last_run_at: string | null;
+  created_at: string;
+}
+
 export interface QueueResponse {
   build: BuildRecord;
   status: BuildStatus;
