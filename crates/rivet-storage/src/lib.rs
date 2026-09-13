@@ -651,6 +651,8 @@ impl Storage {
                 }
                 let artifact_id = Uuid::new_v4();
                 let size_bytes = fs::metadata(&source_path)?.len();
+                i64::try_from(size_bytes)
+                    .map_err(|_| StorageError::ArtifactTooLarge(size_bytes))?;
                 let checksum = sha256_file(&source_path)?;
                 let destination_dir = self.artifact_root.join(build_id.to_string());
                 fs::create_dir_all(&destination_dir)?;
