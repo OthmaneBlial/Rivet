@@ -947,8 +947,10 @@ dependencies = [
 name = "rivet-migration"
 version = "0.1.0"
 dependencies = [
+ "rivet-core",
  "serde",
  "thiserror",
+ "toml",
 ]
 
 [[package]]

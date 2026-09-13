@@ -4,7 +4,7 @@ use rivet_core::{
     BuildEvent, BuildStatus, CronExpression, ExecutionPlan, LogStream, Pipeline, Project,
     ScheduleId, SourceSnapshot,
 };
-use rivet_migration::analyze_jenkinsfile_file;
+use rivet_migration::{analyze_jenkinsfile_file, generate_rivetfile_draft_file};
 use rivet_runner::{QueueHandle, Scheduler};
 use rivet_scm::{GitPrepareOptions, GitRepository, ScmError};
 use rivet_storage::Storage;
@@ -136,7 +136,12 @@ enum ScheduleCommand {
 #[derive(Debug, Subcommand)]
 enum AnalyzeCommand {
     /// Report supported, partial, and unsupported Jenkins constructs as JSON.
-    Jenkinsfile { path: PathBuf },
+    Jenkinsfile {
+        path: PathBuf,
+        /// Include a valid draft for simple, explicitly quoted sh/bat steps.
+        #[arg(long)]
+        draft: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -237,12 +242,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn analyze_file(command: AnalyzeCommand) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        AnalyzeCommand::Jenkinsfile { path } => {
+        AnalyzeCommand::Jenkinsfile { path, draft } => {
             let analysis = analyze_jenkinsfile_file(&path)?;
-            let output = serde_json::json!({
-                "source": path,
-                "analysis": analysis,
-            });
+            let output = if draft {
+                let draft = generate_rivetfile_draft_file(&path)?;
+                serde_json::json!({
+                    "source": path,
+                    "analysis": analysis,
+                    "draft": draft,
+                })
+            } else {
+                serde_json::json!({
+                    "source": path,
+                    "analysis": analysis,
+                })
+            };
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
     }

@@ -4,7 +4,9 @@
 //! arbitrary Jenkins plugins. It recognizes common declarative constructs and
 //! reports the exact line and migration boundary for each one.
 
+use rivet_core::{Pipeline, Stage, Step};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -56,6 +58,16 @@ pub struct JenkinsfileAnalysis {
     pub recommendations: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RivetfileDraft {
+    pub status: SupportLevel,
+    pub converted_steps: usize,
+    pub skipped_stages: Vec<String>,
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rivetfile_toml: Option<String>,
+}
+
 #[derive(Debug, Error)]
 pub enum MigrationError {
     #[error("could not read Jenkinsfile {path}: {source}")]
@@ -63,6 +75,8 @@ pub enum MigrationError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("could not serialize generated Rivetfile: {0}")]
+    Serialize(#[from] toml::ser::Error),
 }
 
 /// Analyze a Jenkinsfile without executing its Groovy or plugin code.
@@ -430,6 +444,155 @@ pub fn analyze_jenkinsfile_file(path: &Path) -> Result<JenkinsfileAnalysis, Migr
     Ok(analyze_jenkinsfile(&source))
 }
 
+/// Generate a valid Rivetfile draft for simple, explicitly quoted shell steps.
+///
+/// Ambiguous commands, unsupported blocks, and stages without a deterministic
+/// command are left as warnings. The generated draft is never presented as a
+/// complete migration.
+pub fn generate_rivetfile_draft(source: &str) -> Result<RivetfileDraft, MigrationError> {
+    let analysis = analyze_jenkinsfile(source);
+    let mut stage_drafts: Vec<StageDraft> = Vec::new();
+    let mut current_stage = None;
+    let mut warnings = Vec::new();
+    let mut in_block_comment = false;
+
+    for (index, raw_line) in source.lines().enumerate() {
+        let line = index + 1;
+        let code_line = strip_comments(raw_line, &mut in_block_comment);
+        let trimmed = code_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if starts_with_construct(trimmed, "stage") {
+            let Some(name) = quoted_argument(trimmed, "stage") else {
+                current_stage = None;
+                warnings.push(format!(
+                    "line {line}: stage name is not a simple quoted argument"
+                ));
+                continue;
+            };
+            if let Some(existing) = stage_drafts.iter().position(|stage| stage.name == name) {
+                current_stage = Some(existing);
+                warnings.push(format!(
+                    "line {line}: duplicate stage {name:?} was merged into one draft stage"
+                ));
+            } else {
+                stage_drafts.push(StageDraft {
+                    name,
+                    steps: Vec::new(),
+                });
+                current_stage = Some(stage_drafts.len() - 1);
+            }
+            continue;
+        }
+
+        let command_kind = if starts_with_construct(trimmed, "sh") {
+            Some(("sh", "sh", "-c"))
+        } else if starts_with_construct(trimmed, "bat") {
+            Some(("bat", "cmd", "/C"))
+        } else {
+            None
+        };
+        let Some((jenkins_kind, program, shell_flag)) = command_kind else {
+            continue;
+        };
+
+        let Some(command) = quoted_command_argument(trimmed, jenkins_kind) else {
+            warnings.push(format!(
+                "line {line}: {jenkins_kind} command is not a single-line quoted string; multi-line forms need manual review"
+            ));
+            continue;
+        };
+        if command.trim().is_empty() {
+            warnings.push(format!("line {line}: {jenkins_kind} command is empty"));
+            continue;
+        }
+        let Some(stage_index) = current_stage else {
+            warnings.push(format!(
+                "line {line}: {jenkins_kind} command is outside a named stage"
+            ));
+            continue;
+        };
+        let step_number = stage_drafts[stage_index].steps.len() + 1;
+        stage_drafts[stage_index].steps.push(Step {
+            name: format!("jenkins-{jenkins_kind}-{line}-{step_number}"),
+            program: program.to_owned(),
+            args: vec![shell_flag.to_owned(), command],
+            env: BTreeMap::new(),
+            working_dir: None,
+            timeout_seconds: None,
+            container: None,
+        });
+    }
+
+    let mut skipped_stages = Vec::new();
+    let stages = stage_drafts
+        .into_iter()
+        .filter_map(|stage| {
+            if stage.steps.is_empty() {
+                skipped_stages.push(stage.name.clone());
+                warnings.push(format!(
+                    "stage {:?}: no deterministic sh/bat step was generated",
+                    stage.name
+                ));
+                return None;
+            }
+            Some(Stage {
+                name: stage.name,
+                steps: stage.steps,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let converted_steps = stages.iter().map(|stage| stage.steps.len()).sum();
+    let rivetfile_toml = if stages.is_empty() {
+        None
+    } else {
+        let pipeline = Pipeline {
+            version: 1,
+            name: "migrated-jenkinsfile".to_owned(),
+            workspace: None,
+            parameters: Vec::new(),
+            artifacts: Vec::new(),
+            caches: Vec::new(),
+            stages,
+        };
+        Some(toml::to_string_pretty(&pipeline)?)
+    };
+
+    let status = match analysis.status {
+        SupportLevel::Unsupported => SupportLevel::Unsupported,
+        SupportLevel::Partial if rivetfile_toml.is_some() => SupportLevel::Partial,
+        SupportLevel::Partial => SupportLevel::Unsupported,
+        SupportLevel::Supported if rivetfile_toml.is_some() && warnings.is_empty() => {
+            SupportLevel::Supported
+        }
+        SupportLevel::Supported => SupportLevel::Partial,
+    };
+    Ok(RivetfileDraft {
+        status,
+        converted_steps,
+        skipped_stages,
+        warnings,
+        rivetfile_toml,
+    })
+}
+
+pub fn generate_rivetfile_draft_file(path: &Path) -> Result<RivetfileDraft, MigrationError> {
+    let source = fs::read_to_string(path).map_err(|source| MigrationError::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    generate_rivetfile_draft(&source)
+}
+
+#[derive(Debug)]
+struct StageDraft {
+    name: String,
+    steps: Vec<Step>,
+}
+
 fn add_finding(
     findings: &mut Vec<ConstructFinding>,
     recommendations: &mut Vec<String>,
@@ -522,6 +685,48 @@ fn quoted_argument(line: &str, construct: &str) -> Option<String> {
     None
 }
 
+fn quoted_command_argument(line: &str, construct: &str) -> Option<String> {
+    let rest = line.strip_prefix(construct)?.trim_start();
+    let rest = rest.strip_prefix('(').map(str::trim_start).unwrap_or(rest);
+    let rest = rest
+        .strip_prefix("script:")
+        .map(str::trim_start)
+        .unwrap_or(rest);
+    if rest.starts_with("'''") || rest.starts_with("\"\"\"") {
+        return None;
+    }
+    let mut characters = rest.chars();
+    let quote = characters.next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let mut value = String::new();
+    let mut escaped = false;
+    let mut closed = false;
+    for character in characters.by_ref() {
+        if escaped {
+            value.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == quote {
+            closed = true;
+            break;
+        } else {
+            value.push(character);
+        }
+    }
+    if !closed {
+        return None;
+    }
+    let trailing = characters.as_str().trim();
+    if trailing.is_empty() || trailing == ")" {
+        Some(value)
+    } else {
+        None
+    }
+}
+
 fn evidence(kind: &str, label: Option<&str>) -> String {
     match label {
         Some(label) => format!("{kind}({label:?})"),
@@ -570,7 +775,7 @@ fn strip_comments(line: &str, in_block_comment: &mut bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SupportLevel, analyze_jenkinsfile};
+    use super::{SupportLevel, analyze_jenkinsfile, generate_rivetfile_draft};
 
     #[test]
     fn declarative_pipeline_reports_mappable_and_partial_constructs() {
@@ -680,6 +885,71 @@ pipeline {
                 .constructs
                 .iter()
                 .any(|finding| finding.kind == "pipeline_root")
+        );
+    }
+
+    #[test]
+    fn generates_a_valid_partial_rivetfile_for_simple_shell_steps() {
+        let draft = generate_rivetfile_draft(
+            r#"pipeline {
+  stages {
+    stage('Build') {
+      steps {
+        sh 'cargo build'
+        sh(script: 'cargo test')
+      }
+    }
+  }
+}"#,
+        )
+        .expect("draft");
+
+        assert_eq!(draft.status, SupportLevel::Partial);
+        assert_eq!(draft.converted_steps, 2);
+        let rivetfile = draft.rivetfile_toml.expect("rivetfile");
+        let pipeline = rivet_core::Pipeline::from_toml_str(&rivetfile).expect("valid Rivetfile");
+        assert_eq!(pipeline.stages[0].name, "Build");
+        assert_eq!(pipeline.stages[0].steps[0].program, "sh");
+        assert_eq!(pipeline.stages[0].steps[0].args, ["-c", "cargo build"]);
+        assert!(draft.warnings.is_empty());
+    }
+
+    #[test]
+    fn leaves_ambiguous_commands_and_empty_stages_visible() {
+        let draft = generate_rivetfile_draft(
+            r#"pipeline {
+  stages {
+    stage('Review') {
+      steps {
+        sh '''multi
+line'''
+      }
+    }
+    stage('Deploy') {
+      steps {
+        input message: 'Approve?'
+      }
+    }
+  }
+}"#,
+        )
+        .expect("draft");
+
+        assert_eq!(draft.status, SupportLevel::Unsupported);
+        assert_eq!(draft.converted_steps, 0);
+        assert_eq!(draft.rivetfile_toml, None);
+        assert_eq!(draft.skipped_stages, ["Review", "Deploy"]);
+        assert!(
+            draft
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("multi-line"))
+        );
+        assert!(
+            draft
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no deterministic"))
         );
     }
 }
