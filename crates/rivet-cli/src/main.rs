@@ -1,11 +1,14 @@
 use chrono::Utc;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
 use globset::{Glob, GlobSetBuilder};
 use rivet_agent_protocol::{
     AgentCapabilities, AgentHeartbeat, AgentId, AgentMessage, AgentRegistration,
     MAX_WORKSPACE_BYTES, MAX_WORKSPACE_CHUNK_BYTES, MAX_WORKSPACE_FILES, PROTOCOL_VERSION,
     WorkspaceTransfer,
+};
+use rivet_auth::{
+    ApiTokenRecord, AuthPolicy, AuthPolicyDocument, Role as AuthRole, generate_token, token_digest,
 };
 use rivet_core::{
     BuildEvent, BuildStatus, CronExpression, ExecutionPlan, LogStream, Pipeline, Project,
@@ -147,6 +150,11 @@ enum Command {
         #[command(subcommand)]
         command: CredentialCommand,
     },
+    /// Manage local API authentication tokens.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Analyze a Jenkinsfile without executing Groovy or plugin code.
     Analyze {
         #[command(subcommand)]
@@ -213,6 +221,61 @@ enum CredentialCommand {
         #[arg(long)]
         vault_file: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommand {
+    /// Manage policy-backed Bearer tokens.
+    Token {
+        #[command(subcommand)]
+        command: AuthTokenCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthTokenCommand {
+    /// Generate a token, save it privately, and add only its digest to policy.
+    Create {
+        id: String,
+        #[arg(long, value_enum, default_value_t = AuthRoleArg::Operator)]
+        role: AuthRoleArg,
+        #[arg(long = "project")]
+        projects: Vec<String>,
+        #[arg(long)]
+        policy_file: PathBuf,
+        #[arg(long)]
+        token_file: PathBuf,
+    },
+    /// List token IDs, roles, and project scopes without revealing tokens.
+    List {
+        #[arg(long)]
+        policy_file: PathBuf,
+    },
+    /// Revoke one token ID while keeping the policy non-empty.
+    Revoke {
+        id: String,
+        #[arg(long)]
+        policy_file: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AuthRoleArg {
+    Admin,
+    Operator,
+    Viewer,
+    Agent,
+}
+
+impl From<AuthRoleArg> for AuthRole {
+    fn from(role: AuthRoleArg) -> Self {
+        match role {
+            AuthRoleArg::Admin => Self::Admin,
+            AuthRoleArg::Operator => Self::Operator,
+            AuthRoleArg::Viewer => Self::Viewer,
+            AuthRoleArg::Agent => Self::Agent,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -396,6 +459,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Scm { command } => inspect_scm(command).await?,
         Command::Schedule { command } => manage_schedule(&cli.data_dir, command)?,
         Command::Credential { command } => manage_credentials(&cli.data_dir, command)?,
+        Command::Auth { command } => manage_auth(command)?,
         Command::Analyze { command } => analyze_file(command)?,
         Command::Agent(args) => run_agent(args).await?,
     }
@@ -1427,6 +1491,173 @@ fn read_webhook_secret(path: &Path) -> Result<String, Box<dyn std::error::Error>
     read_private_value(path, "webhook secret")
 }
 
+fn manage_auth(command: AuthCommand) -> Result<(), Box<dyn std::error::Error>> {
+    let AuthCommand::Token { command } = command;
+    match command {
+        AuthTokenCommand::Create {
+            id,
+            role,
+            projects,
+            policy_file,
+            token_file,
+        } => {
+            if policy_file == token_file {
+                return Err("policy file and token file must be different paths".into());
+            }
+            let mut document = load_auth_policy_for_create(&policy_file)?;
+            let token = generate_token()?;
+            let role: AuthRole = role.into();
+            document.tokens.push(ApiTokenRecord {
+                id: id.clone(),
+                sha256: token_digest(&token),
+                role,
+                projects,
+            });
+            AuthPolicy::from_document(document.clone())?;
+
+            write_private_atomic(&token_file, token.as_bytes(), false, "token file")?;
+            if let Err(error) = write_auth_policy(&policy_file, &document) {
+                let _ = fs::remove_file(&token_file);
+                return Err(error);
+            }
+            println!("Created {role:?} token {id}");
+            println!("Token saved to {}", token_file.display());
+        }
+        AuthTokenCommand::List { policy_file } => {
+            let document = load_auth_policy_document(&policy_file)?;
+            for token in document.tokens {
+                let projects = if token.projects.is_empty() {
+                    "*".to_owned()
+                } else {
+                    token.projects.join(",")
+                };
+                println!("{}\t{:?}\t{}", token.id, token.role, projects);
+            }
+        }
+        AuthTokenCommand::Revoke { id, policy_file } => {
+            let mut document = load_auth_policy_document(&policy_file)?;
+            let original_len = document.tokens.len();
+            document.tokens.retain(|token| token.id != id);
+            if document.tokens.len() == original_len {
+                return Err(format!("authentication token not found: {id}").into());
+            }
+            if document.tokens.is_empty() {
+                return Err(
+                    "cannot revoke the last authentication token; create a replacement first"
+                        .into(),
+                );
+            }
+            AuthPolicy::from_document(document.clone())?;
+            write_auth_policy(&policy_file, &document)?;
+            println!("Revoked token {id}");
+        }
+    }
+    Ok(())
+}
+
+fn load_auth_policy_for_create(
+    path: &Path,
+) -> Result<AuthPolicyDocument, Box<dyn std::error::Error>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => load_auth_policy_document(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(AuthPolicyDocument::empty())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn load_auth_policy_document(
+    path: &Path,
+) -> Result<AuthPolicyDocument, Box<dyn std::error::Error>> {
+    let bytes = read_private_bytes(path, "authentication policy")?;
+    let document: AuthPolicyDocument = serde_json::from_slice(&bytes)?;
+    AuthPolicy::from_document(document.clone())?;
+    Ok(document)
+}
+
+fn write_auth_policy(
+    path: &Path,
+    document: &AuthPolicyDocument,
+) -> Result<(), Box<dyn std::error::Error>> {
+    AuthPolicy::from_document(document.clone())?;
+    let mut bytes = serde_json::to_vec_pretty(document)?;
+    bytes.push(b'\n');
+    write_private_atomic(path, &bytes, true, "authentication policy")
+}
+
+fn write_private_atomic(
+    path: &Path,
+    bytes: &[u8],
+    replace_existing: bool,
+    label: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(format!("{label} must not be a symbolic link: {}", path.display()).into());
+        }
+        if !metadata.is_file() {
+            return Err(format!("{label} path must be a regular file: {}", path.display()).into());
+        }
+        if !replace_existing {
+            return Err(format!("{label} already exists: {}", path.display()).into());
+        }
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{label} parent must not be a symbolic link: {}",
+            parent.display()
+        )
+        .into());
+    }
+    if !parent_metadata.is_dir() {
+        return Err(format!("{label} parent must be a directory: {}", parent.display()).into());
+    }
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("{label} path has no valid filename"))?;
+    let temporary = parent.join(format!(".{filename}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<(), std::io::Error> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        if replace_existing {
+            #[cfg(windows)]
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+            fs::rename(&temporary, path)?;
+        } else {
+            // A hard-link install fails atomically if another process created
+            // the destination after the initial metadata check; rename would
+            // silently replace that file on Unix.
+            fs::hard_link(&temporary, path)?;
+            fs::remove_file(&temporary)?;
+        }
+        #[cfg(unix)]
+        if let Ok(directory) = fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(|error| error.into())
+}
+
 fn manage_credentials(
     data_dir: &Path,
     command: CredentialCommand,
@@ -1473,6 +1704,15 @@ fn manage_credentials(
 }
 
 fn read_private_value(path: &Path, label: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let bytes = read_private_bytes(path, label)?;
+    let value = String::from_utf8(bytes)?.trim().to_owned();
+    if value.is_empty() {
+        return Err(format!("{label} file is empty: {}", path.display()).into());
+    }
+    Ok(value)
+}
+
+fn read_private_bytes(path: &Path, label: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Err(format!(
@@ -1495,11 +1735,11 @@ fn read_private_value(path: &Path, label: &str) -> Result<String, Box<dyn std::e
             .into());
         }
     }
-    let value = fs::read_to_string(path)?.trim().to_owned();
-    if value.is_empty() {
+    let bytes = fs::read(path)?;
+    if bytes.is_empty() {
         return Err(format!("{label} file is empty: {}", path.display()).into());
     }
-    Ok(value)
+    Ok(bytes)
 }
 
 fn init_repository(data_dir: &Path, repository: &Path) -> Result<(), Box<dyn std::error::Error>> {

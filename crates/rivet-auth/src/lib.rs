@@ -10,15 +10,17 @@ use std::collections::BTreeSet;
 use std::fmt;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
-const POLICY_VERSION: u8 = 1;
+pub const AUTH_POLICY_VERSION: u8 = 1;
 const TOKEN_DIGEST_BYTES: usize = 32;
+const GENERATED_TOKEN_BYTES: usize = 32;
 const MAX_TOKEN_ID_BYTES: usize = 64;
 const MAX_PROJECT_NAME_BYTES: usize = 128;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthError {
-    #[error("authentication policy version {0} is unsupported; expected {POLICY_VERSION}")]
+    #[error("authentication policy version {0} is unsupported; expected {AUTH_POLICY_VERSION}")]
     UnsupportedVersion(u8),
     #[error("authentication policy must contain at least one token")]
     EmptyPolicy,
@@ -30,6 +32,8 @@ pub enum AuthError {
     InvalidTokenDigest(String),
     #[error("authentication project scope is invalid: {0}")]
     InvalidProjectScope(String),
+    #[error("authentication token generation failed: {0}")]
+    Randomness(String),
     #[error("authentication policy JSON is invalid: {0}")]
     InvalidJson(String),
 }
@@ -55,6 +59,15 @@ pub enum Permission {
 pub struct AuthPolicyDocument {
     pub version: u8,
     pub tokens: Vec<ApiTokenRecord>,
+}
+
+impl AuthPolicyDocument {
+    pub fn empty() -> Self {
+        Self {
+            version: AUTH_POLICY_VERSION,
+            tokens: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -147,7 +160,7 @@ impl AuthPolicy {
     }
 
     pub fn from_document(document: AuthPolicyDocument) -> Result<Self, AuthError> {
-        if document.version != POLICY_VERSION {
+        if document.version != AUTH_POLICY_VERSION {
             return Err(AuthError::UnsupportedVersion(document.version));
         }
         if document.tokens.is_empty() {
@@ -200,6 +213,23 @@ impl AuthPolicy {
     }
 }
 
+/// Return the lowercase hexadecimal digest persisted in an authentication
+/// policy. The raw token remains the caller's responsibility and is never
+/// stored by this crate.
+pub fn token_digest(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
+/// Generate a high-entropy token for local policy administration.
+///
+/// The returned string is zeroized when dropped so callers can write it to a
+/// protected file without leaving an ordinary owned copy behind.
+pub fn generate_token() -> Result<Zeroizing<String>, AuthError> {
+    let mut bytes = Zeroizing::new([0_u8; GENERATED_TOKEN_BYTES]);
+    getrandom::fill(&mut *bytes).map_err(|error| AuthError::Randomness(error.to_string()))?;
+    Ok(Zeroizing::new(hex::encode(&*bytes)))
+}
+
 fn validate_token_id(id: &str) -> Result<(), AuthError> {
     if id.is_empty()
         || id.len() > MAX_TOKEN_ID_BYTES
@@ -234,7 +264,7 @@ mod tests {
 
     fn policy() -> AuthPolicy {
         AuthPolicy::from_document(AuthPolicyDocument {
-            version: POLICY_VERSION,
+            version: AUTH_POLICY_VERSION,
             tokens: vec![ApiTokenRecord {
                 id: "operator".into(),
                 sha256: hex::encode(Sha256::digest(TOKEN.as_bytes())),
@@ -261,7 +291,7 @@ mod tests {
     #[test]
     fn roles_define_global_and_project_permissions() {
         let admin = AuthPolicy::from_document(AuthPolicyDocument {
-            version: POLICY_VERSION,
+            version: AUTH_POLICY_VERSION,
             tokens: vec![ApiTokenRecord {
                 id: "admin".into(),
                 sha256: hex::encode(Sha256::digest(b"admin-token")),
@@ -276,7 +306,7 @@ mod tests {
         assert!(admin.can_global(Permission::ConnectAgent));
 
         let agent = AuthPolicy::from_document(AuthPolicyDocument {
-            version: POLICY_VERSION,
+            version: AUTH_POLICY_VERSION,
             tokens: vec![ApiTokenRecord {
                 id: "agent".into(),
                 sha256: hex::encode(Sha256::digest(b"agent-token")),
@@ -299,7 +329,7 @@ mod tests {
         ));
         assert!(matches!(
             AuthPolicy::from_document(AuthPolicyDocument {
-                version: POLICY_VERSION,
+                version: AUTH_POLICY_VERSION,
                 tokens: vec![
                     ApiTokenRecord {
                         id: "duplicate".into(),
@@ -319,7 +349,7 @@ mod tests {
         ));
         assert!(matches!(
             AuthPolicy::from_document(AuthPolicyDocument {
-                version: POLICY_VERSION,
+                version: AUTH_POLICY_VERSION,
                 tokens: vec![ApiTokenRecord {
                     id: "token".into(),
                     sha256: "not-a-digest".into(),
@@ -329,5 +359,18 @@ mod tests {
             }),
             Err(AuthError::InvalidTokenDigest(_))
         ));
+    }
+
+    #[test]
+    fn generated_tokens_are_digestable_and_not_empty() {
+        let first = generate_token().expect("token");
+        let second = generate_token().expect("token");
+        assert_eq!(first.len(), GENERATED_TOKEN_BYTES * 2);
+        assert_eq!(second.len(), GENERATED_TOKEN_BYTES * 2);
+        assert_ne!(&*first, &*second);
+        assert_eq!(
+            token_digest(&first),
+            hex::encode(Sha256::digest(first.as_bytes()))
+        );
     }
 }
