@@ -5,7 +5,7 @@ from Jenkins.
 
 ## Delivery progress
 
-**63% verified** · `████████████▋░░░░░░░`<br>
+**65% verified** · `█████████████░░░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -21,8 +21,9 @@ downloads, and a light-default desktop theme with an accessible dark-mode
 toggle, persistent UTC cron schedules, server dispatch, desktop schedule
 controls, signed generic webhook delivery with idempotent redelivery,
 secret-parameter redaction/masking, and a packaged desktop launch with an
-ephemeral loopback engine origin, plus project-scoped local CI cache restore and
-save. The server also exposes a versioned agent handshake/heartbeat registry
+ephemeral loopback engine origin, project-scoped local CI cache restore and
+save, and explicit Docker container command assembly with bounded workspace
+mounts. The server also exposes a versioned agent handshake/heartbeat registry
 with online and stale state, while remote build assignment remains
 intentionally unimplemented until its transport and failure semantics are
 complete.
@@ -187,6 +188,8 @@ name = "unit"
 program = "cargo"
 args = ["test"]
 timeout_seconds = 300
+[stages.steps.container]
+image = "rust:1.85"
 ```
 
 Build parameters and local artifacts are also explicit:
@@ -220,6 +223,12 @@ data directory; a missing or corrupt cache never fails the build. Artifact
 files stay inside the pipeline workspace, are copied to local Rivet storage
 with a SHA-256 checksum, and are available through the build artifacts API or
 `rivet artifacts`.
+
+A step can opt into explicit Docker execution with `[stages.steps.container]`.
+Rivet assembles a direct `docker run` invocation with a private workspace mount,
+the validated working directory, separated arguments, and automatic container
+cleanup. Docker runtime execution, image policy, and end-to-end artifact and
+cancellation behavior remain unverified on machines without Docker.
 
 Shell parsing is not implicit. A later pipeline feature may add an explicit
 shell step with a documented threat boundary; direct process execution is the

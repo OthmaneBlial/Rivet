@@ -71,6 +71,13 @@
       "notes": "Exact relative cache paths are validated, entries are isolated by project and key, restored before execution, and saved atomically after success; fallback keys, eviction, and remote backends remain planned."
     },
     {
+      "category": "Execution",
+      "feature": "Explicit Docker container steps",
+      "status": "partial",
+      "evidence": ["crates/rivet-core/src/pipeline.rs", "crates/rivet-runner/src/pipeline.rs"],
+      "notes": "Container declarations validate an image and assemble a direct docker run command with a bounded workspace mount, separated arguments, timeout propagation, and automatic removal; Docker runtime execution, image policy, and end-to-end artifact/cancellation behavior remain unverified locally."
+    },
+    {
       "category": "Jenkinsfile",
       "feature": "Jenkinsfile parsing",
       "status": "planned",
