@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 pub type ProjectId = Uuid;
 pub type BuildId = Uuid;
+pub type ScheduleId = Uuid;
 pub type StageId = Uuid;
 pub type StepId = Uuid;
 

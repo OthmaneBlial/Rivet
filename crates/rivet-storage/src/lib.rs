@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use globset::{Glob, GlobSetBuilder};
 use rivet_core::{
     BuildEvent, BuildId, BuildStatus, ExecutionPlan, LogStream, Pipeline, Project, ProjectId,
-    SourceSnapshot, StageId, StageStatus, StepId, StepStatus,
+    ScheduleId, SourceSnapshot, StageId, StageStatus, StepId, StepStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -94,6 +94,8 @@ pub enum StorageError {
     ArtifactTooLarge(u64),
     #[error("invalid artifact size in database: {0}")]
     InvalidArtifactSize(i64),
+    #[error("invalid schedule enabled flag in database: {0}")]
+    InvalidScheduleEnabled(i64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -164,6 +166,18 @@ pub struct ArtifactRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduleRecord {
+    pub id: ScheduleId,
+    pub project_id: ProjectId,
+    pub name: String,
+    pub expression: String,
+    pub enabled: bool,
+    pub next_run_at: DateTime<Utc>,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
 impl Storage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
@@ -206,6 +220,11 @@ impl Storage {
             &connection,
             5,
             Some(include_str!("../migrations/005_artifacts.sql")),
+        )?;
+        apply_migration(
+            &connection,
+            6,
+            Some(include_str!("../migrations/006_schedules.sql")),
         )?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -260,6 +279,30 @@ impl Storage {
         row.map(parse_project).transpose()
     }
 
+    pub fn get_project_by_id(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Option<Project>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let row = connection
+            .query_row(
+                "SELECT id, name, repository_path, pipeline_path, created_at
+                 FROM projects WHERE id = ?1",
+                params![project_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(parse_project).transpose()
+    }
+
     pub fn list_projects(&self) -> Result<Vec<Project>, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
@@ -277,6 +320,151 @@ impl Storage {
         })?;
         rows.map(|row| row.map_err(StorageError::from).and_then(parse_project))
             .collect()
+    }
+
+    pub fn create_schedule(
+        &self,
+        project_id: ProjectId,
+        name: impl Into<String>,
+        expression: impl Into<String>,
+        enabled: bool,
+        next_run_at: DateTime<Utc>,
+    ) -> Result<ScheduleRecord, StorageError> {
+        let schedule = ScheduleRecord {
+            id: Uuid::new_v4(),
+            project_id,
+            name: name.into(),
+            expression: expression.into(),
+            enabled,
+            next_run_at,
+            last_run_at: None,
+            created_at: Utc::now(),
+        };
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        connection.execute(
+            "INSERT INTO schedules(
+                id, project_id, name, expression, enabled, next_run_at, last_run_at, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                schedule.id.to_string(),
+                schedule.project_id.to_string(),
+                schedule.name,
+                schedule.expression,
+                i64::from(schedule.enabled),
+                schedule.next_run_at.to_rfc3339(),
+                Option::<String>::None,
+                schedule.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(schedule)
+    }
+
+    pub fn list_schedules(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<ScheduleRecord>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT id, project_id, name, expression, enabled, next_run_at, last_run_at, created_at
+             FROM schedules WHERE project_id = ?1 ORDER BY name ASC",
+        )?;
+        let rows = statement.query_map(params![project_id.to_string()], raw_schedule)?;
+        rows.map(|row| row.map_err(StorageError::from).and_then(parse_schedule))
+            .collect()
+    }
+
+    pub fn get_schedule(
+        &self,
+        project_id: ProjectId,
+        schedule_id: ScheduleId,
+    ) -> Result<Option<ScheduleRecord>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let row = connection
+            .query_row(
+                "SELECT id, project_id, name, expression, enabled, next_run_at, last_run_at, created_at
+                 FROM schedules WHERE project_id = ?1 AND id = ?2",
+                params![project_id.to_string(), schedule_id.to_string()],
+                raw_schedule,
+            )
+            .optional()?;
+        row.map(parse_schedule).transpose()
+    }
+
+    pub fn due_schedules(&self, now: DateTime<Utc>) -> Result<Vec<ScheduleRecord>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT id, project_id, name, expression, enabled, next_run_at, last_run_at, created_at
+             FROM schedules
+             WHERE enabled = 1 AND next_run_at <= ?1
+             ORDER BY next_run_at ASC, created_at ASC, id ASC",
+        )?;
+        let rows = statement.query_map(params![now.to_rfc3339()], raw_schedule)?;
+        rows.map(|row| row.map_err(StorageError::from).and_then(parse_schedule))
+            .collect()
+    }
+
+    /// Atomically claims one due occurrence. The expected timestamp is a
+    /// compare-and-swap guard so two dispatcher ticks cannot enqueue it twice.
+    pub fn claim_schedule(
+        &self,
+        schedule_id: ScheduleId,
+        expected_next_run_at: DateTime<Utc>,
+        fired_at: DateTime<Utc>,
+        next_run_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "UPDATE schedules
+             SET last_run_at = ?1, next_run_at = ?2
+             WHERE id = ?3 AND enabled = 1 AND next_run_at = ?4",
+            params![
+                fired_at.to_rfc3339(),
+                next_run_at.to_rfc3339(),
+                schedule_id.to_string(),
+                expected_next_run_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn set_schedule_enabled(
+        &self,
+        project_id: ProjectId,
+        schedule_id: ScheduleId,
+        enabled: bool,
+    ) -> Result<Option<ScheduleRecord>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "UPDATE schedules SET enabled = ?1 WHERE project_id = ?2 AND id = ?3",
+            params![
+                i64::from(enabled),
+                project_id.to_string(),
+                schedule_id.to_string()
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let row = connection.query_row(
+            "SELECT id, project_id, name, expression, enabled, next_run_at, last_run_at, created_at
+             FROM schedules WHERE project_id = ?1 AND id = ?2",
+            params![project_id.to_string(), schedule_id.to_string()],
+            raw_schedule,
+        )?;
+        parse_schedule(row).map(Some)
+    }
+
+    pub fn delete_schedule(
+        &self,
+        project_id: ProjectId,
+        schedule_id: ScheduleId,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "DELETE FROM schedules WHERE project_id = ?1 AND id = ?2",
+            params![project_id.to_string(), schedule_id.to_string()],
+        )?;
+        Ok(changed == 1)
     }
 
     pub fn create_build(
@@ -789,6 +977,16 @@ type RawStep = (
     Option<String>,
 );
 type RawArtifact = (String, String, String, String, i64, String, String);
+type RawSchedule = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    String,
+);
 
 fn parse_project(raw: RawProject) -> Result<Project, StorageError> {
     Ok(Project {
@@ -941,6 +1139,37 @@ fn parse_artifact(raw: RawArtifact) -> Result<ArtifactRecord, StorageError> {
     })
 }
 
+fn raw_schedule(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSchedule> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+    ))
+}
+
+fn parse_schedule(raw: RawSchedule) -> Result<ScheduleRecord, StorageError> {
+    let enabled = match raw.4 {
+        0 => false,
+        1 => true,
+        value => return Err(StorageError::InvalidScheduleEnabled(value)),
+    };
+    Ok(ScheduleRecord {
+        id: parse_uuid(&raw.0)?,
+        project_id: parse_uuid(&raw.1)?,
+        name: raw.2,
+        expression: raw.3,
+        enabled,
+        next_run_at: parse_timestamp(&raw.5)?,
+        last_run_at: raw.6.as_deref().map(parse_timestamp).transpose()?,
+        created_at: parse_timestamp(&raw.7)?,
+    })
+}
+
 fn sha256_file(path: &Path) -> Result<String, StorageError> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -1028,6 +1257,7 @@ fn transition_build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use rivet_core::{BuildEvent, ExecutionPlan, Pipeline, SourceSnapshot};
     use std::collections::BTreeMap;
     use tempfile::tempdir;
@@ -1226,5 +1456,54 @@ program = "true"
         drop(storage);
         let reopened = Storage::open(&database).expect("reopen");
         assert_eq!(reopened.artifacts(build.id).expect("artifacts"), collected);
+    }
+
+    #[test]
+    fn schedules_are_persisted_and_claimed_once() {
+        let directory = tempdir().expect("tempdir");
+        let database = directory.path().join("rivet.db");
+        let (project, pipeline, _) = fixture();
+        let storage = Storage::open(&database).expect("open");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let due_at = Utc
+            .with_ymd_and_hms(2026, 9, 13, 12, 0, 0)
+            .single()
+            .expect("due timestamp");
+        let next_at = Utc
+            .with_ymd_and_hms(2026, 9, 13, 12, 5, 0)
+            .single()
+            .expect("next timestamp");
+        let schedule = storage
+            .create_schedule(project.id, "nightly", "*/5 * * * *", true, due_at)
+            .expect("schedule");
+
+        assert_eq!(
+            storage.list_schedules(project.id).expect("list"),
+            vec![schedule.clone()]
+        );
+        assert_eq!(storage.due_schedules(due_at).expect("due").len(), 1);
+        assert!(
+            storage
+                .claim_schedule(schedule.id, due_at, due_at, next_at)
+                .expect("claim")
+        );
+        assert!(storage.due_schedules(due_at).expect("claimed").is_empty());
+        assert!(
+            !storage
+                .claim_schedule(schedule.id, due_at, due_at, next_at)
+                .expect("duplicate claim")
+        );
+
+        drop(storage);
+        let reopened = Storage::open(&database).expect("reopen");
+        let persisted = reopened
+            .list_schedules(project.id)
+            .expect("persisted")
+            .pop()
+            .expect("schedule exists");
+        assert_eq!(persisted.next_run_at, next_at);
+        assert_eq!(persisted.last_run_at, Some(due_at));
     }
 }
