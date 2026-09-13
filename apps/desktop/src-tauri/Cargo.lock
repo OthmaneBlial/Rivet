@@ -3525,6 +3525,7 @@ dependencies = [
  "base64 0.22.1",
  "rivet-core",
  "serde",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "zeroize",

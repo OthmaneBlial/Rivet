@@ -133,6 +133,7 @@ export interface PipelineParameter {
 
 export interface CredentialSummary {
   id: string;
+  kind: "http_basic" | "ssh_key";
   username: string;
   /** Empty means the credential is available to every project. */
   projects: string[];

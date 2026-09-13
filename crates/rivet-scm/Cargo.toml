@@ -9,10 +9,10 @@ repository.workspace = true
 base64.workspace = true
 rivet-core = { path = "../rivet-core" }
 serde.workspace = true
+tempfile = "3"
 thiserror.workspace = true
 tokio = { version = "1.47", features = ["io-util", "process"] }
 zeroize.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread"] }

@@ -163,6 +163,7 @@ function App() {
   const [credentialError, setCredentialError] = useState<string | null>(null);
   const [credentialBusy, setCredentialBusy] = useState(false);
   const [credentialId, setCredentialId] = useState("");
+  const [credentialKind, setCredentialKind] = useState<CredentialSummary["kind"]>("http_basic");
   const [credentialUsername, setCredentialUsername] = useState("");
   const [credentialSecret, setCredentialSecret] = useState("");
   const [credentialProjects, setCredentialProjects] = useState("");
@@ -638,6 +639,7 @@ function App() {
 
   function editCredential(credential: CredentialSummary) {
     setCredentialId(credential.id);
+    setCredentialKind(credential.kind);
     setCredentialUsername(credential.username);
     setCredentialSecret("");
     setCredentialProjects(credential.projects.join(", "));
@@ -646,6 +648,7 @@ function App() {
 
   function resetCredentialForm() {
     setCredentialId("");
+    setCredentialKind("http_basic");
     setCredentialUsername("");
     setCredentialSecret("");
     setCredentialProjects("");
@@ -658,6 +661,7 @@ function App() {
     setCredentialError(null);
     try {
       await setCredential(credentialId.trim(), {
+        kind: credentialKind,
         username: credentialUsername.trim(),
         secret: credentialSecret,
         projects: [...new Set(credentialProjects.split(",").map((project) => project.trim()).filter(Boolean))],
@@ -818,10 +822,12 @@ function App() {
             error={credentialError}
             busy={credentialBusy}
             id={credentialId}
+            kind={credentialKind}
             username={credentialUsername}
             secret={credentialSecret}
             projects={credentialProjects}
             onIdChange={setCredentialId}
+            onKindChange={setCredentialKind}
             onUsernameChange={setCredentialUsername}
             onSecretChange={setCredentialSecret}
             onProjectsChange={setCredentialProjects}
@@ -1251,10 +1257,12 @@ function CredentialsPanel({
   error,
   busy,
   id,
+  kind,
   username,
   secret,
   projects,
   onIdChange,
+  onKindChange,
   onUsernameChange,
   onSecretChange,
   onProjectsChange,
@@ -1269,10 +1277,12 @@ function CredentialsPanel({
   error: string | null;
   busy: boolean;
   id: string;
+  kind: CredentialSummary["kind"];
   username: string;
   secret: string;
   projects: string;
   onIdChange: (value: string) => void;
+  onKindChange: (value: CredentialSummary["kind"]) => void;
   onUsernameChange: (value: string) => void;
   onSecretChange: (value: string) => void;
   onProjectsChange: (value: string) => void;
@@ -1330,8 +1340,9 @@ function CredentialsPanel({
               </div>
               <form className="credential-form" onSubmit={onSubmit}>
                 <label htmlFor="credential-id">Credential ID<input id="credential-id" value={id} onChange={(event) => onIdChange(event.target.value)} placeholder="github-ci" autoComplete="off" required /></label>
-                <label htmlFor="credential-username">Username<input id="credential-username" value={username} onChange={(event) => onUsernameChange(event.target.value)} placeholder="automation-user" autoComplete="username" required /></label>
-                <label htmlFor="credential-secret">Secret<input id="credential-secret" type="password" value={secret} onChange={(event) => onSecretChange(event.target.value)} placeholder={id ? "enter a new secret" : "paste a provider token"} autoComplete="new-password" required /><small>Required for every save; the field is cleared after success.</small></label>
+                <label htmlFor="credential-kind">Credential type<select id="credential-kind" value={kind} onChange={(event) => onKindChange(event.target.value as CredentialSummary["kind"])}><option value="http_basic">HTTP basic / token</option><option value="ssh_key">SSH private key</option></select><small>SSH keys are written only to a private temporary file while Git runs.</small></label>
+                <label htmlFor="credential-username">Username<input id="credential-username" value={username} onChange={(event) => onUsernameChange(event.target.value)} placeholder={kind === "ssh_key" ? "git" : "automation-user"} autoComplete="username" required /></label>
+                <label htmlFor="credential-secret">{kind === "ssh_key" ? "Private key" : "Secret"}<input id="credential-secret" type="password" value={secret} onChange={(event) => onSecretChange(event.target.value)} placeholder={kind === "ssh_key" ? "paste an SSH private key" : id ? "enter a new secret" : "paste a provider token"} autoComplete="new-password" required /><small>Required for every save; the field is cleared after success.</small></label>
                 <label htmlFor="credential-projects">Allowed projects <span className="optional">(empty = all)</span><input id="credential-projects" value={projects} onChange={(event) => onProjectsChange(event.target.value)} placeholder="web-app, release" autoComplete="off" /><small>Comma-separated project names. Scope credentials to the repositories that need them.</small></label>
                 <div className="credential-form-actions">
                   {id && <button className="button button-quiet" type="button" disabled={busy} onClick={onReset}>Clear</button>}
@@ -1352,7 +1363,7 @@ function CredentialsPanel({
                   {credentials.map((credential) => (
                     <div className="credential-row" key={credential.id}>
                       <span className="credential-row-mark">◈</span>
-                      <div className="credential-copy"><strong>{credential.id}</strong><small>{credential.username} · {credential.projects.length ? `scoped to ${credential.projects.join(", ")}` : "all projects"} · secret sealed</small></div>
+                      <div className="credential-copy"><strong>{credential.id}</strong><small>{credential.kind === "ssh_key" ? "SSH private key" : "HTTP basic / token"} · {credential.username} · {credential.projects.length ? `scoped to ${credential.projects.join(", ")}` : "all projects"} · secret sealed</small></div>
                       <button className="button button-quiet credential-action" type="button" disabled={busy} onClick={() => onEdit(credential)}>Rotate</button>
                       <button className="credential-delete" type="button" disabled={busy} aria-label={`Remove credential ${credential.id}`} onClick={() => void onRemove(credential)}>×</button>
                     </div>

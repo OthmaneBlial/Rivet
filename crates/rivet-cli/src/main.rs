@@ -15,11 +15,13 @@ use rivet_core::{
     BuildEvent, BuildStatus, CronExpression, ExecutionPlan, LogStream, Pipeline, Project,
     ScheduleId, SourceSnapshot,
 };
-use rivet_credentials::{CredentialKeychain, CredentialVault};
+use rivet_credentials::{CredentialKeychain, CredentialKind, CredentialVault};
 use rivet_migration::{analyze_jenkinsfile_file, generate_rivetfile_draft_file};
 use rivet_runner::execute_pipeline_with_parameters;
 use rivet_runner::{CacheStore, MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHandle, Scheduler};
-use rivet_scm::{GitHttpCredential, GitPrepareOptions, GitRepository, ScmError};
+use rivet_scm::{
+    GitCredential, GitHttpCredential, GitPrepareOptions, GitRepository, GitSshCredential, ScmError,
+};
 use rivet_storage::Storage;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -216,9 +218,11 @@ enum ScheduleCommand {
 
 #[derive(Debug, Subcommand)]
 enum CredentialCommand {
-    /// Store an HTTP basic credential without placing its secret in argv.
+    /// Store an HTTP or SSH credential without placing its secret in argv.
     Set {
         id: String,
+        #[arg(long, value_enum, default_value_t = CredentialKindArg::HttpBasic)]
+        kind: CredentialKindArg,
         #[arg(long)]
         username: String,
         /// Restrict use to one or more project names; repeat the flag.
@@ -330,6 +334,14 @@ impl From<AuthRoleArg> for AuthRole {
             AuthRoleArg::Agent => Self::Agent,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CredentialKindArg {
+    #[value(name = "http-basic")]
+    HttpBasic,
+    #[value(name = "ssh-key")]
+    SshKey,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1455,7 +1467,7 @@ async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Erro
     let snapshot = match options {
         Some(options) => {
             repository
-                .prepare_with_credential(&options, credential.as_ref())
+                .prepare_with_auth(&options, credential.as_ref())
                 .await?
         }
         None => repository.inspect().await?,
@@ -1825,6 +1837,7 @@ fn manage_credentials(
     match command {
         CredentialCommand::Set {
             id,
+            kind,
             username,
             projects,
             secret_file,
@@ -1835,7 +1848,14 @@ fn manage_credentials(
             let passphrase = read_private_value(&passphrase_file, "credential vault passphrase")?;
             let secret = read_private_value(&secret_file, "credential secret")?;
             let mut vault = CredentialVault::open_or_create(&vault_path, passphrase)?;
-            vault.set_http_basic_for_projects(id.clone(), username, secret, projects)?;
+            match kind {
+                CredentialKindArg::HttpBasic => {
+                    vault.set_http_basic_for_projects(id.clone(), username, secret, projects)?;
+                }
+                CredentialKindArg::SshKey => {
+                    vault.set_ssh_key_for_projects(id.clone(), username, secret, projects)?;
+                }
+            }
             println!("Stored credential {id} in {}", vault.path().display());
         }
         CredentialCommand::KeychainSet {
@@ -1863,7 +1883,16 @@ fn manage_credentials(
                 } else {
                     credential.projects.join(",")
                 };
-                println!("{}\t{}\t{}", credential.id, credential.username, scope);
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    credential.id,
+                    match credential.kind {
+                        CredentialKind::HttpBasic => "http-basic",
+                        CredentialKind::SshKey => "ssh-key",
+                    },
+                    credential.username,
+                    scope
+                );
             }
         }
         CredentialCommand::Remove {
@@ -2056,7 +2085,7 @@ async fn run_project_with_options(
     name: &str,
     scm: Option<GitPrepareOptions>,
     supplied_parameters: BTreeMap<String, String>,
-    credential: Option<GitHttpCredential>,
+    credential: Option<GitCredential>,
     priority: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage = open_storage(data_dir)?;
@@ -2174,16 +2203,12 @@ fn parse_parameters(values: &[String]) -> Result<BTreeMap<String, String>, Strin
 async fn capture_source_snapshot(
     path: &str,
     prepare: Option<&GitPrepareOptions>,
-    credential: Option<&GitHttpCredential>,
+    credential: Option<&GitCredential>,
 ) -> Result<Option<SourceSnapshot>, ScmError> {
     match GitRepository::open(path).await {
         Ok(repository) => {
             let snapshot = match prepare {
-                Some(options) => {
-                    repository
-                        .prepare_with_credential(options, credential)
-                        .await?
-                }
+                Some(options) => repository.prepare_with_auth(options, credential).await?,
                 None => repository.inspect().await?,
             };
             Ok(Some(snapshot.source_snapshot()))
@@ -2205,7 +2230,7 @@ fn load_git_credential(
     credentials_file: Option<&Path>,
     credentials_passphrase_file: Option<&Path>,
     project: Option<&str>,
-) -> Result<Option<GitHttpCredential>, Box<dyn std::error::Error>> {
+) -> Result<Option<GitCredential>, Box<dyn std::error::Error>> {
     match (credential_id, credentials_file, credentials_passphrase_file) {
         (None, None, None) => Ok(None),
         (None, Some(_), _) | (None, _, Some(_)) => Err(
@@ -2229,10 +2254,17 @@ fn load_git_credential(
                     credential
                 }
             };
-            Ok(Some(GitHttpCredential::new(
-                credential.username(),
-                credential.secret(),
-            )?))
+            let resolved = match credential.kind() {
+                CredentialKind::HttpBasic => GitCredential::HttpBasic(GitHttpCredential::new(
+                    credential.username(),
+                    credential.secret(),
+                )?),
+                CredentialKind::SshKey => GitCredential::SshKey(GitSshCredential::new(
+                    credential.username(),
+                    credential.secret(),
+                )?),
+            };
+            Ok(Some(resolved))
         }
     }
 }

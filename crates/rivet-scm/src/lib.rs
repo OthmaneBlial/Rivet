@@ -9,7 +9,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::process::Command;
 use zeroize::Zeroize;
@@ -96,6 +98,70 @@ impl Drop for GitHttpCredential {
     fn drop(&mut self) {
         self.secret.zeroize();
     }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct GitSshCredential {
+    username: String,
+    private_key: String,
+}
+
+impl GitSshCredential {
+    pub fn new(
+        username: impl Into<String>,
+        private_key: impl Into<String>,
+    ) -> Result<Self, ScmError> {
+        let username = username.into();
+        let private_key = private_key.into();
+        if username.is_empty() {
+            return Err(ScmError::InvalidCredential(
+                "username cannot be empty".into(),
+            ));
+        }
+        if private_key.is_empty() {
+            return Err(ScmError::InvalidCredential(
+                "private key cannot be empty".into(),
+            ));
+        }
+        if !private_key.contains("PRIVATE KEY") {
+            return Err(ScmError::InvalidCredential(
+                "private key does not contain a private-key marker".into(),
+            ));
+        }
+        Ok(Self {
+            username,
+            private_key,
+        })
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn private_key(&self) -> &str {
+        &self.private_key
+    }
+}
+
+impl fmt::Debug for GitSshCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitSshCredential")
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for GitSshCredential {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum GitCredential {
+    HttpBasic(GitHttpCredential),
+    SshKey(GitSshCredential),
 }
 
 #[derive(Debug, Error)]
@@ -209,6 +275,15 @@ impl GitRepository {
         remote: &str,
         credential: Option<&GitHttpCredential>,
     ) -> Result<(), ScmError> {
+        let credential = credential.map(|value| GitCredential::HttpBasic(value.clone()));
+        self.fetch_with_auth(remote, credential.as_ref()).await
+    }
+
+    pub async fn fetch_with_auth(
+        &self,
+        remote: &str,
+        credential: Option<&GitCredential>,
+    ) -> Result<(), ScmError> {
         validate_argument(remote, "remote")?;
         self.run(["fetch", "--prune", remote], "fetch", credential)
             .await
@@ -220,6 +295,17 @@ impl GitRepository {
         remote: &str,
         refspec: &str,
         credential: Option<&GitHttpCredential>,
+    ) -> Result<(), ScmError> {
+        let credential = credential.map(|value| GitCredential::HttpBasic(value.clone()));
+        self.fetch_ref_with_auth(remote, refspec, credential.as_ref())
+            .await
+    }
+
+    pub async fn fetch_ref_with_auth(
+        &self,
+        remote: &str,
+        refspec: &str,
+        credential: Option<&GitCredential>,
     ) -> Result<(), ScmError> {
         validate_argument(remote, "remote")?;
         validate_refspec(refspec)?;
@@ -257,13 +343,21 @@ impl GitRepository {
         options: &GitPrepareOptions,
         credential: Option<&GitHttpCredential>,
     ) -> Result<GitSnapshot, ScmError> {
+        let credential = credential.map(|value| GitCredential::HttpBasic(value.clone()));
+        self.prepare_with_auth(options, credential.as_ref()).await
+    }
+
+    pub async fn prepare_with_auth(
+        &self,
+        options: &GitPrepareOptions,
+        credential: Option<&GitCredential>,
+    ) -> Result<GitSnapshot, ScmError> {
         if options.fetch {
             if let Some(refspec) = options.fetch_ref.as_deref() {
-                self.fetch_ref_with_credential(&options.remote, refspec, credential)
+                self.fetch_ref_with_auth(&options.remote, refspec, credential)
                     .await?;
             } else {
-                self.fetch_with_credential(&options.remote, credential)
-                    .await?;
+                self.fetch_with_auth(&options.remote, credential).await?;
             }
         }
         if let Some(revision) = options.revision.as_deref() {
@@ -279,12 +373,13 @@ impl GitRepository {
         &self,
         args: [&str; N],
         operation: &'static str,
-        credential: Option<&GitHttpCredential>,
+        credential: Option<&GitCredential>,
     ) -> Result<GitCommandOutput, ScmError> {
+        let authentication = git_auth_environment(credential)?;
         let output = Command::new("git")
             .args(args)
             .current_dir(&self.root)
-            .envs(git_auth_environment(credential))
+            .envs(&authentication.values)
             .output()
             .await
             .map_err(ScmError::Filesystem)?;
@@ -330,32 +425,95 @@ impl GitCommandOutput {
     }
 }
 
-fn git_auth_environment(credential: Option<&GitHttpCredential>) -> BTreeMap<String, String> {
-    let mut environment = BTreeMap::new();
-    let Some(credential) = credential else {
-        return environment;
-    };
-    let encoded = STANDARD.encode(format!("{}:{}", credential.username, credential.secret));
-    environment.insert("GIT_CONFIG_COUNT".into(), "2".into());
-    environment.insert("GIT_CONFIG_KEY_0".into(), "http.extraHeader".into());
-    environment.insert(
-        "GIT_CONFIG_VALUE_0".into(),
-        format!("Authorization: Basic {encoded}"),
-    );
-    environment.insert("GIT_CONFIG_KEY_1".into(), "credential.helper".into());
-    environment.insert("GIT_CONFIG_VALUE_1".into(), String::new());
-    environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
-    environment
+struct GitAuthEnvironment {
+    values: BTreeMap<String, String>,
+    _ssh_key: Option<NamedTempFile>,
 }
 
-fn redact_credential(message: &str, credential: Option<&GitHttpCredential>) -> String {
+fn git_auth_environment(
+    credential: Option<&GitCredential>,
+) -> Result<GitAuthEnvironment, ScmError> {
+    let mut environment = BTreeMap::new();
+    let mut ssh_key = None;
+    let Some(credential) = credential else {
+        return Ok(GitAuthEnvironment {
+            values: environment,
+            _ssh_key: ssh_key,
+        });
+    };
+    match credential {
+        GitCredential::HttpBasic(credential) => {
+            let encoded = STANDARD.encode(format!("{}:{}", credential.username, credential.secret));
+            environment.insert("GIT_CONFIG_COUNT".into(), "2".into());
+            environment.insert("GIT_CONFIG_KEY_0".into(), "http.extraHeader".into());
+            environment.insert(
+                "GIT_CONFIG_VALUE_0".into(),
+                format!("Authorization: Basic {encoded}"),
+            );
+            environment.insert("GIT_CONFIG_KEY_1".into(), "credential.helper".into());
+            environment.insert("GIT_CONFIG_VALUE_1".into(), String::new());
+        }
+        GitCredential::SshKey(credential) => {
+            let mut temporary = tempfile::Builder::new()
+                .prefix("rivet-ssh-key-")
+                .tempfile()
+                .map_err(ScmError::Filesystem)?;
+            temporary
+                .write_all(credential.private_key.as_bytes())
+                .map_err(ScmError::Filesystem)?;
+            temporary
+                .as_file()
+                .sync_all()
+                .map_err(ScmError::Filesystem)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = temporary
+                    .as_file()
+                    .metadata()
+                    .map_err(ScmError::Filesystem)?
+                    .permissions();
+                permissions.set_mode(0o600);
+                temporary
+                    .as_file()
+                    .set_permissions(permissions)
+                    .map_err(ScmError::Filesystem)?;
+            }
+            let key_path = shell_quote(&temporary.path().to_string_lossy());
+            environment.insert(
+                "GIT_SSH_COMMAND".into(),
+                format!(
+                    "ssh -i {} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
+                    key_path
+                ),
+            );
+            ssh_key = Some(temporary);
+        }
+    }
+    environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+    Ok(GitAuthEnvironment {
+        values: environment,
+        _ssh_key: ssh_key,
+    })
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
+}
+
+fn redact_credential(message: &str, credential: Option<&GitCredential>) -> String {
     let Some(credential) = credential else {
         return message.to_owned();
     };
-    let encoded = STANDARD.encode(format!("{}:{}", credential.username, credential.secret));
-    message
-        .replace(&credential.secret, "[redacted]")
-        .replace(&encoded, "[redacted]")
+    match credential {
+        GitCredential::HttpBasic(credential) => {
+            let encoded = STANDARD.encode(format!("{}:{}", credential.username, credential.secret));
+            message
+                .replace(&credential.secret, "[redacted]")
+                .replace(&encoded, "[redacted]")
+        }
+        GitCredential::SshKey(credential) => message.replace(&credential.private_key, "[redacted]"),
+    }
 }
 
 fn parse_stdout(operation: &'static str, stdout: &[u8]) -> Result<String, ScmError> {
@@ -537,27 +695,43 @@ mod tests {
     fn builds_ephemeral_git_auth_and_redacts_secret_material() {
         let credential =
             GitHttpCredential::new("oauth2", "fixture-token-value").expect("credential");
-        let environment = git_auth_environment(Some(&credential));
+        let credential = GitCredential::HttpBasic(credential);
+        let environment = git_auth_environment(Some(&credential)).expect("environment");
         let encoded = STANDARD.encode("oauth2:fixture-token-value");
 
         assert_eq!(
-            environment.get("GIT_CONFIG_COUNT").map(String::as_str),
+            environment
+                .values
+                .get("GIT_CONFIG_COUNT")
+                .map(String::as_str),
             Some("2")
         );
         assert_eq!(
-            environment.get("GIT_CONFIG_KEY_0").map(String::as_str),
+            environment
+                .values
+                .get("GIT_CONFIG_KEY_0")
+                .map(String::as_str),
             Some("http.extraHeader")
         );
         assert_eq!(
-            environment.get("GIT_CONFIG_KEY_1").map(String::as_str),
+            environment
+                .values
+                .get("GIT_CONFIG_KEY_1")
+                .map(String::as_str),
             Some("credential.helper")
         );
         assert_eq!(
-            environment.get("GIT_CONFIG_VALUE_0").map(String::as_str),
+            environment
+                .values
+                .get("GIT_CONFIG_VALUE_0")
+                .map(String::as_str),
             Some(format!("Authorization: Basic {encoded}").as_str())
         );
         assert_eq!(
-            environment.get("GIT_TERMINAL_PROMPT").map(String::as_str),
+            environment
+                .values
+                .get("GIT_TERMINAL_PROMPT")
+                .map(String::as_str),
             Some("0")
         );
 
@@ -569,6 +743,61 @@ mod tests {
         assert!(!redacted.contains(&encoded));
         assert!(redacted.contains("[redacted]"));
         assert!(!format!("{credential:?}").contains("fixture-token-value"));
+    }
+
+    #[test]
+    fn writes_ssh_key_to_private_ephemeral_file_and_redacts_it() {
+        let private_key =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-key\n-----END OPENSSH PRIVATE KEY-----";
+        let credential =
+            GitCredential::SshKey(GitSshCredential::new("git", private_key).expect("credential"));
+        let environment = git_auth_environment(Some(&credential)).expect("environment");
+        let key_path = environment
+            ._ssh_key
+            .as_ref()
+            .expect("temporary key")
+            .path()
+            .to_path_buf();
+        let ssh_command = environment
+            .values
+            .get("GIT_SSH_COMMAND")
+            .expect("ssh command");
+        assert!(ssh_command.contains(key_path.to_str().expect("key path")));
+        assert!(ssh_command.contains("IdentitiesOnly=yes"));
+        assert!(ssh_command.contains("BatchMode=yes"));
+        assert!(ssh_command.contains("StrictHostKeyChecking=accept-new"));
+        assert!(!ssh_command.contains(private_key));
+        assert_eq!(
+            environment
+                .values
+                .get("GIT_TERMINAL_PROMPT")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            fs::read_to_string(&key_path).expect("read key"),
+            private_key
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&key_path)
+                    .expect("key metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        let redacted =
+            redact_credential(&format!("ssh failed with {private_key}"), Some(&credential));
+        assert!(!redacted.contains(private_key));
+        assert!(redacted.contains("[redacted]"));
+        assert!(!format!("{credential:?}").contains(private_key));
+        drop(environment);
+        assert!(!key_path.exists());
     }
 
     #[test]

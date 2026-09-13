@@ -23,13 +23,18 @@ use rivet_core::{
     BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, Pipeline, Project, ScheduleId,
     SourceSnapshot,
 };
-use rivet_credentials::{CredentialError, CredentialKeychain, CredentialSummary, CredentialVault};
+use rivet_credentials::{
+    CredentialError, CredentialKeychain, CredentialKind, CredentialSummary, CredentialVault,
+};
 use rivet_extension_protocol::{
     ExtensionCatalog, ExtensionCatalogError, ExtensionKind, ExtensionManager,
     ExtensionManagerError, ExtensionManifest,
 };
 use rivet_runner::{MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHandle, QueueStats, Scheduler};
-use rivet_scm::{GitHttpCredential, GitPrepareOptions, GitRepository, GitSnapshot, ScmError};
+use rivet_scm::{
+    GitCredential, GitHttpCredential, GitPrepareOptions, GitRepository, GitSnapshot,
+    GitSshCredential, ScmError,
+};
 use rivet_storage::{
     ArtifactRecord, AuditEventRecord, BuildDetails, BuildRecord, LogRecord, ScheduleRecord,
     Storage, StorageError,
@@ -233,6 +238,7 @@ impl IntoResponse for ApiError {
                 | CredentialError::TooManyProjects
                 | CredentialError::InvalidKeychainLabel(_)
                 | CredentialError::EmptySecret
+                | CredentialError::InvalidSecret
                 | CredentialError::WeakPassphrase => StatusCode::BAD_REQUEST,
                 CredentialError::SymlinkPath(_)
                 | CredentialError::VaultNotFound(_)
@@ -310,6 +316,8 @@ pub struct UpdateScheduleRequest {
 
 #[derive(Deserialize)]
 struct CredentialWriteRequest {
+    #[serde(default)]
+    kind: CredentialKind,
     username: String,
     secret: String,
     /// Empty keeps the credential globally usable for backwards-compatible
@@ -599,7 +607,7 @@ async fn prepare_scm(
     .await?;
     Ok(Json(
         repository
-            .prepare_with_credential(
+            .prepare_with_auth(
                 &GitPrepareOptions {
                     remote: request.remote,
                     fetch: request.fetch,
@@ -927,12 +935,20 @@ async fn set_credential(
     require_global(&principal, Permission::Administer)?;
     let vault = configured_credentials(&state)?;
     let mut vault = vault.lock().await;
-    vault.set_http_basic_for_projects(
-        id.clone(),
-        request.username,
-        request.secret,
-        request.projects,
-    )?;
+    let CredentialWriteRequest {
+        kind,
+        username,
+        secret,
+        projects,
+    } = request;
+    match kind {
+        CredentialKind::HttpBasic => {
+            vault.set_http_basic_for_projects(id.clone(), username, secret, projects)?;
+        }
+        CredentialKind::SshKey => {
+            vault.set_ssh_key_for_projects(id.clone(), username, secret, projects)?;
+        }
+    }
     let summary = vault
         .list()
         .into_iter()
@@ -3586,7 +3602,7 @@ async fn capture_source_snapshot(
                     )
                     .await?;
                     repository
-                        .prepare_with_credential(
+                        .prepare_with_auth(
                             &GitPrepareOptions {
                                 remote: request.remote.clone(),
                                 fetch: request.fetch,
@@ -3620,7 +3636,7 @@ async fn resolve_git_credential(
     credentials: Option<&Arc<Mutex<CredentialVault>>>,
     credential_id: Option<&str>,
     project_name: &str,
-) -> Result<Option<GitHttpCredential>, ApiError> {
+) -> Result<Option<GitCredential>, ApiError> {
     let Some(credential_id) = credential_id else {
         return Ok(None);
     };
@@ -3638,9 +3654,17 @@ async fn resolve_git_credential(
         .map_err(|error| {
             ApiError::BadRequest(format!("could not resolve SCM credential: {error}"))
         })?;
-    GitHttpCredential::new(credential.username(), credential.secret())
-        .map(Some)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))
+    let resolved = match credential.kind() {
+        CredentialKind::HttpBasic => GitCredential::HttpBasic(
+            GitHttpCredential::new(credential.username(), credential.secret())
+                .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+        ),
+        CredentialKind::SshKey => GitCredential::SshKey(
+            GitSshCredential::new(credential.username(), credential.secret())
+                .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+        ),
+    };
+    Ok(Some(resolved))
 }
 
 async fn cancel_build(
@@ -4781,6 +4805,32 @@ mod tests {
                 .any(|window| { window == b"scope-secret" })
         );
 
+        let ssh_response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/credentials/deploy-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"ssh_key","username":"git","secret":"-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-key\n-----END OPENSSH PRIVATE KEY-----","projects":["release"]}"#,
+                    ))
+                    .expect("ssh credential request"),
+            )
+            .await
+            .expect("ssh credential response");
+        assert_eq!(ssh_response.status(), StatusCode::OK);
+        let ssh_body = to_bytes(ssh_response.into_body(), 16 * 1024)
+            .await
+            .expect("ssh credential body");
+        let ssh_summary: serde_json::Value =
+            serde_json::from_slice(&ssh_body).expect("ssh summary JSON");
+        assert_eq!(ssh_summary["kind"], "ssh_key");
+        assert!(
+            !ssh_body
+                .windows(b"fixture-key".len())
+                .any(|window| { window == b"fixture-key" })
+        );
+
         assert!(
             resolve_git_credential(state.credentials.as_ref(), Some("release-token"), "release")
                 .await
@@ -4796,6 +4846,12 @@ mod tests {
         assert!(
             matches!(denied, Err(ApiError::BadRequest(message)) if message.contains("not found"))
         );
+        assert!(matches!(
+            resolve_git_credential(state.credentials.as_ref(), Some("deploy-key"), "release")
+                .await
+                .expect("ssh resolution"),
+            Some(GitCredential::SshKey(_))
+        ));
     }
 
     #[tokio::test]

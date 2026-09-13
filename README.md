@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**90% verified** · `██████████████████░░`<br>
-Weighted evidence score: **90.86 / 100** · displayed conservatively as the
+**91% verified** · `██████████████████░░`<br>
+Weighted evidence score: **91.39 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -28,7 +28,7 @@ toggle, persistent UTC cron schedules, server dispatch, desktop schedule
 controls, signed generic webhook delivery with idempotent redelivery,
 policy-backed API identities with role/project authorization,
 secret-parameter redaction/masking, a passphrase-encrypted SCM credential vault
-with non-secret credential references and project allow-lists, and a packaged desktop launch with an
+with typed HTTP/SSH credentials, non-secret credential references and project allow-lists, and a packaged desktop launch with an
 ephemeral loopback engine origin, project-scoped local CI cache restore and
 save, explicit Docker container command assembly with bounded workspace mounts,
 and a bounded Jenkinsfile migration analyzer with line-level support findings
@@ -49,8 +49,8 @@ closes unfinished steps, stages, and builds as failed when recovery is
 unavailable. Steps may also use a bounded, cancellation-aware retry policy
 shared by local and assigned-agent execution. On startup, persisted incomplete builds are reconciled
 idempotently so a crashed server cannot leave history stuck forever; resuming
-the same remote attempt after restart and richer retry policy remain future
-gates. Authenticated deployments persist bounded success/failure audit records
+the same remote attempt after restart and cross-restart retry recovery remain
+future gates. Authenticated deployments persist bounded success/failure audit records
 without request bodies or Bearer values and expose them only to administrators;
 user sessions and external identity providers remain future gates.
 
@@ -345,6 +345,11 @@ cargo run -p rivet -- credential set github \
   --secret-file /secure/path/github.token \
   --passphrase-file /secure/path/rivet.credentials.passphrase \
   --vault-file /secure/path/rivet.credentials.vault
+cargo run -p rivet -- credential set deploy-key \
+  --kind ssh-key --username git \
+  --secret-file /secure/path/deploy.key \
+  --passphrase-file /secure/path/rivet.credentials.passphrase \
+  --vault-file /secure/path/rivet.credentials.vault
 cargo run -p rivet -- credential list \
   --passphrase-file /secure/path/rivet.credentials.passphrase \
   --vault-file /secure/path/rivet.credentials.vault
@@ -365,13 +370,16 @@ cargo run -p rivet -- --data-dir .rivet server \
 Build admission and explicit SCM preparation accept only the non-secret
 credential ID, for example `{ "remote": "origin", "fetch": true,
 "credential_id": "github" }`. Provider PR/MR deliveries additionally carry a
-validated `fetch_ref`. Rivet resolves the ID locally, passes HTTP
-Basic auth to the Git child process through ephemeral configuration, and
-redacts the secret and encoded header from command errors. The vault stores
-authenticated ciphertext only. When the server is configured with the vault,
+validated `fetch_ref`. Rivet resolves the ID locally, passes HTTP Basic auth
+through ephemeral Git configuration or writes an SSH private key to a private
+temporary file for the lifetime of the Git process, and redacts credential
+material from command errors. SSH uses `BatchMode` and `IdentitiesOnly`; its
+`accept-new` host-key behavior is a first-use convenience that still needs
+deployment-specific host-key policy. The vault stores authenticated ciphertext
+only. When the server is configured with the vault,
 administrators can manage its lifecycle through `GET /api/v1/credentials`,
 `PUT /api/v1/credentials/<id>`, and `DELETE /api/v1/credentials/<id>`.
-Responses contain only IDs, usernames, and non-secret project scopes;
+Responses contain only IDs, credential kinds, usernames, and non-secret project scopes;
 replacement and removal require the administrator permission and append a
 bounded audit event without recording the secret. A credential with no project
 scope is global for backwards compatibility; `--project` (repeatable) or the
@@ -429,8 +437,8 @@ Cancellation is propagated to the agent, and declared artifacts return through
 the same bounded transfer with checksum verification before local storage.
 After an agent disconnect, the server makes one bounded replacement attempt and
 persists a terminal failed state when no replacement is available. Durable
-recovery across a server restart, exactly-once guarantees, and richer retry
-policy remain future gates.
+recovery across a server restart, exactly-once guarantees, and cross-restart
+retry recovery remain future gates.
 
 Connect a worker for heartbeat and capability discovery:
 

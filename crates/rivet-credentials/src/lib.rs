@@ -28,6 +28,7 @@ const MAX_ID_BYTES: usize = 64;
 const MAX_USERNAME_BYTES: usize = 256;
 const MAX_PROJECT_BYTES: usize = 256;
 const MAX_PROJECTS: usize = 64;
+const MAX_SECRET_BYTES: usize = 64 * 1024;
 const MAX_KEYCHAIN_LABEL_BYTES: usize = 256;
 pub const DEFAULT_KEYCHAIN_SERVICE: &str = "Rivet";
 
@@ -53,6 +54,8 @@ pub enum CredentialError {
     InvalidKeychainLabel(&'static str),
     #[error("credential secret cannot be empty")]
     EmptySecret,
+    #[error("credential secret is too large or contains NUL bytes")]
+    InvalidSecret,
     #[error("credential was not found: {0}")]
     CredentialNotFound(String),
     #[error("credential vault format is invalid: {0}")]
@@ -119,9 +122,18 @@ impl CredentialKeychain {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialKind {
+    #[default]
+    HttpBasic,
+    SshKey,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Credential {
     id: String,
+    kind: CredentialKind,
     username: String,
     secret: String,
     projects: BTreeSet<String>,
@@ -130,6 +142,10 @@ pub struct Credential {
 impl Credential {
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub fn kind(&self) -> CredentialKind {
+        self.kind
     }
 
     pub fn username(&self) -> &str {
@@ -170,6 +186,7 @@ impl Drop for Credential {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CredentialSummary {
     pub id: String,
+    pub kind: CredentialKind,
     pub username: String,
     /// Empty means global access; otherwise this is the explicit project
     /// allow-list. Secrets are intentionally never part of this summary.
@@ -201,6 +218,8 @@ struct VaultPayload {
 
 #[derive(Deserialize, Serialize)]
 struct VaultCredential {
+    #[serde(default)]
+    kind: CredentialKind,
     username: String,
     secret: String,
     #[serde(default)]
@@ -263,14 +282,13 @@ impl CredentialVault {
             .map(|(id, credential)| {
                 validate_id(&id)?;
                 validate_username(&credential.username)?;
-                if credential.secret.is_empty() {
-                    return Err(CredentialError::EmptySecret);
-                }
+                validate_secret(&credential.kind, &credential.secret)?;
                 validate_projects(&credential.projects)?;
                 Ok((
                     id.clone(),
                     Credential {
                         id,
+                        kind: credential.kind,
                         username: credential.username.clone(),
                         secret: credential.secret.clone(),
                         projects: credential.projects.clone(),
@@ -320,6 +338,7 @@ impl CredentialVault {
             .values()
             .map(|credential| CredentialSummary {
                 id: credential.id.clone(),
+                kind: credential.kind,
                 username: credential.username.clone(),
                 projects: credential.projects.iter().cloned().collect(),
             })
@@ -377,14 +396,53 @@ impl CredentialVault {
             .collect::<BTreeSet<_>>();
         validate_id(&id)?;
         validate_username(&username)?;
-        if secret.is_empty() {
-            return Err(CredentialError::EmptySecret);
-        }
+        self.set_for_projects(id, CredentialKind::HttpBasic, username, secret, projects)
+    }
+
+    /// Store or replace an SSH private-key credential with an optional project
+    /// allow-list. The key remains encrypted in the vault until Git needs it.
+    pub fn set_ssh_key_for_projects<I, S>(
+        &mut self,
+        id: impl Into<String>,
+        username: impl Into<String>,
+        private_key: impl Into<String>,
+        projects: I,
+    ) -> Result<(), CredentialError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.set_for_projects(id, CredentialKind::SshKey, username, private_key, projects)
+    }
+
+    fn set_for_projects<I, S>(
+        &mut self,
+        id: impl Into<String>,
+        kind: CredentialKind,
+        username: impl Into<String>,
+        secret: impl Into<String>,
+        projects: I,
+    ) -> Result<(), CredentialError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let id = id.into();
+        let username = username.into();
+        let secret = secret.into();
+        let projects = projects
+            .into_iter()
+            .map(|project| project.into().trim().to_owned())
+            .collect::<BTreeSet<_>>();
+        validate_id(&id)?;
+        validate_username(&username)?;
+        validate_secret(&kind, &secret)?;
         validate_projects(&projects)?;
         let previous = self.credentials.insert(
             id.clone(),
             Credential {
                 id: id.clone(),
+                kind,
                 username,
                 secret,
                 projects,
@@ -423,6 +481,7 @@ impl CredentialVault {
                     (
                         id.clone(),
                         VaultCredential {
+                            kind: credential.kind,
                             username: credential.username.clone(),
                             secret: credential.secret.clone(),
                             projects: credential.projects.clone(),
@@ -464,6 +523,21 @@ fn validate_username(username: &str) -> Result<(), CredentialError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_secret(kind: &CredentialKind, secret: &str) -> Result<(), CredentialError> {
+    if secret.is_empty() {
+        return Err(CredentialError::EmptySecret);
+    }
+    if secret.len() > MAX_SECRET_BYTES || secret.contains('\0') {
+        return Err(CredentialError::InvalidSecret);
+    }
+    if *kind == CredentialKind::SshKey && !secret.contains("PRIVATE KEY") {
+        return Err(CredentialError::InvalidFormat(
+            "SSH credential does not contain a private-key marker".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_projects(projects: &BTreeSet<String>) -> Result<(), CredentialError> {
@@ -654,6 +728,7 @@ mod tests {
             vault.list(),
             [CredentialSummary {
                 id: "github".into(),
+                kind: CredentialKind::HttpBasic,
                 username: "oauth2".into(),
                 projects: vec![],
             }]
@@ -758,9 +833,81 @@ mod tests {
             Err(CredentialError::EmptySecret)
         ));
         assert!(matches!(
+            vault.set_http_basic("nul", "user", "secret\0value"),
+            Err(CredentialError::InvalidSecret)
+        ));
+        assert!(matches!(
             CredentialVault::open_or_create(directory.path().join("weak.vault"), "short"),
             Err(CredentialError::WeakPassphrase)
         ));
+    }
+
+    #[test]
+    fn ssh_credentials_round_trip_with_kind_and_project_scope() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("credentials.vault");
+        let private_key =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-key\n-----END OPENSSH PRIVATE KEY-----";
+        let mut vault = CredentialVault::open_or_create(&path, PASSPHRASE).expect("create");
+        vault
+            .set_ssh_key_for_projects("deploy", "git", private_key, ["rivet"])
+            .expect("set ssh credential");
+        assert_eq!(vault.list()[0].kind, CredentialKind::SshKey);
+        assert_eq!(
+            vault.get_for_project("deploy", "rivet").unwrap().secret(),
+            private_key
+        );
+        assert!(matches!(
+            vault.set_ssh_key_for_projects(
+                "invalid",
+                "git",
+                "not-a-key",
+                std::iter::empty::<String>()
+            ),
+            Err(CredentialError::InvalidFormat(_))
+        ));
+        drop(vault);
+
+        let vault = CredentialVault::open(&path, PASSPHRASE).expect("reopen");
+        let credential = vault.get("deploy").expect("ssh credential");
+        assert_eq!(credential.kind(), CredentialKind::SshKey);
+        assert_eq!(credential.username(), "git");
+        assert_eq!(credential.secret(), private_key);
+    }
+
+    #[test]
+    fn legacy_vault_entries_default_to_http_basic() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("credentials.vault");
+        let mut vault = CredentialVault::open_or_create(&path, PASSPHRASE).expect("create");
+        vault
+            .set_http_basic("github", "oauth2", "fixture-token-value")
+            .expect("set");
+        let encrypted = serde_json::from_slice::<EncryptedVault>(&fs::read(&path).expect("read"))
+            .expect("decode encrypted vault");
+        let plaintext =
+            Zeroizing::new(decrypt_vault(&encrypted, PASSPHRASE.as_bytes()).expect("decrypt"));
+        let mut legacy = serde_json::from_slice::<serde_json::Value>(&plaintext).expect("payload");
+        let credential = legacy["credentials"]["github"]
+            .as_object_mut()
+            .expect("credential object");
+        credential.remove("kind");
+        let reencrypted = encrypt_vault(
+            &Zeroizing::new(serde_json::to_vec(&legacy).expect("serialize legacy payload")),
+            PASSPHRASE.as_bytes(),
+        )
+        .expect("encrypt legacy payload");
+        fs::write(
+            &path,
+            serde_json::to_vec(&reencrypted).expect("serialize vault"),
+        )
+        .expect("write legacy vault");
+
+        let vault = CredentialVault::open(&path, PASSPHRASE).expect("open legacy vault");
+        assert_eq!(
+            vault.get("github").unwrap().kind(),
+            CredentialKind::HttpBasic
+        );
     }
 
     #[cfg(unix)]
