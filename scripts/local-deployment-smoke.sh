@@ -25,6 +25,7 @@ data_dir="$deployment_dir/data"
 token_file="$deployment_dir/server.token"
 server_log="$deployment_dir/server.log"
 health_headers="$deployment_dir/health.headers"
+fallback_headers="$deployment_dir/fallback.headers"
 health_body="$deployment_dir/health.json"
 projects_body="$deployment_dir/projects.json"
 unauthorized_body="$deployment_dir/unauthorized.json"
@@ -60,6 +61,11 @@ rg -Fiq 'referrer-policy: no-referrer' "$health_headers"
 rg -Fiq 'x-frame-options: DENY' "$health_headers"
 rg -Fiq 'x-request-id: local-deployment-health' "$health_headers"
 rg -Fiq 'access-control-allow-origin: http://127.0.0.1:1420' "$health_headers"
+
+curl -fsS -D "$fallback_headers" -o /dev/null \
+    -H 'origin: http://127.0.0.1:1421' \
+    "http://127.0.0.1:$auth_port/api/v1/health"
+rg -Fiq 'access-control-allow-origin: http://127.0.0.1:1421' "$fallback_headers"
 
 curl -fsS "http://127.0.0.1:$auth_port/api/v1/ready" | jq -e \
     '.status == "ready" and .service == "rivet-server" and .storage == "ok"' >/dev/null
