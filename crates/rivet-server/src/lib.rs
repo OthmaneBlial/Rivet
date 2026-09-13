@@ -446,6 +446,7 @@ fn cors_layer(allowed_origins: &[String]) -> Result<CorsLayer, ServerError> {
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
             HeaderName::from_static("x-rivet-signature"),
+            HeaderName::from_static("x-request-id"),
         ]))
 }
 
@@ -3643,6 +3644,28 @@ mod tests {
                 .get("x-frame-options")
                 .and_then(|value| value.to_str().ok()),
             Some("DENY")
+        );
+
+        let response = router(AppState::new(Storage::open_in_memory().expect("storage")))
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/v1/health")
+                    .header("origin", "http://127.0.0.1:1420")
+                    .header("access-control-request-method", "GET")
+                    .header("access-control-request-headers", "x-request-id")
+                    .body(Body::empty())
+                    .expect("preflight request"),
+            )
+            .await
+            .expect("preflight response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-headers")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.to_ascii_lowercase().contains("x-request-id"))
         );
 
         let mut custom_origins = vec!["https://console.example".to_owned()];
