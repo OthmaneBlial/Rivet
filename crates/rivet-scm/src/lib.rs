@@ -196,6 +196,18 @@ impl GitRepository {
     }
 }
 
+impl GitSnapshot {
+    pub fn source_snapshot(&self) -> rivet_core::SourceSnapshot {
+        rivet_core::SourceSnapshot {
+            provider: "git".to_owned(),
+            revision: self.revision.clone(),
+            reference: self.branch.clone(),
+            remote: self.remote.clone(),
+            dirty: self.dirty,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct GitCommandOutput {
     stdout: Vec<u8>,

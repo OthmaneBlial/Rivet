@@ -11,9 +11,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
-use rivet_core::{BuildEvent, BuildId, BuildStatus, ExecutionPlan, Pipeline, Project};
+use rivet_core::{
+    BuildEvent, BuildId, BuildStatus, ExecutionPlan, Pipeline, Project, SourceSnapshot,
+};
 use rivet_runner::{QueueHandle, Scheduler};
-use rivet_scm::{GitPrepareOptions, GitRepository, GitSnapshot};
+use rivet_scm::{GitPrepareOptions, GitRepository, GitSnapshot, ScmError};
 use rivet_storage::{BuildDetails, BuildRecord, LogRecord, Storage, StorageError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -289,7 +291,10 @@ async fn queue_build(
     let repository_root = PathBuf::from(&project.repository_path);
     let pipeline = Pipeline::load(&project.pipeline_path)?;
     let plan = ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), project.id);
-    let build = state.storage.create_build(&project, &plan, &pipeline)?;
+    let source = capture_source_snapshot(&repository_root).await;
+    let build = state
+        .storage
+        .create_build(&project, &plan, &pipeline, source.as_ref())?;
     let cancellation = CancellationToken::new();
     state
         .active_builds
@@ -330,6 +335,23 @@ async fn queue_build(
             status: BuildStatus::Queued,
         }),
     ))
+}
+
+async fn capture_source_snapshot(path: &Path) -> Option<SourceSnapshot> {
+    match GitRepository::open(path).await {
+        Ok(repository) => match repository.inspect().await {
+            Ok(snapshot) => Some(snapshot.source_snapshot()),
+            Err(error) => {
+                tracing::warn!(?error, "source snapshot unavailable");
+                None
+            }
+        },
+        Err(ScmError::NotGitRepository(_)) => None,
+        Err(error) => {
+            tracing::warn!(?error, "source snapshot unavailable");
+            None
+        }
+    }
 }
 
 async fn cancel_build(

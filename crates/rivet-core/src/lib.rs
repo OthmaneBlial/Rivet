@@ -11,6 +11,7 @@ mod pipeline;
 pub use events::{BuildEvent, EventKind, LogStream};
 pub use execution::{ExecutionPlan, ExecutionStage, ExecutionStep};
 pub use model::{
-    BuildId, BuildStatus, ModelError, Project, ProjectId, StageId, StageStatus, StepId, StepStatus,
+    BuildId, BuildStatus, ModelError, Project, ProjectId, SourceSnapshot, StageId, StageStatus,
+    StepId, StepStatus,
 };
 pub use pipeline::{Pipeline, PipelineError, Stage, Step};

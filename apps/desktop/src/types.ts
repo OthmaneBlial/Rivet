@@ -25,6 +25,14 @@ export interface Project {
   created_at: string;
 }
 
+export interface SourceSnapshot {
+  provider: string;
+  revision: string;
+  reference: string | null;
+  remote: string | null;
+  dirty: boolean;
+}
+
 export interface BuildRecord {
   id: string;
   project_id: string;
@@ -33,6 +41,7 @@ export interface BuildRecord {
   queued_at: string;
   started_at: string | null;
   finished_at: string | null;
+  source: SourceSnapshot | null;
 }
 
 export interface StepRecord {

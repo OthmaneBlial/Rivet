@@ -9,6 +9,15 @@ pub type StageId = Uuid;
 pub type StepId = Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceSnapshot {
+    pub provider: String,
+    pub revision: String,
+    pub reference: Option<String>,
+    pub remote: Option<String>,
+    pub dirty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BuildStatus {
     Pending,

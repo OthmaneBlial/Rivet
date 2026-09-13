@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use rivet_core::{
     BuildEvent, BuildId, BuildStatus, ExecutionPlan, LogStream, Pipeline, Project, ProjectId,
-    StageId, StageStatus, StepId, StepStatus,
+    SourceSnapshot, StageId, StageStatus, StepId, StepStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,30 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct Storage {
     connection: Arc<Mutex<Connection>>,
+}
+
+fn apply_migration(
+    connection: &Connection,
+    version: i64,
+    script: Option<&str>,
+) -> Result<(), StorageError> {
+    let applied: Option<i64> = connection
+        .query_row(
+            "SELECT version FROM schema_migrations WHERE version = ?1",
+            params![version],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if applied.is_none() {
+        if let Some(script) = script {
+            connection.execute_batch(script)?;
+        }
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![version, Utc::now().to_rfc3339()],
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -46,6 +70,8 @@ pub enum StorageError {
     MissingStep(StepId),
     #[error("invalid build transition from {from:?} to {to:?}")]
     InvalidBuildTransition { from: BuildStatus, to: BuildStatus },
+    #[error("invalid source snapshot in database: {0}")]
+    InvalidSource(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,6 +83,7 @@ pub struct BuildRecord {
     pub queued_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    pub source: Option<SourceSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,9 +144,11 @@ impl Storage {
         let connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         connection.execute_batch(include_str!("../migrations/001_initial.sql"))?;
-        connection.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
-            params![1_i64, Utc::now().to_rfc3339()],
+        apply_migration(&connection, 1, None)?;
+        apply_migration(
+            &connection,
+            2,
+            Some(include_str!("../migrations/002_build_source.sql")),
         )?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -197,6 +226,7 @@ impl Storage {
         project: &Project,
         plan: &ExecutionPlan,
         pipeline: &Pipeline,
+        source: Option<&SourceSnapshot>,
     ) -> Result<BuildRecord, StorageError> {
         let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let transaction = connection.transaction()?;
@@ -208,14 +238,22 @@ impl Storage {
         let id = plan.build_id;
         let queued_at = Utc::now();
         transaction.execute(
-            "INSERT INTO builds(id, project_id, number, status, queued_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO builds(
+                id, project_id, number, status, queued_at,
+                source_provider, source_revision, source_reference,
+                source_remote, source_dirty
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 id.to_string(),
                 project.id.to_string(),
                 number,
                 status_string(&BuildStatus::Pending)?,
                 queued_at.to_rfc3339(),
+                source.map(|snapshot| snapshot.provider.as_str()),
+                source.map(|snapshot| snapshot.revision.as_str()),
+                source.and_then(|snapshot| snapshot.reference.as_deref()),
+                source.and_then(|snapshot| snapshot.remote.as_deref()),
+                source.map(|snapshot| i64::from(snapshot.dirty)),
             ],
         )?;
         for stage in &plan.stages {
@@ -257,6 +295,7 @@ impl Storage {
             queued_at,
             started_at: None,
             finished_at: None,
+            source: source.cloned(),
         })
     }
 
@@ -378,7 +417,8 @@ impl Storage {
     pub fn list_builds(&self, project_id: ProjectId) -> Result<Vec<BuildRecord>, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
-            "SELECT id, project_id, number, status, queued_at, started_at, finished_at
+            "SELECT id, project_id, number, status, queued_at, started_at, finished_at,
+                    source_provider, source_revision, source_reference, source_remote, source_dirty
              FROM builds WHERE project_id = ?1 ORDER BY number DESC",
         )?;
         let rows = statement.query_map(params![project_id.to_string()], raw_build)?;
@@ -393,7 +433,8 @@ impl Storage {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let raw = connection
             .query_row(
-                "SELECT id, project_id, number, status, queued_at, started_at, finished_at
+                "SELECT id, project_id, number, status, queued_at, started_at, finished_at,
+                        source_provider, source_revision, source_reference, source_remote, source_dirty
                  FROM builds WHERE id = ?1",
                 params![build_id.to_string()],
                 raw_build,
@@ -460,6 +501,11 @@ type RawBuild = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
 );
 type RawStage = (
     String,
@@ -500,6 +546,11 @@ fn raw_build(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawBuild> {
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
     ))
 }
 
@@ -512,7 +563,31 @@ fn parse_build(raw: RawBuild) -> Result<BuildRecord, StorageError> {
         queued_at: parse_timestamp(&raw.4)?,
         started_at: raw.5.as_deref().map(parse_timestamp).transpose()?,
         finished_at: raw.6.as_deref().map(parse_timestamp).transpose()?,
+        source: parse_source(&raw)?,
     })
+}
+
+fn parse_source(raw: &RawBuild) -> Result<Option<SourceSnapshot>, StorageError> {
+    match (raw.7.as_deref(), raw.8.as_deref()) {
+        (None, None) => Ok(None),
+        (Some(provider), Some(revision)) => {
+            let dirty = match raw.11 {
+                None | Some(0) => false,
+                Some(1) => true,
+                Some(value) => return Err(StorageError::InvalidSource(value.to_string())),
+            };
+            Ok(Some(SourceSnapshot {
+                provider: provider.to_owned(),
+                revision: revision.to_owned(),
+                reference: raw.9.clone(),
+                remote: raw.10.clone(),
+                dirty,
+            }))
+        }
+        _ => Err(StorageError::InvalidSource(
+            "provider and revision must be stored together".to_owned(),
+        )),
+    }
 }
 
 fn raw_stage(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawStage> {
@@ -648,7 +723,7 @@ fn transition_build(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rivet_core::{BuildEvent, ExecutionPlan, Pipeline};
+    use rivet_core::{BuildEvent, ExecutionPlan, Pipeline, SourceSnapshot};
     use tempfile::tempdir;
 
     fn fixture() -> (Project, Pipeline, ExecutionPlan) {
@@ -678,8 +753,15 @@ program = "true"
         storage
             .create_project(&project, &pipeline)
             .expect("project");
+        let source = SourceSnapshot {
+            provider: "git".to_owned(),
+            revision: "0123456789012345678901234567890123456789".to_owned(),
+            reference: Some("main".to_owned()),
+            remote: Some("origin".to_owned()),
+            dirty: false,
+        };
         let build = storage
-            .create_build(&project, &plan, &pipeline)
+            .create_build(&project, &plan, &pipeline, Some(&source))
             .expect("build");
         storage
             .apply_event(&BuildEvent::BuildQueued {
@@ -758,6 +840,7 @@ program = "true"
             .expect("details")
             .expect("build exists");
         assert_eq!(details.build.status, BuildStatus::Passed);
+        assert_eq!(details.build.source, Some(source));
         assert_eq!(details.stages[0].steps[0].status, StepStatus::Passed);
         assert_eq!(reopened.logs(build.id).expect("logs")[0].line, "hello");
     }

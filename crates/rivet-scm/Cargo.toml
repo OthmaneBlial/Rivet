@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+rivet-core = { path = "../rivet-core" }
 serde.workspace = true
 thiserror.workspace = true
 tokio = { version = "1.47", features = ["io-util", "process"] }

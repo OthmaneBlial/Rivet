@@ -74,6 +74,10 @@ function duration(build: BuildRecord): string {
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
+function shortRevision(revision: string): string {
+  return revision.slice(0, 8);
+}
+
 function App() {
   const [engineOnline, setEngineOnline] = useState(false);
   const [projectsList, setProjectsList] = useState<Project[]>([]);
@@ -324,7 +328,10 @@ function App() {
                   <span className="run-index">{details ? `RUN ${String(details.build.number).padStart(3, "0")}` : "NO RUN SELECTED"}</span>
                   <span className={`status-chip ${details ? statusClass(details.build.status) : "status-pending"}`}><i />{details ? STATUS_LABEL[details.build.status] : "Awaiting signal"}</span>
                 </div>
-                <span className="execution-time">{details ? `started ${formatTime(details.build.started_at)}` : "The map will populate after the first run"}</span>
+                <div className="execution-context">
+                  <span className="execution-time">{details ? `started ${formatTime(details.build.started_at)}` : "The map will populate after the first run"}</span>
+                  {details?.build.source && <span className={`source-badge ${details.build.source.dirty ? "source-dirty" : ""}`} title={details.build.source.revision}><span>⎇</span>{shortRevision(details.build.source.revision)} · {details.build.source.reference ?? "detached"} · {details.build.source.dirty ? "dirty" : "clean"}</span>}
+                </div>
               </div>
               <StageRail stages={details?.stages ?? []} />
             </section>

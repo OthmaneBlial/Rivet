@@ -1,7 +1,9 @@
 use clap::{Args, Parser, Subcommand};
-use rivet_core::{BuildEvent, BuildStatus, ExecutionPlan, LogStream, Pipeline, Project};
+use rivet_core::{
+    BuildEvent, BuildStatus, ExecutionPlan, LogStream, Pipeline, Project, SourceSnapshot,
+};
 use rivet_runner::{QueueHandle, Scheduler};
-use rivet_scm::{GitPrepareOptions, GitRepository};
+use rivet_scm::{GitPrepareOptions, GitRepository, ScmError};
 use rivet_storage::Storage;
 use std::fs;
 use std::net::SocketAddr;
@@ -209,7 +211,8 @@ async fn run_project(data_dir: &Path, name: &str) -> Result<(), Box<dyn std::err
     let pipeline = Pipeline::load(&project.pipeline_path)?;
     let build_id = uuid::Uuid::new_v4();
     let plan = ExecutionPlan::from_pipeline(&pipeline, build_id, project.id);
-    let build = storage.create_build(&project, &plan, &pipeline)?;
+    let source = capture_source_snapshot(&project.repository_path).await;
+    let build = storage.create_build(&project, &plan, &pipeline, source.as_ref())?;
     println!("Queued {} #{} ({})", project.name, build.number, build.id);
 
     let (events, mut received_events) = mpsc::channel(512);
@@ -242,6 +245,23 @@ async fn run_project(data_dir: &Path, name: &str) -> Result<(), Box<dyn std::err
         return Err(format!("build finished {}", status_label(&status)).into());
     }
     Ok(())
+}
+
+async fn capture_source_snapshot(path: &str) -> Option<SourceSnapshot> {
+    match GitRepository::open(path).await {
+        Ok(repository) => match repository.inspect().await {
+            Ok(snapshot) => Some(snapshot.source_snapshot()),
+            Err(error) => {
+                eprintln!("warning: source snapshot unavailable: {error}");
+                None
+            }
+        },
+        Err(ScmError::NotGitRepository(_)) => None,
+        Err(error) => {
+            eprintln!("warning: source snapshot unavailable: {error}");
+            None
+        }
+    }
 }
 
 async fn wait_for_build(
