@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.47 / 100** · displayed conservatively as the
+Weighted evidence score: **92.51 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -101,7 +101,12 @@ administrator-only runtime status, start/stop actions, and a permission-checked
 reflects that state. The bounded WASM runtime accepts only the
 documented JSON ABI, denies all module imports, caps module/memory/output
 sizes, and meters execution fuel. Filesystem, network, process, and clock
-capabilities are not exposed to WASM modules.
+capabilities are not exposed to WASM modules. Four host methods are now
+versioned and read-only: `builds.list` (project UUID), `build.details`,
+`build.logs`, and `build.artifacts` (build UUID). Each requires its matching
+declared permission, caps returned records, and wraps the original input with a
+host protocol version; unknown extension methods receive their original input
+unchanged.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument

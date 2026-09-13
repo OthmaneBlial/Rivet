@@ -108,6 +108,11 @@ const MAX_AGENT_PENDING_DELIVERIES: usize = 8192;
 const MAX_AGENT_RECEIVED_DELIVERIES: usize = 8192;
 const AGENT_RETRANSMIT_AFTER: Duration = Duration::from_secs(2);
 const MAX_AGENT_RETRANSMITS: u8 = 5;
+const MAX_EXTENSION_BUILD_RECORDS: usize = 100;
+const MAX_EXTENSION_STAGE_RECORDS: usize = 100;
+const MAX_EXTENSION_STEP_RECORDS: usize = 500;
+const MAX_EXTENSION_LOG_RECORDS: usize = 500;
+const MAX_EXTENSION_ARTIFACT_RECORDS: usize = 100;
 
 struct PendingAgentDelivery {
     envelope: AgentTransportMessage,
@@ -1646,11 +1651,140 @@ async fn request_extension(
         .extension_manager
         .as_ref()
         .ok_or(ApiError::ExtensionsUnavailable)?;
+    let ExtensionRequestInput {
+        permission,
+        method,
+        payload: input,
+    } = request;
+    let payload = extension_host_payload(&state, permission, &method, input)?;
     let result = manager
-        .request(&id, request.permission, request.method, request.payload)
+        .request(&id, permission, method, payload)
         .await
         .map_err(ApiError::ExtensionManager)?;
     Ok(Json(result))
+}
+
+/// Add bounded, read-only host data to the small set of versioned capability
+/// methods exposed by the server. Unknown methods keep their original payload
+/// so extensions can define private application-level messages without being
+/// granted implicit access to Rivet state.
+fn extension_host_payload(
+    state: &AppState,
+    permission: ExtensionPermission,
+    method: &str,
+    input: Value,
+) -> Result<Value, ApiError> {
+    let Some(required_permission) = extension_host_permission(method) else {
+        return Ok(input);
+    };
+    if permission != required_permission {
+        return Err(ApiError::BadRequest(format!(
+            "extension host method {method:?} requires permission {required_permission:?}"
+        )));
+    }
+    let data = match method {
+        "builds.list" => {
+            let project_id = extension_uuid(&input, "project_id")?;
+            if state.storage.get_project_by_id(project_id)?.is_none() {
+                return Err(ApiError::BadRequest(
+                    "extension project_id was not found".into(),
+                ));
+            }
+            let builds = state.storage.list_builds(project_id)?;
+            json!({
+                "builds": builds.iter().take(MAX_EXTENSION_BUILD_RECORDS).collect::<Vec<_>>(),
+                "truncated": builds.len() > MAX_EXTENSION_BUILD_RECORDS,
+            })
+        }
+        "build.details" => {
+            let build_id = extension_uuid(&input, "build_id")?;
+            let details = state
+                .storage
+                .get_build_details(build_id)?
+                .ok_or_else(|| ApiError::BadRequest("extension build_id was not found".into()))?;
+            let stages = details
+                .stages
+                .iter()
+                .take(MAX_EXTENSION_STAGE_RECORDS)
+                .map(|stage| {
+                    json!({
+                        "stage": stage.stage,
+                        "steps": stage.steps.iter().take(MAX_EXTENSION_STEP_RECORDS).collect::<Vec<_>>(),
+                        "steps_truncated": stage.steps.len() > MAX_EXTENSION_STEP_RECORDS,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "build": details.build,
+                "stages": stages,
+                "stages_truncated": details.stages.len() > MAX_EXTENSION_STAGE_RECORDS,
+            })
+        }
+        "build.logs" => {
+            let build_id = extension_uuid(&input, "build_id")?;
+            ensure_extension_build_exists(&state.storage, build_id)?;
+            let after_sequence = input
+                .get("after_sequence")
+                .and_then(Value::as_i64)
+                .unwrap_or(-1);
+            let logs = state
+                .storage
+                .logs(build_id)?
+                .into_iter()
+                .filter(|log| log.sequence > after_sequence)
+                .collect::<Vec<_>>();
+            let truncated = logs.len() > MAX_EXTENSION_LOG_RECORDS;
+            json!({
+                "logs": logs.into_iter().take(MAX_EXTENSION_LOG_RECORDS).collect::<Vec<_>>(),
+                "after_sequence": after_sequence,
+                "truncated": truncated,
+            })
+        }
+        "build.artifacts" => {
+            let build_id = extension_uuid(&input, "build_id")?;
+            ensure_extension_build_exists(&state.storage, build_id)?;
+            let artifacts = state.storage.artifacts(build_id)?;
+            let truncated = artifacts.len() > MAX_EXTENSION_ARTIFACT_RECORDS;
+            json!({
+                "artifacts": artifacts.into_iter().take(MAX_EXTENSION_ARTIFACT_RECORDS).collect::<Vec<_>>(),
+                "truncated": truncated,
+            })
+        }
+        _ => unreachable!("extension_host_permission only returns known methods"),
+    };
+    Ok(json!({
+        "host_protocol_version": 1,
+        "method": method,
+        "input": input,
+        "data": data,
+    }))
+}
+
+fn extension_host_permission(method: &str) -> Option<ExtensionPermission> {
+    match method {
+        "builds.list" | "build.details" => Some(ExtensionPermission::ReadBuilds),
+        "build.logs" => Some(ExtensionPermission::ReadLogs),
+        "build.artifacts" => Some(ExtensionPermission::ReadArtifacts),
+        _ => None,
+    }
+}
+
+fn extension_uuid(input: &Value, field: &str) -> Result<Uuid, ApiError> {
+    let value = input
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::BadRequest(format!("extension payload requires {field:?}")))?;
+    Uuid::parse_str(value)
+        .map_err(|_| ApiError::BadRequest(format!("extension payload {field:?} is invalid")))
+}
+
+fn ensure_extension_build_exists(storage: &Storage, build_id: BuildId) -> Result<(), ApiError> {
+    if storage.get_build_details(build_id)?.is_none() {
+        return Err(ApiError::BadRequest(
+            "extension build_id was not found".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn extension_status_for(
@@ -4798,6 +4932,28 @@ mod tests {
         let catalog = ExtensionCatalog::from_directory(Some(directory.path())).expect("catalog");
         let manager = ExtensionManager::new(directory.path(), &catalog).expect("manager");
         let mut state = AppState::new(Storage::open_in_memory().expect("storage"));
+        let host_pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "extension-host-route"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("host pipeline");
+        let host_project = Project::new(
+            "extension-host-route",
+            directory.path().to_string_lossy().into_owned(),
+            "Rivetfile.toml",
+        )
+        .expect("host project");
+        state
+            .storage
+            .create_project(&host_project, &host_pipeline)
+            .expect("host project persistence");
         state.extensions = Arc::new(catalog);
         state.extension_manager = Some(Arc::new(manager));
 
@@ -4827,7 +4983,10 @@ mod tests {
                     .uri("/api/v1/extensions/coverage.reporter/request")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"permission":"read_builds","method":"summary","payload":{"build":7}}"#,
+                        format!(
+                            r#"{{"permission":"read_builds","method":"builds.list","payload":{{"project_id":"{}"}}}}"#,
+                            host_project.id
+                        ),
                     ))
                     .expect("request"),
             )
@@ -4853,6 +5012,115 @@ mod tests {
             .await
             .expect("denied extension request response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn extension_host_methods_return_bounded_real_data_and_enforce_permissions() {
+        let directory = tempdir().expect("workspace");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "extension-host"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+        let project = Project::new(
+            "extension-host",
+            directory.path().to_string_lossy().into_owned(),
+            "Rivetfile.toml",
+        )
+        .expect("project");
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("persist project");
+        let plan = ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), project.id);
+        let build = storage
+            .create_build(&project, &plan, &pipeline, None)
+            .expect("persist build");
+        let now = Utc::now();
+        storage
+            .apply_event(&BuildEvent::BuildQueued {
+                build_id: build.id,
+                project_id: project.id,
+                timestamp: now,
+            })
+            .expect("queued event");
+        storage
+            .apply_event(&BuildEvent::BuildStarted {
+                build_id: build.id,
+                timestamp: now,
+            })
+            .expect("started event");
+        storage
+            .apply_event(&BuildEvent::StepOutput {
+                build_id: build.id,
+                stage_id: plan.stages[0].id,
+                step_id: plan.stages[0].steps[0].id,
+                stream: rivet_core::LogStream::Stdout,
+                line: "safe output".into(),
+                timestamp: now,
+            })
+            .expect("output event");
+
+        let state = AppState::new(storage);
+        let build_list = extension_host_payload(
+            &state,
+            ExtensionPermission::ReadBuilds,
+            "builds.list",
+            json!({ "project_id": project.id }),
+        )
+        .expect("build list host method");
+        let build_id = build.id.to_string();
+        assert_eq!(
+            build_list["data"]["builds"][0]["id"].as_str(),
+            Some(build_id.as_str())
+        );
+        assert_eq!(build_list["host_protocol_version"], 1);
+
+        let logs = extension_host_payload(
+            &state,
+            ExtensionPermission::ReadLogs,
+            "build.logs",
+            json!({ "build_id": build.id, "after_sequence": -1 }),
+        )
+        .expect("build logs host method");
+        assert_eq!(logs["data"]["logs"][0]["line"], "safe output");
+
+        let details = extension_host_payload(
+            &state,
+            ExtensionPermission::ReadBuilds,
+            "build.details",
+            json!({ "build_id": build.id }),
+        )
+        .expect("build details host method");
+        assert_eq!(
+            details["data"]["build"]["id"].as_str(),
+            Some(build_id.as_str())
+        );
+
+        let denied = extension_host_payload(
+            &state,
+            ExtensionPermission::ReadBuilds,
+            "build.logs",
+            json!({ "build_id": build.id }),
+        )
+        .expect_err("wrong permission must be rejected");
+        assert!(matches!(denied, ApiError::BadRequest(message) if message.contains("ReadLogs")));
+
+        let custom = extension_host_payload(
+            &state,
+            ExtensionPermission::ReadBuilds,
+            "custom.extension.method",
+            json!({ "value": 7 }),
+        )
+        .expect("custom extension methods remain untouched");
+        assert_eq!(custom, json!({ "value": 7 }));
     }
 
     #[cfg(unix)]
