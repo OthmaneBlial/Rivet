@@ -24,7 +24,8 @@ secret-parameter redaction/masking, and a packaged desktop launch with an
 ephemeral loopback engine origin, project-scoped local CI cache restore and
 save, explicit Docker container command assembly with bounded workspace mounts,
 and a bounded Jenkinsfile migration analyzer with line-level support findings
-plus safe drafts for deterministic shell steps. The server also exposes a
+plus safe drafts for deterministic shell steps, exposed through the headless
+API and rendered in the desktop control room. The server also exposes a
 versioned agent handshake/heartbeat registry
 with online and stale state, while remote build assignment remains
 intentionally unimplemented until its transport and failure semantics are
