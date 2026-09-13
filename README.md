@@ -155,6 +155,11 @@ The token is held in memory, never printed, and never stored in the Rivet
 database. Health checks remain public; API and WebSocket routes require
 `Authorization: Bearer <token>` when authentication is enabled.
 
+The desktop client attaches a bounded request ID to each API call. It retries
+only idempotent reads while the engine is unreachable; state-changing requests
+are deliberately not retried automatically, so a lost response cannot create
+duplicate builds or mutations.
+
 Browser access uses an exact local/Tauri origin allow-list by default. Add an
 exact remote console origin explicitly when needed; wildcard origins are
 rejected:

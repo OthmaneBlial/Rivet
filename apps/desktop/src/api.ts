@@ -23,6 +23,21 @@ let engineOriginPromise: Promise<string> | null = null;
 export const ENGINE_OFFLINE_MESSAGE =
   "Engine offline — start the local engine to connect.";
 
+const RETRYABLE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+const MAX_READ_ATTEMPTS = 8;
+
+export class EngineRequestError extends Error {
+  constructor(
+    message: string,
+    readonly requestId: string,
+    readonly status: number | null,
+    readonly networkFailure: boolean,
+  ) {
+    super(message);
+    this.name = "EngineRequestError";
+  }
+}
+
 export interface HealthResponse {
   status: string;
   service: string;
@@ -71,14 +86,19 @@ export function getEngineOrigin(): string {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const engineOrigin = await initializeEngineOrigin();
+  const method = (init?.method ?? "GET").toUpperCase();
+  const retryable = RETRYABLE_METHODS.has(method);
   let response: Response | undefined;
-  for (let attempt = 0; attempt < 8; attempt += 1) {
+  let requestId = "";
+  for (let attempt = 0; attempt < (retryable ? MAX_READ_ATTEMPTS : 1); attempt += 1) {
+    requestId = createRequestId();
     try {
       response = await fetch(`${engineOrigin}${path}`, {
         ...init,
         headers: {
           "content-type": "application/json",
           ...init?.headers,
+          "x-request-id": requestId,
         },
       });
       break;
@@ -86,13 +106,24 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       if (cause instanceof DOMException && cause.name === "AbortError") {
         throw cause;
       }
-      if (attempt === 7) throw new Error(ENGINE_OFFLINE_MESSAGE);
+      if (!retryable || attempt === MAX_READ_ATTEMPTS - 1) {
+        throw new EngineRequestError(
+          retryable
+            ? ENGINE_OFFLINE_MESSAGE
+            : "The engine connection was lost before this mutation returned; it was not retried automatically to prevent duplicate work.",
+          requestId,
+          null,
+          true,
+        );
+      }
       await new Promise((resolve) =>
         window.setTimeout(resolve, Math.min(150 * 2 ** attempt, 1_000)),
       );
     }
   }
-  if (!response) throw new Error(ENGINE_OFFLINE_MESSAGE);
+  if (!response) {
+    throw new EngineRequestError(ENGINE_OFFLINE_MESSAGE, requestId, null, true);
+  }
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
     try {
@@ -101,10 +132,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Preserve the useful HTTP status if the response is not JSON.
     }
-    throw new Error(message);
+    throw new EngineRequestError(
+      message,
+      response.headers.get("x-request-id") ?? requestId,
+      response.status,
+      false,
+    );
   }
   const payload = await response.text();
   return (payload ? JSON.parse(payload) : undefined) as T;
+}
+
+function createRequestId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `rivet-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
 export function health(): Promise<HealthResponse> {
