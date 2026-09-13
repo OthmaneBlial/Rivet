@@ -208,13 +208,7 @@ async fn execute_step(
     env.insert("CI".into(), "true".into());
     env.insert("RIVET_BUILD_ID".into(), plan.build_id.to_string());
     env.insert("RIVET_PROJECT_ID".into(), plan.project_id.to_string());
-    let spec = ProcessSpec {
-        program: step.definition.program.clone(),
-        args: step.definition.args.clone(),
-        env,
-        working_dir,
-        timeout: step.definition.timeout_seconds.map(Duration::from_secs),
-    };
+    let spec = build_process_spec(step, workspace, working_dir, env);
 
     let (output_tx, mut output_rx) = mpsc::channel(256);
     let process = run_process(spec, cancellation.clone(), output_tx);
@@ -287,6 +281,53 @@ async fn execute_step(
     )
     .await?;
     Ok(status)
+}
+
+fn build_process_spec(
+    step: &ExecutionStep,
+    workspace: &Path,
+    working_dir: PathBuf,
+    env: BTreeMap<String, String>,
+) -> ProcessSpec {
+    let timeout = step.definition.timeout_seconds.map(Duration::from_secs);
+    let Some(container) = step.definition.container.as_ref() else {
+        return ProcessSpec {
+            program: step.definition.program.clone(),
+            args: step.definition.args.clone(),
+            env,
+            working_dir,
+            timeout,
+        };
+    };
+
+    let container_workspace = Path::new("/rivet/workspace");
+    let relative_working_dir = working_dir
+        .strip_prefix(workspace)
+        .unwrap_or_else(|_| Path::new("."));
+    let container_working_dir = container_workspace.join(relative_working_dir);
+    let mut args = vec![
+        "run".to_owned(),
+        "--rm".to_owned(),
+        "--init".to_owned(),
+        "--workdir".to_owned(),
+        container_working_dir.to_string_lossy().into_owned(),
+        "--volume".to_owned(),
+        format!("{}:/rivet/workspace:rw", workspace.display()),
+    ];
+    for name in env.keys() {
+        args.push("--env".to_owned());
+        args.push(name.clone());
+    }
+    args.push(container.image.clone());
+    args.push(step.definition.program.clone());
+    args.extend(step.definition.args.clone());
+    ProcessSpec {
+        program: "docker".to_owned(),
+        args,
+        env,
+        working_dir: workspace.to_owned(),
+        timeout,
+    }
 }
 
 fn mask_line(line: &str, secret_values: &[String]) -> String {
@@ -522,5 +563,121 @@ args = ["-c", "printf 'token=%s\\n' \"$TOKEN\""]
         }
         assert!(output.iter().any(|line| line == "token=***"));
         assert!(output.iter().all(|line| !line.contains("runtime-secret")));
+    }
+
+    #[tokio::test]
+    async fn restores_cache_before_execution_and_saves_after_success() {
+        let directory = tempdir().expect("tempdir");
+        let cache_root = directory.path().join("cache");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "cached-build"
+[[caches]]
+name = "workspace-cache"
+key = "deps-v1"
+paths = ["cache.txt"]
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "cache-check"
+program = "sh"
+args = ["-c", "if test -f cache.txt; then printf hit > result.txt; else printf miss > result.txt; fi; printf cached > cache.txt"]
+"#,
+        )
+        .expect("pipeline");
+        let project_id = uuid::Uuid::new_v4();
+        let first_plan = ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), project_id);
+        let (first_tx, mut first_rx) = mpsc::channel(64);
+        assert_eq!(
+            execute_pipeline_with_parameters_and_cache(
+                &first_plan,
+                &pipeline,
+                directory.path(),
+                &BTreeMap::new(),
+                CancellationToken::new(),
+                first_tx,
+                Some(&cache_root),
+            )
+            .await
+            .expect("first build"),
+            BuildStatus::Passed
+        );
+        while first_rx.recv().await.is_some() {}
+        fs::remove_file(directory.path().join("cache.txt")).expect("remove cache file");
+        fs::remove_file(directory.path().join("result.txt")).expect("remove result");
+
+        let second_plan = ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), project_id);
+        let (second_tx, mut second_rx) = mpsc::channel(64);
+        assert_eq!(
+            execute_pipeline_with_parameters_and_cache(
+                &second_plan,
+                &pipeline,
+                directory.path(),
+                &BTreeMap::new(),
+                CancellationToken::new(),
+                second_tx,
+                Some(&cache_root),
+            )
+            .await
+            .expect("second build"),
+            BuildStatus::Passed
+        );
+        while second_rx.recv().await.is_some() {}
+        assert_eq!(
+            fs::read_to_string(directory.path().join("result.txt")).expect("result"),
+            "hit"
+        );
+    }
+
+    #[test]
+    fn builds_container_commands_with_a_bounded_workspace_mount() {
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "container-command"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "cargo"
+args = ["test", "--workspace"]
+env = { TARGET = "release" }
+working_dir = "subdir"
+[stages.steps.container]
+image = "rust:1.85"
+"#,
+        )
+        .expect("container pipeline");
+        let plan =
+            ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let workspace = PathBuf::from("/tmp/rivet-workspace");
+        let working_dir = workspace.join("subdir");
+        let env = BTreeMap::from([
+            (String::from("TARGET"), String::from("release")),
+            (String::from("CI"), String::from("true")),
+        ]);
+        let spec = build_process_spec(&plan.stages[0].steps[0], &workspace, working_dir, env);
+
+        assert_eq!(spec.program, "docker");
+        assert_eq!(
+            spec.args[0..7],
+            [
+                "run",
+                "--rm",
+                "--init",
+                "--workdir",
+                "/rivet/workspace/subdir",
+                "--volume",
+                "/tmp/rivet-workspace:/rivet/workspace:rw",
+            ]
+        );
+        assert!(spec.args.windows(2).any(|args| args == ["--env", "CI"]));
+        assert!(spec.args.windows(2).any(|args| args == ["--env", "TARGET"]));
+        assert_eq!(
+            spec.args[spec.args.len() - 4..],
+            ["rust:1.85", "cargo", "test", "--workspace"]
+        );
+        assert_eq!(spec.env["TARGET"], "release");
     }
 }
