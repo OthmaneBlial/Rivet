@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **79% verified** · `███████████████▊░░░░`<br>
-Weighted evidence score: **79.27 / 100** · displayed conservatively as the
+Weighted evidence score: **79.67 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -141,9 +141,26 @@ Protect the file and pass it to the server with
 `--auth-policy-file /secure/path/rivet.auth.json`. Supported roles are
 `admin`, `operator`, `viewer`, and `agent`; project routes are filtered and
 mutations require the corresponding role and scope. The legacy private
-`--token-file` remains available for a single unrestricted deployment. User
-accounts, sessions, token rotation, audit history, and external identity
-providers remain future gates.
+`--token-file` remains available for a single unrestricted deployment.
+Operators can manage policy tokens locally without hand-computing digests. The
+create command generates the token, stores it in a new private `0600` file, and
+writes only its SHA-256 digest to the policy. Create a replacement before
+revoking the old token during rotation:
+
+```sh
+cargo run -p rivet -- auth token create operator \
+  --role operator --project rivet \
+  --policy-file /secure/path/rivet.auth.json \
+  --token-file /secure/path/rivet.operator.token
+cargo run -p rivet -- auth token list \
+  --policy-file /secure/path/rivet.auth.json
+cargo run -p rivet -- auth token revoke old-operator \
+  --policy-file /secure/path/rivet.auth.json
+```
+
+The token value is not printed by the command and is not recoverable from the
+policy. User accounts, sessions, expiration, audit history, and external
+identity providers remain future gates.
 
 The versioned API currently exposes health, projects, queued builds, build
 details, persisted logs, cancellation, a live queue snapshot, durable replay,

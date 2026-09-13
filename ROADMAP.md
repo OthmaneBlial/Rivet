@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **79 / 100 points** (**79.27 weighted evidence
+The current verified total is **79 / 100 points** (**79.67 weighted evidence
 points**, displayed conservatively as 79%).
 
 | Workstream | Weight | Current state | Gate for completion |
@@ -25,7 +25,7 @@ points**, displayed conservatively as 79%).
 | Artifacts | 4 | partial | local and remote workspace collection, upload/download, bounded checksum-verified transfer, metadata, and a storage boundary pass; retention and remote object backends remain |
 | CI cache | 3 | partial | validated exact project-scoped keys, safe relative paths, atomic local archive save/restore, and corrupt-entry recovery pass; fallback keys, eviction, and remote cache backends remain |
 | Secrets and credentials | 6 | partial | secret parameters require explicit runtime values, persisted values/API responses are redacted, logs are masked, retries require fresh secret input, and a passphrase-encrypted local credential vault with private-file CLI setup passes; credential ownership, rotation, keychain integration, and project access control remain |
-| Authentication and authorization | 4 | partial | protected remote transport with private Bearer tokens, policy-file token digests, roles, project scopes, route authorization, and agent-connect permission checks pass; users, sessions, token lifecycle, audit history, and external identity providers remain |
+| Authentication and authorization | 4 | partial | protected remote transport with private Bearer tokens, policy-file token digests, roles, project scopes, route authorization, agent-connect permission checks, and local token creation/listing/revocation pass; users, sessions, expiration, audit history, and external identity providers remain |
 | Extension protocol | 4 | planned | versioned WASM/subprocess/protocol boundary and frontend extension model |
 | Jenkins migration analyzer | 3 | partial | bounded Jenkinsfile analysis, headless API delivery, rendered desktop report, and valid drafts for deterministic quoted shell steps pass; full Groovy parsing, plugin semantics, and broad generated Rivetfile conversion remain |
 | Differential compatibility harness | 2 | planned | normalized behavioral fixtures and permanent regressions |
