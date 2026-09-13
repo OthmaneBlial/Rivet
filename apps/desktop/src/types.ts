@@ -116,6 +116,14 @@ export interface QueueStats {
   paused: boolean;
 }
 
+export interface QueueItem {
+  build_id: string;
+  project_id: string;
+  project: string;
+  priority: number;
+  position: number;
+}
+
 export interface CredentialSummary {
   id: string;
   username: string;

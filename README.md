@@ -22,7 +22,8 @@ admission, parameterized builds, local artifact storage and retention pruning,
 protected server
 transport with safe request IDs and structured method/route/status tracing,
 build retry, pre-execution queue cancellation, build artifact
-downloads, and a light-default desktop theme with an accessible dark-mode
+downloads, a priority-ordered queue snapshot and rendered queue control room,
+and a light-default desktop theme with an accessible dark-mode
 toggle, persistent UTC cron schedules, server dispatch, desktop schedule
 controls, signed generic webhook delivery with idempotent redelivery,
 policy-backed API identities with role/project authorization,
@@ -60,8 +61,8 @@ versioned SHA-256 manifest:
 
 The release gate first runs `scripts/local-progress-check.sh`, which verifies
 that the README percentage matches the weighted evidence calculation, that
-`base/jenkins` remains ignored, and that no GitHub Actions workflow has been
-added.
+the internal reference directory remains ignored, and that no GitHub Actions
+workflow has been added.
 
 This produces a locally verifiable artifact, not a signed installer, store
 submission, or hosted CI result.

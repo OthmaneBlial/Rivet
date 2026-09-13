@@ -19,6 +19,7 @@ import {
   initializeEngineOrigin,
   logs,
   pauseQueue,
+  queueItems as fetchQueueItems,
   projects,
   queueStats as fetchQueueStats,
   queueBuild,
@@ -38,6 +39,7 @@ import type {
   LogRecord,
   MigrationResponse,
   Project,
+  QueueItem,
   QueueStats,
   ScheduleRecord,
   StageDetails,
@@ -51,7 +53,7 @@ import type { ExtensionManifest } from "./extensionModel";
 
 const NAV_ITEMS = [
   { label: "Pipelines", mark: "↳", active: true },
-  { label: "Queue", mark: "≋", active: false },
+  { label: "Queue", mark: "≋", active: true },
   { label: "Agents", mark: "⊙", active: true },
   { label: "Artifacts", mark: "□", active: false },
   { label: "Credentials", mark: "◈", active: true },
@@ -146,6 +148,7 @@ function App() {
   const [projectName, setProjectName] = useState("");
   const [buildList, setBuildList] = useState<BuildRecord[]>([]);
   const [queueStatus, setQueueStatus] = useState<QueueStats | null>(null);
+  const [queueItemList, setQueueItemList] = useState<QueueItem[]>([]);
   const [agentList, setAgentList] = useState<AgentSummary[]>([]);
   const [extensionList, setExtensionList] = useState<ExtensionManifest[]>([]);
   const [credentialList, setCredentialList] = useState<CredentialSummary[]>([]);
@@ -250,6 +253,14 @@ function App() {
     }
   }, []);
 
+  const loadQueueItemList = useCallback(async () => {
+    try {
+      setQueueItemList(await fetchQueueItems());
+    } catch {
+      setQueueItemList([]);
+    }
+  }, []);
+
   const loadAgentList = useCallback(async () => {
     try {
       setAgentList(await fetchAgents());
@@ -324,6 +335,16 @@ function App() {
     const interval = window.setInterval(() => void loadAgentList(), 3000);
     return () => window.clearInterval(interval);
   }, [engineOnline, loadAgentList]);
+
+  useEffect(() => {
+    if (!engineOnline || activeNav !== "Queue") {
+      setQueueItemList([]);
+      return;
+    }
+    void loadQueueItemList();
+    const interval = window.setInterval(() => void loadQueueItemList(), 1000);
+    return () => window.clearInterval(interval);
+  }, [activeNav, engineOnline, loadQueueItemList]);
 
   useEffect(() => {
     if (!engineOnline) {
@@ -673,6 +694,14 @@ function App() {
           <ExtensionsPanel extensions={extensionList} />
         ) : activeNav === "Agents" ? (
           <AgentsPanel agents={agentList} online={engineOnline} />
+        ) : activeNav === "Queue" ? (
+          <QueuePanel
+            items={queueItemList}
+            stats={queueStatus}
+            online={engineOnline}
+            busy={busy}
+            onToggle={toggleQueue}
+          />
         ) : activeNav === "Credentials" ? (
           <CredentialsPanel
             credentials={credentialList}
@@ -868,6 +897,67 @@ function SourcePreparationPanel({
         <div className="scm-collapsed"><span className="scm-collapsed-mark">⎇</span><p>Rivet inspects the current checkout by default. Open this panel to fetch a revision, clean untracked files, or attach a vault credential ID.</p><span className="scm-collapsed-status">NO MUTATION</span></div>
       )}
     </section>
+  );
+}
+
+function QueuePanel({
+  items,
+  stats,
+  online,
+  busy,
+  onToggle,
+}: {
+  items: QueueItem[];
+  stats: QueueStats | null;
+  online: boolean;
+  busy: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div className="content-wrap queue-page">
+      <section className="page-heading queue-heading">
+        <div>
+          <span className="eyebrow"><span className="eyebrow-line" />Admission control</span>
+          <h1>Make the waiting visible.</h1>
+          <p>Priority decides first; sequence keeps equal-priority work fair. Pausing admission never discards queued builds.</p>
+        </div>
+        <div className={`queue-status ${stats?.paused ? "paused" : ""}`}>
+          <span className="overline">Queue state</span>
+          <strong>{!online ? "ENGINE OFFLINE" : stats?.paused ? "PAUSED" : "ADMITTING"}</strong>
+          <small>{stats ? `${stats.running} running · ${stats.capacity} slots` : "waiting for telemetry"}</small>
+        </div>
+      </section>
+
+      <section className="metric-grid queue-metrics" aria-label="Queue metrics">
+        <MetricCard label="Waiting" value={String(stats?.queued ?? items.length).padStart(2, "0")} detail="pending admission" accent="amber" />
+        <MetricCard label="Running" value={String(stats?.running ?? 0).padStart(2, "0")} detail="active executors" accent="cyan" />
+        <MetricCard label="Capacity" value={String(stats?.capacity ?? 0).padStart(2, "0")} detail="global slots" accent="neutral" />
+        <MetricCard label="Policy" value="PRIORITY" detail="FIFO tie-break" accent="neutral" />
+      </section>
+
+      <section className="panel queue-panel" aria-label="Queued builds">
+        <div className="panel-heading">
+          <div><span className="overline">Admission order</span><h2>Waiting builds</h2></div>
+          <div className="queue-heading-actions"><span className="panel-count">{String(items.length).padStart(2, "0")}</span><button className="button button-quiet" type="button" disabled={busy || !online || !stats} onClick={onToggle}>{stats?.paused ? "Resume queue" : "Pause queue"}</button></div>
+        </div>
+        {items.length === 0 ? (
+          <div className="queue-empty"><span className="queue-empty-mark">≋</span><div><strong>No builds are waiting.</strong><p>New manual, scheduled, or webhook builds will appear here before an executor admits them.</p></div></div>
+        ) : (
+          <div className="queue-list">
+            <div className="queue-list-head"><span>Position</span><span>Project</span><span>Build</span><span>Priority</span></div>
+            {items.map((item) => (
+              <div className="queue-row" key={item.build_id}>
+                <span className="queue-position">{String(item.position).padStart(2, "0")}</span>
+                <strong>{item.project}</strong>
+                <code title={item.build_id}>{item.build_id.slice(0, 8)}</code>
+                <span className={`queue-priority ${item.priority > 0 ? "high" : item.priority < 0 ? "low" : "normal"}`}>{item.priority > 0 ? "+" : ""}{item.priority}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+      <p className="queue-boundary"><span />The queue snapshot contains identifiers, project names, and scheduling metadata only; build parameters and secrets stay in their existing scoped records.</p>
+    </div>
   );
 }
 

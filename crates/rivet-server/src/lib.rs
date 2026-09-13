@@ -362,6 +362,15 @@ struct QueueStatusResponse {
     paused: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct QueueItemResponse {
+    build_id: BuildId,
+    project_id: rivet_core::ProjectId,
+    project: String,
+    priority: i32,
+    position: usize,
+}
+
 pub fn router(state: AppState) -> Router {
     router_with_origins(state, &default_allowed_origins())
         .expect("default Rivet origins must be valid")
@@ -387,6 +396,7 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
         .route("/api/v1/webhooks/github/{project}", post(github_webhook))
         .route("/api/v1/webhooks/gitlab/{project}", post(gitlab_webhook))
         .route("/api/v1/queue", get(queue_status))
+        .route("/api/v1/queue/items", get(queue_items))
         .route("/api/v1/queue/pause", post(pause_queue))
         .route("/api/v1/queue/resume", post(resume_queue))
         .route("/api/v1/projects", get(list_projects).post(create_project))
@@ -1075,6 +1085,37 @@ async fn queue_status(
 ) -> Result<Json<QueueStatusResponse>, ApiError> {
     require_global(&principal, Permission::Read)?;
     Ok(Json(queue_status_response(&state)))
+}
+
+async fn queue_items(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<QueueItemResponse>>, ApiError> {
+    require_global(&principal, Permission::Read)?;
+    let project_names = state
+        .storage
+        .list_projects()?
+        .into_iter()
+        .map(|project| (project.id, project.name))
+        .collect::<HashMap<_, _>>();
+    let items = state
+        .scheduler
+        .queue_entries()
+        .await
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| QueueItemResponse {
+            build_id: entry.build_id,
+            project_id: entry.project_id,
+            project: project_names
+                .get(&entry.project_id)
+                .cloned()
+                .unwrap_or_else(|| entry.project_id.to_string()),
+            priority: entry.priority,
+            position: index + 1,
+        })
+        .collect();
+    Ok(Json(items))
 }
 
 async fn pause_queue(
@@ -3667,6 +3708,62 @@ mod tests {
             &body[..],
             br#"{"queued":0,"running":0,"capacity":2,"paused":false}"#
         );
+    }
+
+    #[tokio::test]
+    async fn queue_items_report_priority_order_without_build_parameters() {
+        let directory = tempdir().expect("tempdir");
+        let pipeline_path = directory.path().join("Rivetfile.toml");
+        fs::write(
+            &pipeline_path,
+            "version = 1\nname = \"queue-items\"\n[[stages]]\nname = \"Test\"\n[[stages.steps]]\nname = \"noop\"\nprogram = \"true\"\n",
+        )
+        .expect("pipeline");
+        let pipeline = Pipeline::load(&pipeline_path).expect("pipeline");
+        let storage = Storage::open_in_memory().expect("storage");
+        let project = Project::new(
+            "queue-items",
+            directory.path().to_string_lossy().into_owned(),
+            pipeline_path.to_string_lossy().into_owned(),
+        )
+        .expect("project");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("create project");
+        let state = AppState::new(storage);
+        state.scheduler.pause();
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/queue-items/builds")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"priority":10}"#))
+                    .expect("queue request"),
+            )
+            .await
+            .expect("queue response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/queue/items")
+                    .body(Body::empty())
+                    .expect("items request"),
+            )
+            .await
+            .expect("items response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("items body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("items JSON");
+        assert_eq!(payload[0]["project"], "queue-items");
+        assert_eq!(payload[0]["priority"], 10);
+        assert_eq!(payload[0]["position"], 1);
+        assert!(payload[0].get("parameters").is_none());
     }
 
     #[tokio::test]

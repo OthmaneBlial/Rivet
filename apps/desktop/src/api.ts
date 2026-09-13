@@ -7,6 +7,7 @@ import type {
   LogRecord,
   MigrationResponse,
   Project,
+  QueueItem,
   QueueResponse,
   QueueStats,
   ScheduleRecord,
@@ -160,6 +161,10 @@ export function projects(): Promise<Project[]> {
 
 export function queueStats(): Promise<QueueStats> {
   return request<QueueStats>("/api/v1/queue");
+}
+
+export function queueItems(): Promise<QueueItem[]> {
+  return request<QueueItem[]>("/api/v1/queue/items");
 }
 
 export function pauseQueue(): Promise<QueueStats> {

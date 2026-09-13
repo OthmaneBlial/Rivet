@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use thiserror::Error;
-use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -84,6 +84,14 @@ pub struct QueueStats {
     pub paused: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueEntry {
+    pub build_id: BuildId,
+    pub project_id: ProjectId,
+    pub priority: i32,
+    pub sequence: u64,
+}
+
 struct SchedulerMetrics {
     queued: AtomicUsize,
     running: AtomicUsize,
@@ -107,6 +115,7 @@ pub struct Scheduler {
     queue: mpsc::Sender<QueueRequest>,
     worker: JoinHandle<()>,
     metrics: Arc<SchedulerMetrics>,
+    entries: Arc<Mutex<BTreeMap<BuildId, QueueEntry>>>,
     wake: Arc<Notify>,
     next_sequence: AtomicU64,
 }
@@ -152,6 +161,8 @@ impl Scheduler {
             HashMap::<ProjectId, Arc<Semaphore>>::new(),
         ));
         let worker_metrics = metrics.clone();
+        let entries = Arc::new(Mutex::new(BTreeMap::new()));
+        let worker_entries = entries.clone();
         let worker_cache_root = cache_root;
         let wake = Arc::new(Notify::new());
         let worker_wake = wake.clone();
@@ -188,6 +199,7 @@ impl Scheduler {
                     while let Some(entry) = pending.pop() {
                         let request = entry.request;
                         if request.cancellation.is_cancelled() {
+                            worker_entries.lock().await.remove(&request.plan.build_id);
                             worker_metrics.queued.fetch_sub(1, Ordering::Relaxed);
                             tokio::spawn(finish_queued_cancellation(request));
                         } else {
@@ -219,6 +231,7 @@ impl Scheduler {
                 while let Some(entry) = pending.pop() {
                     let request = entry.request;
                     if request.cancellation.is_cancelled() {
+                        worker_entries.lock().await.remove(&request.plan.build_id);
                         worker_metrics.queued.fetch_sub(1, Ordering::Relaxed);
                         tokio::spawn(finish_queued_cancellation(request));
                         continue;
@@ -263,6 +276,7 @@ impl Scheduler {
                         }
                     };
                     if request.cancellation.is_cancelled() {
+                        worker_entries.lock().await.remove(&request.plan.build_id);
                         drop(project_permit);
                         drop(global_permit);
                         worker_metrics.queued.fetch_sub(1, Ordering::Relaxed);
@@ -272,6 +286,7 @@ impl Scheduler {
                     }
 
                     worker_metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                    worker_entries.lock().await.remove(&request.plan.build_id);
                     worker_metrics.running.fetch_add(1, Ordering::Relaxed);
                     let metrics = worker_metrics.clone();
                     let wake = worker_wake.clone();
@@ -318,6 +333,7 @@ impl Scheduler {
             queue,
             worker,
             metrics,
+            entries,
             wake,
             next_sequence: AtomicU64::new(0),
         }
@@ -340,6 +356,23 @@ impl Scheduler {
     pub fn resume(&self) {
         self.metrics.paused.store(false, Ordering::Relaxed);
         self.wake.notify_one();
+    }
+
+    pub async fn queue_entries(&self) -> Vec<QueueEntry> {
+        let mut entries = self
+            .entries
+            .lock()
+            .await
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.sequence.cmp(&right.sequence))
+        });
+        entries
     }
 
     pub async fn enqueue(
@@ -424,6 +457,15 @@ impl Scheduler {
         let (completion, result) = oneshot::channel();
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         self.metrics.queued.fetch_add(1, Ordering::Relaxed);
+        self.entries.lock().await.insert(
+            plan.build_id,
+            QueueEntry {
+                build_id: plan.build_id,
+                project_id: plan.project_id,
+                priority,
+                sequence,
+            },
+        );
         if self
             .queue
             .send(QueueRequest {
@@ -441,6 +483,7 @@ impl Scheduler {
             .is_err()
         {
             self.metrics.queued.fetch_sub(1, Ordering::Relaxed);
+            self.entries.lock().await.remove(&plan.build_id);
             return Err(SchedulerError::Closed);
         }
         Ok(QueueHandle {
@@ -497,6 +540,61 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
     use tokio::time::{Duration, sleep};
+
+    #[tokio::test]
+    async fn queue_entries_are_sorted_by_priority_then_fifo_sequence() {
+        let dir = tempdir().expect("tempdir");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "queue-snapshot"
+[[stages]]
+name = "run"
+[[stages.steps]]
+name = "noop"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+        let scheduler = Scheduler::new(1, Some(1));
+        scheduler.pause();
+        let project_id = uuid::Uuid::new_v4();
+        let mut handles = Vec::new();
+        for (priority, build_id) in [
+            (0, uuid::Uuid::new_v4()),
+            (10, uuid::Uuid::new_v4()),
+            (10, uuid::Uuid::new_v4()),
+        ] {
+            let plan = ExecutionPlan::from_pipeline(&pipeline, build_id, project_id);
+            let (events, _received_events) = mpsc::channel(16);
+            handles.push(
+                scheduler
+                    .enqueue_with_priority(
+                        plan,
+                        pipeline.clone(),
+                        dir.path().to_path_buf(),
+                        priority,
+                        CancellationToken::new(),
+                        events,
+                    )
+                    .await
+                    .expect("enqueue"),
+            );
+        }
+
+        let entries = scheduler.queue_entries().await;
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.priority)
+                .collect::<Vec<_>>(),
+            [10, 10, 0]
+        );
+        assert!(entries[0].sequence < entries[1].sequence);
+        assert_eq!(entries[2].sequence, 0);
+        drop(handles);
+    }
 
     #[tokio::test]
     async fn queue_preserves_admission_order_when_execution_is_serial() {

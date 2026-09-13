@@ -15,5 +15,6 @@ pub use pipeline::{
 };
 pub use process::{LogLine, ProcessError, ProcessOutcome, ProcessResult, ProcessSpec, run_process};
 pub use scheduler::{
-    MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHandle, QueueStats, Scheduler, SchedulerError,
+    MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueEntry, QueueHandle, QueueStats, Scheduler,
+    SchedulerError,
 };
