@@ -70,6 +70,8 @@ enum Command {
         project: String,
         #[arg(long)]
         build: i64,
+        #[arg(long = "param", value_name = "NAME=VALUE")]
+        parameters: Vec<String>,
     },
     /// Run the headless HTTP/WebSocket service.
     Server {
@@ -187,7 +189,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Builds { project } => list_builds(&cli.data_dir, &project)?,
         Command::Logs { project, build } => show_logs(&cli.data_dir, &project, build)?,
         Command::Artifacts { project, build } => list_artifacts(&cli.data_dir, &project, build)?,
-        Command::Retry { project, build } => retry_project(&cli.data_dir, &project, build).await?,
+        Command::Retry {
+            project,
+            build,
+            parameters,
+        } => retry_project(&cli.data_dir, &project, build, parameters).await?,
         Command::Server {
             bind,
             token_file,
@@ -451,6 +457,7 @@ async fn retry_project(
     data_dir: &Path,
     name: &str,
     number: i64,
+    parameter_values: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage = open_storage(data_dir)?;
     let project = storage
@@ -464,7 +471,27 @@ async fn retry_project(
     if !original.status.is_terminal() {
         return Err(format!("build {name} #{number} is not finished and cannot be retried").into());
     }
-    run_project_with_options(data_dir, name, None, original.parameters).await
+    let pipeline = Pipeline::load(&project.pipeline_path)?;
+    let replacements = parse_parameters(&parameter_values)?;
+    if let Some(missing) = pipeline
+        .parameters
+        .iter()
+        .find(|parameter| parameter.secret && !replacements.contains_key(&parameter.name))
+    {
+        return Err(format!(
+            "retry requires an explicit value for secret parameter {:?}; pass it with --param {}=VALUE",
+            missing.name, missing.name
+        )
+        .into());
+    }
+    let supplied_parameters = if replacements.is_empty() {
+        original.parameters
+    } else {
+        let mut parameters = original.parameters;
+        parameters.extend(replacements);
+        parameters
+    };
+    run_project_with_options(data_dir, name, None, supplied_parameters).await
 }
 
 async fn run_project_with_options(

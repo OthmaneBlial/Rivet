@@ -1104,6 +1104,7 @@ async fn retry_build(
     request: Option<Json<QueueBuildRequest>>,
 ) -> Result<(StatusCode, Json<QueueBuildResponse>), ApiError> {
     let project = project_by_name(&state.storage, &name)?;
+    let pipeline = Pipeline::load(&project.pipeline_path)?;
     let original = build_by_number(&state.storage, project.id, &name, number)?;
     if !original.status.is_terminal() {
         return Err(ApiError::BadRequest(format!(
@@ -1112,6 +1113,11 @@ async fn retry_build(
     }
     let mut request = request.map(|Json(request)| request).unwrap_or_default();
     if request.parameters.is_empty() {
+        if pipeline.has_secret_parameters() {
+            return Err(ApiError::BadRequest(
+                "retry requires explicit values for secret parameters".into(),
+            ));
+        }
         request.parameters = original.parameters;
     }
     Ok((
@@ -1788,6 +1794,125 @@ program = "true"
         );
         let response = router(state).oneshot(request()).await.expect("response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn retry_requires_explicit_secret_values() {
+        let directory = tempdir().expect("tempdir");
+        let repository = directory.path().join("repository");
+        fs::create_dir_all(&repository).expect("repository");
+        let pipeline_path = repository.join("Rivetfile.toml");
+        fs::write(
+            &pipeline_path,
+            r#"
+version = 1
+name = "secret-retry"
+[[parameters]]
+name = "TOKEN"
+secret = true
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline file");
+        let pipeline = Pipeline::load(&pipeline_path).expect("pipeline");
+        let project = Project::new(
+            "secret-retry",
+            repository.to_string_lossy().into_owned(),
+            pipeline_path.to_string_lossy().into_owned(),
+        )
+        .expect("project");
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let state = AppState::new(storage.clone());
+
+        let initial_body = br#"{"parameters":{"TOKEN":"initial-secret"}}"#;
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/projects/secret-retry/builds")
+                    .header("content-type", "application/json")
+                    .body(Body::from(initial_body.as_slice()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let queued = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("queued body");
+        assert!(
+            !queued
+                .windows(b"initial-secret".len())
+                .any(|window| { window == b"initial-secret" })
+        );
+
+        for _ in 0..50 {
+            if storage
+                .list_builds(project.id)
+                .expect("builds")
+                .first()
+                .is_some_and(|build| build.status.is_terminal())
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            storage.list_builds(project.id).expect("builds")[0].status,
+            BuildStatus::Passed
+        );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/projects/secret-retry/builds/1/retry")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("retry response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("retry error body"),
+        )
+        .expect("retry error JSON");
+        assert_eq!(
+            error["error"],
+            "retry requires explicit values for secret parameters"
+        );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/projects/secret-retry/builds/1/retry")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        br#"{"parameters":{"TOKEN":"retry-secret"}}"#.as_slice(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("retry response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let queued = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("retry queued body");
+        assert!(
+            !queued
+                .windows(b"retry-secret".len())
+                .any(|window| { window == b"retry-secret" })
+        );
     }
 
     fn sign_webhook(secret: &str, body: &[u8]) -> String {
