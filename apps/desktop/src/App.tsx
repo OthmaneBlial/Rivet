@@ -4,6 +4,8 @@ import {
   builds,
   cancelBuild,
   createProject,
+  artifactUrl,
+  artifacts,
   ENGINE_ORIGIN,
   ENGINE_OFFLINE_MESSAGE,
   eventUrl,
@@ -11,8 +13,10 @@ import {
   projects,
   queueStats as fetchQueueStats,
   queueBuild,
+  retryBuild,
 } from "./api";
 import type {
+  ArtifactRecord,
   BuildDetails,
   BuildRecord,
   BuildStatus,
@@ -88,6 +92,7 @@ function App() {
   const [selectedBuild, setSelectedBuild] = useState<number | null>(null);
   const [details, setDetails] = useState<BuildDetails | null>(null);
   const [logLines, setLogLines] = useState<LogRecord[]>([]);
+  const [artifactList, setArtifactList] = useState<ArtifactRecord[]>([]);
   const [activeNav, setActiveNav] = useState("Pipelines");
   const [showCreate, setShowCreate] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -124,14 +129,21 @@ function App() {
   }, [projectName]);
 
   const loadBuildView = useCallback(async () => {
-    if (!projectName || selectedBuild === null) return;
+    if (!projectName || selectedBuild === null) {
+      setDetails(null);
+      setLogLines([]);
+      setArtifactList([]);
+      return;
+    }
     try {
-      const [nextDetails, nextLogs] = await Promise.all([
+      const [nextDetails, nextLogs, nextArtifacts] = await Promise.all([
         buildDetails(projectName, selectedBuild),
         logs(projectName, selectedBuild),
+        artifacts(projectName, selectedBuild),
       ]);
       setDetails(nextDetails);
       setLogLines(nextLogs);
+      setArtifactList(nextArtifacts);
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not load build");
@@ -205,6 +217,22 @@ function App() {
       await loadBuildView();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not cancel build");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function retrySelectedBuild() {
+    if (!projectName || selectedBuild === null) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const queued = await retryBuild(projectName, selectedBuild);
+      setSelectedBuild(queued.build.number);
+      await loadBuildList();
+      await loadBuildView();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not retry build");
     } finally {
       setBusy(false);
     }
@@ -342,6 +370,7 @@ function App() {
               <div><span className="overline">Execution map</span><h2>{selectedProject?.name ?? "Pipeline"}</h2></div>
               <div className="section-actions">
                 {isRunning && <button className="button button-danger" disabled={busy} onClick={() => void stopSelectedBuild()}>Stop run</button>}
+                {details && details.build.status !== "running" && details.build.status !== "queued" && <button className="button button-quiet" disabled={busy || !engineOnline} onClick={() => void retrySelectedBuild()}>↻ Retry run</button>}
                 <button className="button button-primary" disabled={busy || !engineOnline} onClick={() => void runSelectedPipeline()}>
                   <span className="run-icon">▶</span> {busy ? "Working…" : "Run pipeline"}
                 </button>
@@ -381,6 +410,7 @@ function App() {
 
               <LogPanel logs={logLines} build={details?.build ?? null} />
             </div>
+            <ArtifactPanel artifacts={artifactList} build={details?.build ?? null} projectName={projectName} />
           </div>
         )}
       </main>
@@ -404,6 +434,50 @@ function StageRail({ stages }: { stages: StageDetails[] }) {
 
 function LogPanel({ logs, build }: { logs: LogRecord[]; build: BuildRecord | null }) {
   return <section className="panel log-panel"><div className="panel-heading"><div><span className="overline">Live output</span><h2>Signal stream</h2></div><div className="log-meta"><span className="live-dot" />{build?.status === "running" ? "listening" : `${logs.length} lines`}</div></div><div className="log-window">{logs.length === 0 ? <EmptyState text="Output will appear here, line by line." /> : logs.slice(-160).map((log) => <div className="log-line" key={log.sequence}><span className="log-sequence">{String(log.sequence).padStart(4, "0")}</span><span className={`log-stream ${log.stream}`}>{log.stream === "stderr" ? "ERR" : log.stream === "system" ? "SYS" : "OUT"}</span><span className="log-text">{log.line || " "}</span></div>)}</div></section>;
+}
+
+function ArtifactPanel({
+  artifacts: artifactRecords,
+  build,
+  projectName,
+}: {
+  artifacts: ArtifactRecord[];
+  build: BuildRecord | null;
+  projectName: string;
+}) {
+  return (
+    <section className="panel artifacts-panel">
+      <div className="panel-heading">
+        <div><span className="overline">Build outputs</span><h2>Artifacts</h2></div>
+        <span className="panel-count">{artifactRecords.length.toString().padStart(2, "0")}</span>
+      </div>
+      {artifactRecords.length === 0 ? (
+        <EmptyState text={build ? "No artifacts were collected for this run." : "Artifacts will appear after a completed run."} />
+      ) : (
+        <div className="artifact-list">
+          {artifactRecords.map((artifact) => (
+            <a
+              className="artifact-row"
+              href={artifactUrl(projectName, build?.number ?? 0, artifact.id)}
+              download
+              key={artifact.id}
+            >
+              <span className="artifact-mark">□</span>
+              <span className="artifact-copy"><strong>{artifact.relative_path}</strong><small>{artifact.name} · {formatBytes(artifact.size_bytes)}</small></span>
+              <span className="artifact-checksum">{artifact.checksum.slice(-12)}</span>
+              <span className="artifact-arrow">↗</span>
+            </a>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function EmptyState({ text }: { text: string }) { return <div className="empty-state"><span>∅</span>{text}</div>; }
