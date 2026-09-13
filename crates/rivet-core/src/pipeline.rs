@@ -135,16 +135,37 @@ pub struct Step {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContainerSpec {
     pub image: String,
+    /// Select the local OCI-compatible command. Docker remains the default
+    /// for backwards-compatible pipeline files.
+    #[serde(default)]
+    pub runtime: ContainerRuntime,
     /// Ask the runtime to refresh the image before every container start.
     #[serde(default)]
     pub pull: ContainerPullPolicy,
-    /// Optional Docker network name or one of Docker's built-in network names.
+    /// Optional OCI runtime network name or one of the runtime's built-in names.
     #[serde(default)]
     pub network: Option<String>,
     /// Additional bind mounts. Sources are always relative to the workspace and
     /// targets are confined to the container workspace.
     #[serde(default)]
     pub volumes: Vec<ContainerVolume>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerRuntime {
+    #[default]
+    Docker,
+    Podman,
+}
+
+impl ContainerRuntime {
+    pub fn executable(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,7 +178,7 @@ pub enum ContainerPullPolicy {
 }
 
 impl ContainerPullPolicy {
-    pub fn docker_value(self) -> &'static str {
+    pub fn runtime_value(self) -> &'static str {
         match self {
             Self::IfNotPresent => "missing",
             Self::Always => "always",

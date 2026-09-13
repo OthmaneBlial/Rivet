@@ -505,7 +505,7 @@ fn build_process_spec(
         "--init".to_owned(),
         "--sig-proxy=true".to_owned(),
         "--pull".to_owned(),
-        container.pull.docker_value().to_owned(),
+        container.pull.runtime_value().to_owned(),
     ];
     if let Some(network) = &container.network {
         args.push("--network".to_owned());
@@ -534,7 +534,7 @@ fn build_process_spec(
     args.push(step.definition.program.clone());
     args.extend(step.definition.args.clone());
     ProcessSpec {
-        program: "docker".to_owned(),
+        program: container.runtime.executable().to_owned(),
         args,
         env,
         working_dir: workspace.to_owned(),
@@ -1157,6 +1157,38 @@ read_only = true
         assert_eq!(spec.env["TARGET"], "release");
     }
 
+    #[test]
+    fn selects_podman_without_starting_a_container_daemon() {
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "podman-command"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+[stages.steps.container]
+runtime = "podman"
+image = "fixture/runtime:1"
+pull = "never"
+"#,
+        )
+        .expect("container pipeline");
+        let plan =
+            ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let workspace = PathBuf::from("/tmp/rivet-workspace");
+        let spec = build_process_spec(
+            &plan.stages[0].steps[0],
+            &workspace,
+            workspace.clone(),
+            BTreeMap::new(),
+        );
+
+        assert_eq!(spec.program, "podman");
+        assert!(spec.args.windows(2).any(|args| args == ["--pull", "never"]));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn executes_container_command_through_a_runtime_shim_without_shell_interpolation() {
@@ -1166,9 +1198,9 @@ read_only = true
         fs::create_dir(directory.path().join("cache")).expect("cache directory");
         let fake_runtime = directory.path().join("fake-runtime");
         fs::create_dir(&fake_runtime).expect("runtime directory");
-        let docker = fake_runtime.join("docker");
+        let podman = fake_runtime.join("podman");
         fs::write(
-            &docker,
+            &podman,
             r#"#!/bin/sh
 set -eu
 workspace=
@@ -1194,11 +1226,11 @@ exec "$@"
 "#,
         )
         .expect("write runtime shim");
-        let mut permissions = fs::metadata(&docker)
+        let mut permissions = fs::metadata(&podman)
             .expect("runtime metadata")
             .permissions();
         permissions.set_mode(0o700);
-        fs::set_permissions(&docker, permissions).expect("make runtime executable");
+        fs::set_permissions(&podman, permissions).expect("make runtime executable");
 
         let pipeline = Pipeline::from_toml_str(
             r#"
@@ -1211,6 +1243,7 @@ name = "unit"
 program = "sh"
 args = ["-c", "printf 'container-ok\\n'"]
 [stages.steps.container]
+runtime = "podman"
 image = "fixture/runtime:1"
 pull = "never"
 network = "none"

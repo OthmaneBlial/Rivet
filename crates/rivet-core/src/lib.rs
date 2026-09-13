@@ -16,7 +16,8 @@ pub use model::{
     StageStatus, StepId, StepStatus,
 };
 pub use pipeline::{
-    AgentRequirement, CacheSpec, ContainerPullPolicy, ContainerSpec, ContainerVolume,
-    ParameterSpec, Pipeline, PipelineError, REDACTED_PARAMETER_VALUE, Stage, StageCondition, Step,
+    AgentRequirement, CacheSpec, ContainerPullPolicy, ContainerRuntime, ContainerSpec,
+    ContainerVolume, ParameterSpec, Pipeline, PipelineError, REDACTED_PARAMETER_VALUE, Stage,
+    StageCondition, Step,
 };
 pub use schedule::{CronExpression, CronExpressionError};

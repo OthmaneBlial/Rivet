@@ -30,7 +30,7 @@ policy-backed API identities with role/project authorization,
 secret-parameter redaction/masking, a passphrase-encrypted SCM credential vault
 with typed HTTP/SSH credentials, non-secret credential references and project allow-lists, and a packaged desktop launch with an
 ephemeral loopback engine origin, project-scoped local CI cache restore and
-save, explicit Docker container command assembly with bounded workspace mounts,
+save, explicit Docker/Podman container command assembly with bounded workspace mounts,
 and a bounded Jenkinsfile migration analyzer with line-level support findings
 plus safe drafts for deterministic shell steps, exposed through the headless
 API and rendered in the desktop control room. The server also exposes
@@ -562,6 +562,7 @@ timeout_seconds = 300
 retries = 2
 retry_delay_seconds = 3
 [stages.steps.container]
+runtime = "podman"
 image = "rust:1.85"
 
 [environment]
@@ -623,13 +624,16 @@ cargo run -p rivet -- cache prune --max-bytes 5368709120
 cargo run -p rivet -- artifact prune --max-bytes 10737418240
 ```
 
-A step can opt into explicit Docker execution with `[stages.steps.container]`.
-The declaration supports bounded image pull policy, network selection, workspace
-relative bind volumes, environment forwarding, validated working directories,
-separated arguments, `--init`, signal proxying, and automatic container cleanup.
-A local runtime-shim test exercises the direct command handoff and output path;
-real Docker/Podman runtime execution, image policy enforcement by the daemon, and
-end-to-end artifact and cancellation behavior remain unverified on this machine.
+A step can opt into explicit OCI runtime execution with `[stages.steps.container]`.
+Set `runtime = "podman"` to use Podman on a machine without Docker; the default
+is the legacy `docker` executable for existing pipeline files. The declaration
+supports bounded image pull policy, network selection, workspace-relative bind
+volumes, environment forwarding, validated working directories, separated
+arguments, `--init`, signal proxying, and automatic container cleanup. Local
+runtime-shim tests exercise both executable selections and the direct command
+handoff without installing Docker, starting a daemon, or pulling an image. Real
+Docker/Podman daemon behavior, image policy enforcement, and end-to-end artifact
+and cancellation behavior remain unverified on this machine.
 
 Inspect a Jenkinsfile locally before attempting a migration, or request a
 safe draft for simple quoted commands:
