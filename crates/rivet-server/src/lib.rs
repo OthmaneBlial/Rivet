@@ -18,7 +18,9 @@ use hmac::{Hmac, Mac};
 use rivet_agent_protocol::{
     AgentMessage, AgentRequirements, MAX_WORKSPACE_CHUNK_BYTES, PROTOCOL_VERSION, WorkspaceTransfer,
 };
-use rivet_auth::{AuthError, AuthPolicy, Permission, Principal};
+use rivet_auth::{
+    AuthError, AuthPolicy, Permission, Principal, Role, generate_token, token_digest,
+};
 use rivet_core::{
     BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, Pipeline, Project, ScheduleId,
     SourceSnapshot,
@@ -196,6 +198,8 @@ enum ApiError {
     #[error(transparent)]
     Migration(#[from] rivet_migration::MigrationError),
     #[error(transparent)]
+    Auth(#[from] AuthError),
+    #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
     Pipeline(#[from] rivet_core::PipelineError),
@@ -259,6 +263,7 @@ impl IntoResponse for ApiError {
                 | rivet_scm::ScmError::Filesystem(_) => StatusCode::INTERNAL_SERVER_ERROR,
             },
             Self::Migration(_)
+            | Self::Auth(_)
             | Self::Storage(_)
             | Self::Pipeline(_)
             | Self::Model(_)
@@ -282,6 +287,15 @@ struct AuthMeResponse {
     projects: Vec<String>,
     local_mode: bool,
 }
+
+#[derive(Debug, Serialize)]
+struct AuthSessionResponse {
+    id: uuid::Uuid,
+    session_token: String,
+    expires_at: DateTime<Utc>,
+}
+
+const AUTH_SESSION_TTL_SECONDS: i64 = 12 * 60 * 60;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateProjectRequest {
@@ -426,6 +440,11 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
     Ok(Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/auth/me", get(auth_me))
+        .route("/api/v1/auth/sessions", post(create_session))
+        .route(
+            "/api/v1/auth/sessions/current",
+            axum::routing::delete(revoke_session),
+        )
         .route("/api/v1/audit", get(list_audit))
         .route("/api/v1/credentials", get(list_credentials))
         .route(
@@ -910,6 +929,127 @@ async fn auth_me(Extension(principal): Extension<Principal>) -> Json<AuthMeRespo
     })
 }
 
+async fn create_session(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<AuthSessionResponse>, ApiError> {
+    require_global(&principal, Permission::Read)?;
+    if principal.id() == "local" {
+        return Err(ApiError::BadRequest(
+            "sessions are only needed when server authentication is enabled".into(),
+        ));
+    }
+
+    let created_at = Utc::now();
+    let expires_at = created_at + chrono::Duration::seconds(AUTH_SESSION_TTL_SECONDS);
+    let raw_token = generate_token()?;
+    let digest = token_digest(&raw_token);
+    let session_id = uuid::Uuid::new_v4();
+    let role = role_label(principal.role());
+    let projects = principal.projects().map(str::to_owned).collect::<Vec<_>>();
+    state.storage.create_auth_session(
+        session_id,
+        &digest,
+        principal.id(),
+        role,
+        &projects,
+        created_at,
+        expires_at,
+    )?;
+    if let Err(error) = state.storage.prune_auth_sessions(created_at) {
+        tracing::warn!(?error, "could not prune expired authentication sessions");
+    }
+    record_auth_session_audit(
+        &state.storage,
+        principal.id(),
+        &session_id.to_string(),
+        "created",
+    );
+    Ok(Json(AuthSessionResponse {
+        id: session_id,
+        session_token: raw_token.as_str().to_owned(),
+        expires_at,
+    }))
+}
+
+async fn revoke_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(principal): Extension<Principal>,
+) -> Result<StatusCode, ApiError> {
+    require_global(&principal, Permission::Read)?;
+    let Some(token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return Err(ApiError::BadRequest(
+            "Bearer session token is required".into(),
+        ));
+    };
+    let digest = token_digest(token);
+    if state.storage.revoke_auth_session(&digest, Utc::now())? {
+        record_auth_session_audit(&state.storage, principal.id(), "current", "revoked");
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn role_label(role: Role) -> &'static str {
+    match role {
+        Role::Admin => "admin",
+        Role::Operator => "operator",
+        Role::Viewer => "viewer",
+        Role::Agent => "agent",
+    }
+}
+
+fn parse_role_label(value: &str) -> Option<Role> {
+    match value {
+        "admin" => Some(Role::Admin),
+        "operator" => Some(Role::Operator),
+        "viewer" => Some(Role::Viewer),
+        "agent" => Some(Role::Agent),
+        _ => None,
+    }
+}
+
+fn authenticate_session(state: &AppState, token: &str) -> Option<Principal> {
+    let digest = token_digest(token);
+    let session = match state.storage.auth_session(&digest, Utc::now()) {
+        Ok(session) => session,
+        Err(error) => {
+            tracing::warn!(?error, "could not read authentication session");
+            return None;
+        }
+    }?;
+    let role = parse_role_label(&session.role)?;
+    Some(Principal::from_parts(
+        session.principal_id,
+        role,
+        session.projects,
+    ))
+}
+
+fn record_auth_session_audit(
+    storage: &Storage,
+    actor_id: &str,
+    session_resource: &str,
+    operation: &str,
+) {
+    if let Err(error) = storage.append_audit_event(
+        Utc::now(),
+        Some(actor_id),
+        "auth.session",
+        session_resource,
+        operation,
+    ) {
+        tracing::warn!(
+            ?error,
+            "could not persist authentication session audit event"
+        );
+    }
+}
+
 fn configured_credentials(state: &AppState) -> Result<&Arc<Mutex<CredentialVault>>, ApiError> {
     state
         .credentials
@@ -1027,6 +1167,7 @@ async fn authenticate(
                         bool::from(candidate.ct_eq(digest)).then(Principal::legacy_admin)
                     })
                 })
+                .or_else(|| authenticate_session(&state, token))
         });
     if let Some(principal) = principal {
         record_auth_audit(
@@ -4619,6 +4760,116 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authenticated_sessions_can_be_created_used_and_revoked_without_exposing_tokens() {
+        let raw_token = "session-source-fixture-token";
+        let storage = Storage::open_in_memory().expect("storage");
+        let state = AppState::with_token(storage.clone(), raw_token);
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/sessions")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {raw_token}"),
+                    )
+                    .body(Body::empty())
+                    .expect("create session request"),
+            )
+            .await
+            .expect("create session response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("session body");
+        assert!(
+            !body
+                .windows(raw_token.len())
+                .any(|window| window == raw_token.as_bytes())
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("session JSON");
+        let session_token = payload["session_token"]
+            .as_str()
+            .expect("session token")
+            .to_owned();
+        assert_eq!(session_token.len(), 64);
+        assert!(payload["expires_at"].is_string());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {session_token}"),
+                    )
+                    .body(Body::empty())
+                    .expect("session identity request"),
+            )
+            .await
+            .expect("session identity response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let identity: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("identity body"),
+        )
+        .expect("identity JSON");
+        assert_eq!(identity["id"], "legacy-token");
+        assert_eq!(identity["local_mode"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/v1/auth/sessions/current")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {session_token}"),
+                    )
+                    .body(Body::empty())
+                    .expect("revoke session request"),
+            )
+            .await
+            .expect("revoke session response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {session_token}"),
+                    )
+                    .body(Body::empty())
+                    .expect("revoked identity request"),
+            )
+            .await
+            .expect("revoked identity response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            storage
+                .list_audit_events(50)
+                .expect("session audit")
+                .iter()
+                .any(|event| event.action == "auth.session" && event.outcome == "created")
+        );
+        assert!(
+            storage
+                .list_audit_events(50)
+                .expect("revoke audit")
+                .iter()
+                .any(|event| event.action == "auth.session" && event.outcome == "revoked")
+        );
     }
 
     #[tokio::test]

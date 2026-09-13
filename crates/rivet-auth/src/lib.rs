@@ -109,6 +109,19 @@ impl Principal {
         }
     }
 
+    /// Rebuild a principal from a server-side session snapshot.
+    ///
+    /// The constructor is intentionally small: session persistence belongs to
+    /// the server/storage boundary, while this crate owns the authorization
+    /// semantics used by every transport.
+    pub fn from_parts(id: impl Into<String>, role: Role, projects: Vec<String>) -> Self {
+        Self {
+            id: id.into(),
+            role,
+            projects: projects.into_iter().collect(),
+        }
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }

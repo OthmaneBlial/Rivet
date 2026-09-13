@@ -24,6 +24,7 @@ use walkdir::WalkDir;
 
 const MAX_AUDIT_PAGE_SIZE: usize = 1000;
 const MAX_AUDIT_FIELD_BYTES: usize = 256;
+const SESSION_DIGEST_BYTES: usize = 32;
 
 #[derive(Clone)]
 pub struct Storage {
@@ -104,6 +105,12 @@ pub enum StorageError {
     MissingWebhookDelivery(String),
     #[error("audit {field} is empty, too long, or contains control characters")]
     InvalidAuditField { field: &'static str },
+    #[error("authentication session token digest is invalid")]
+    InvalidSessionDigest,
+    #[error("authentication session principal is invalid")]
+    InvalidSessionPrincipal,
+    #[error("authentication session role is invalid")]
+    InvalidSessionRole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -212,6 +219,20 @@ pub struct AuditEventRecord {
     pub outcome: String,
 }
 
+/// Persisted session metadata. The raw session token is never stored; callers
+/// pass its SHA-256 digest when creating, looking up, or revoking a session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthSessionRecord {
+    pub id: Uuid,
+    pub token_sha256: String,
+    pub principal_id: String,
+    pub role: String,
+    pub projects: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
 impl Storage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
@@ -277,6 +298,11 @@ impl Storage {
             &connection,
             8,
             Some(include_str!("../migrations/008_audit_events.sql")),
+        )?;
+        apply_migration(
+            &connection,
+            9,
+            Some(include_str!("../migrations/009_auth_sessions.sql")),
         )?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -621,6 +647,90 @@ impl Storage {
         let rows = statement.query_map(params![limit as i64], raw_audit_event)?;
         rows.map(|row| row.map_err(StorageError::from).and_then(parse_audit_event))
             .collect()
+    }
+
+    pub fn create_auth_session(
+        &self,
+        id: Uuid,
+        token_sha256: &str,
+        principal_id: &str,
+        role: &str,
+        projects: &[String],
+        created_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<AuthSessionRecord, StorageError> {
+        validate_session_digest(token_sha256)?;
+        validate_session_field(principal_id, "principal")?;
+        validate_session_field(role, "role")?;
+        let projects_json = serde_json::to_string(projects)?;
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        connection.execute(
+            "INSERT INTO auth_sessions(
+                id, token_sha256, principal_id, role, projects_json, created_at, expires_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id.to_string(),
+                token_sha256,
+                principal_id,
+                role,
+                projects_json,
+                created_at.to_rfc3339(),
+                expires_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(AuthSessionRecord {
+            id,
+            token_sha256: token_sha256.to_owned(),
+            principal_id: principal_id.to_owned(),
+            role: role.to_owned(),
+            projects: projects.to_vec(),
+            created_at,
+            expires_at,
+            revoked_at: None,
+        })
+    }
+
+    pub fn auth_session(
+        &self,
+        token_sha256: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<AuthSessionRecord>, StorageError> {
+        validate_session_digest(token_sha256)?;
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let raw = connection
+            .query_row(
+                "SELECT id, token_sha256, principal_id, role, projects_json,
+                        created_at, expires_at, revoked_at
+                 FROM auth_sessions
+                 WHERE token_sha256 = ?1 AND revoked_at IS NULL AND expires_at > ?2",
+                params![token_sha256, now.to_rfc3339()],
+                raw_auth_session,
+            )
+            .optional()?;
+        raw.map(parse_auth_session).transpose()
+    }
+
+    pub fn revoke_auth_session(
+        &self,
+        token_sha256: &str,
+        revoked_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        validate_session_digest(token_sha256)?;
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "UPDATE auth_sessions SET revoked_at = ?1
+             WHERE token_sha256 = ?2 AND revoked_at IS NULL",
+            params![revoked_at.to_rfc3339(), token_sha256],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn prune_auth_sessions(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(connection.execute(
+            "DELETE FROM auth_sessions WHERE expires_at <= ?1 OR revoked_at IS NOT NULL",
+            params![now.to_rfc3339()],
+        )?)
     }
 
     pub fn create_build(
@@ -1294,6 +1404,16 @@ type RawSchedule = (
 );
 type RawWebhookDelivery = (String, String, String, Option<String>, Option<i64>);
 type RawAuditEvent = (i64, String, Option<String>, String, String, String);
+type RawAuthSession = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+);
 
 fn validate_audit_field(value: &str, field: &'static str) -> Result<(), StorageError> {
     if value.trim().is_empty()
@@ -1301,6 +1421,28 @@ fn validate_audit_field(value: &str, field: &'static str) -> Result<(), StorageE
         || value.chars().any(char::is_control)
     {
         return Err(StorageError::InvalidAuditField { field });
+    }
+    Ok(())
+}
+
+fn validate_session_digest(value: &str) -> Result<(), StorageError> {
+    if value.len() != SESSION_DIGEST_BYTES * 2
+        || value.bytes().any(|byte| !byte.is_ascii_hexdigit())
+    {
+        return Err(StorageError::InvalidSessionDigest);
+    }
+    Ok(())
+}
+
+fn validate_session_field(value: &str, field: &'static str) -> Result<(), StorageError> {
+    if value.trim().is_empty()
+        || value.len() > MAX_AUDIT_FIELD_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(StorageError::InvalidSessionPrincipal);
+    }
+    if field == "role" && !matches!(value, "admin" | "operator" | "viewer" | "agent") {
+        return Err(StorageError::InvalidSessionRole);
     }
     Ok(())
 }
@@ -1324,6 +1466,35 @@ fn parse_audit_event(raw: RawAuditEvent) -> Result<AuditEventRecord, StorageErro
         action: raw.3,
         resource: raw.4,
         outcome: raw.5,
+    })
+}
+
+fn raw_auth_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAuthSession> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+    ))
+}
+
+fn parse_auth_session(raw: RawAuthSession) -> Result<AuthSessionRecord, StorageError> {
+    validate_session_digest(&raw.1)?;
+    validate_session_field(&raw.2, "principal")?;
+    validate_session_field(&raw.3, "role")?;
+    Ok(AuthSessionRecord {
+        id: parse_uuid(&raw.0)?,
+        token_sha256: raw.1,
+        principal_id: raw.2,
+        role: raw.3,
+        projects: serde_json::from_str(&raw.4)?,
+        created_at: parse_timestamp(&raw.5)?,
+        expires_at: parse_timestamp(&raw.6)?,
+        revoked_at: raw.7.as_deref().map(parse_timestamp).transpose()?,
     })
 }
 
@@ -2157,6 +2328,92 @@ program = "true"
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].actor_id.as_deref(), Some("operator"));
         assert_eq!(events[1].timestamp, first_at);
+    }
+
+    #[test]
+    fn auth_sessions_store_only_digests_and_support_expiry_revocation_and_reopen() {
+        let directory = tempdir().expect("tempdir");
+        let database = directory.path().join("rivet.db");
+        let storage = Storage::open(&database).expect("open");
+        let created_at = Utc
+            .with_ymd_and_hms(2026, 9, 13, 12, 0, 0)
+            .single()
+            .expect("created timestamp");
+        let expires_at = created_at + chrono::Duration::hours(1);
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let session_id = Uuid::new_v4();
+        let projects = vec!["release".to_owned()];
+        let record = storage
+            .create_auth_session(
+                session_id, digest, "operator", "operator", &projects, created_at, expires_at,
+            )
+            .expect("session");
+        assert_eq!(record.id, session_id);
+        assert_eq!(
+            storage
+                .auth_session(digest, created_at + chrono::Duration::minutes(1))
+                .expect("lookup")
+                .expect("active session")
+                .projects,
+            projects
+        );
+        assert!(
+            storage
+                .auth_session(digest, expires_at)
+                .expect("expired lookup")
+                .is_none()
+        );
+        assert!(
+            storage
+                .revoke_auth_session(digest, created_at + chrono::Duration::minutes(2))
+                .expect("revoke")
+        );
+        assert!(
+            storage
+                .auth_session(digest, created_at + chrono::Duration::minutes(3))
+                .expect("revoked lookup")
+                .is_none()
+        );
+
+        drop(storage);
+        let reopened = Storage::open(&database).expect("reopen");
+        assert!(
+            reopened
+                .auth_session(digest, created_at + chrono::Duration::minutes(3))
+                .expect("reopened lookup")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn auth_sessions_reject_invalid_digest_and_role() {
+        let storage = Storage::open_in_memory().expect("storage");
+        let now = Utc::now();
+        let projects = Vec::new();
+        assert!(matches!(
+            storage.create_auth_session(
+                Uuid::new_v4(),
+                "not-a-digest",
+                "viewer",
+                "viewer",
+                &projects,
+                now,
+                now + chrono::Duration::hours(1),
+            ),
+            Err(StorageError::InvalidSessionDigest)
+        ));
+        assert!(matches!(
+            storage.create_auth_session(
+                Uuid::new_v4(),
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "viewer",
+                "root",
+                &projects,
+                now,
+                now + chrono::Duration::hours(1),
+            ),
+            Err(StorageError::InvalidSessionRole)
+        ));
     }
 
     #[test]

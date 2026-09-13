@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**91% verified** · `██████████████████░░`<br>
-Weighted evidence score: **91.99 / 100** · displayed conservatively as the
+**92% verified** · `██████████████████░░`<br>
+Weighted evidence score: **92.07 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -51,8 +51,11 @@ shared by local and assigned-agent execution. On startup, persisted incomplete b
 idempotently so a crashed server cannot leave history stuck forever; resuming
 the same remote attempt after restart and cross-restart retry recovery remain
 future gates. Authenticated deployments persist bounded success/failure audit records
-without request bodies or Bearer values and expose them only to administrators;
-user sessions and external identity providers remain future gates.
+without request bodies or Bearer values and expose them only to administrators.
+Server deployments can exchange an authenticated API token for a twelve-hour
+opaque session token; only its SHA-256 digest and scoped principal snapshot are
+persisted, and the current session can be revoked. User accounts and external
+identity providers remain future gates.
 
 The repository includes a local-only release gate. It runs the workspace tests,
 builds the optimized CLI, builds the desktop web client, checks the native
@@ -224,8 +227,15 @@ The token value is not printed by the command and is not recoverable from the
 policy. The optional RFC3339 `expires_at` value is enforced at request time;
 legacy records without it remain non-expiring. Authenticated requests also
 produce bounded audit records available to administrators at
-`GET /api/v1/audit`; request bodies and Bearer values are never recorded. User
-accounts, sessions, and external identity providers remain future gates.
+`GET /api/v1/audit`; request bodies and Bearer values are never recorded.
+
+For a server deployment, an already authenticated operator or viewer can call
+`POST /api/v1/auth/sessions` to receive one opaque twelve-hour session token.
+Use it as `Authorization: Bearer <session-token>` and revoke it with
+`DELETE /api/v1/auth/sessions/current`. Rivet stores only the token digest in
+SQLite, expires sessions at lookup time, prunes expired/revoked rows, and
+records session creation/revocation in the administrator audit stream. User
+accounts and external identity providers remain future gates.
 
 Recorded Jenkins/Rivet behavior snapshots can be compared locally with the
 same explicit normalizer used by future live adapters:
