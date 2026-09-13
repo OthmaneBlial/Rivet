@@ -16,7 +16,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const PROTOCOL_NAME: &str = "rivet-agent";
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub type AgentId = Uuid;
 
 const MAX_AGENT_NAME_BYTES: usize = 128;
@@ -267,6 +267,7 @@ pub enum AgentMessage {
     Assign {
         protocol_version: u16,
         build_id: BuildId,
+        attempt_id: Uuid,
         project_id: ProjectId,
         plan: ExecutionPlan,
         pipeline: Pipeline,
@@ -300,6 +301,8 @@ pub enum AgentMessage {
     },
     Event {
         protocol_version: u16,
+        attempt_id: Uuid,
+        sequence: u64,
         event: BuildEvent,
     },
     Cancel {
@@ -438,6 +441,12 @@ impl AgentMessage {
             Self::Heartbeat(heartbeat) => heartbeat.validate(),
         }
         .and_then(|()| match self {
+            Self::Assign { attempt_id, .. } | Self::Event { attempt_id, .. }
+                if attempt_id.is_nil() =>
+            {
+                Err(ProtocolError::EmptyAttemptId)
+            }
+            Self::Event { sequence, .. } if *sequence == 0 => Err(ProtocolError::ZeroEventSequence),
             Self::Assign { workspace, .. } => workspace.validate(),
             Self::ArtifactsReady { transfer, .. } => transfer.validate(),
             Self::WorkspaceChunk { data, .. } | Self::ArtifactChunk { data, .. }
@@ -550,6 +559,10 @@ pub enum ProtocolError {
     WorkspaceChunkTooLarge,
     #[error("agent transport delivery ID cannot be nil")]
     EmptyDeliveryId,
+    #[error("remote attempt ID cannot be nil")]
+    EmptyAttemptId,
+    #[error("remote event sequence must be positive")]
+    ZeroEventSequence,
 }
 
 fn validate_version(version: u16) -> Result<(), ProtocolError> {
@@ -665,6 +678,7 @@ program = "true"
         let message = AgentMessage::Assign {
             protocol_version: PROTOCOL_VERSION,
             build_id,
+            attempt_id: Uuid::new_v4(),
             project_id,
             plan: ExecutionPlan::from_pipeline(&pipeline, build_id, project_id),
             pipeline,
@@ -679,6 +693,33 @@ program = "true"
         let encoded = serde_json::to_string(&message).expect("encode");
         let decoded: AgentMessage = serde_json::from_str(&encoded).expect("decode");
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn remote_event_identity_is_required_and_versioned() {
+        let build_id = Uuid::new_v4();
+        let event = AgentMessage::Event {
+            protocol_version: PROTOCOL_VERSION,
+            attempt_id: Uuid::new_v4(),
+            sequence: 1,
+            event: BuildEvent::BuildStarted {
+                build_id,
+                timestamp: Utc::now(),
+            },
+        };
+        event.validate().expect("valid remote event");
+        let encoded = serde_json::to_string(&event).expect("encode");
+        assert!(encoded.contains(r#""sequence":1"#));
+        assert_eq!(
+            serde_json::from_str::<AgentMessage>(&encoded).unwrap(),
+            event
+        );
+
+        let mut invalid = event.clone();
+        if let AgentMessage::Event { sequence, .. } = &mut invalid {
+            *sequence = 0;
+        }
+        assert_eq!(invalid.validate(), Err(ProtocolError::ZeroEventSequence));
     }
 
     #[test]

@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.63 / 100** · displayed conservatively as the
+Weighted evidence score: **92.64 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -63,9 +63,11 @@ Non-secret remote attempts additionally retain their plan and redacted
 parameters and are redispatched with the same build identity when a compatible
 agent returns; attempts that require secret values fail closed.
 Bounded session-scoped agent delivery now uses versioned delivery IDs, ACKs,
-duplicate suppression, and timed retransmission; durable cross-restart
-exactly-once delivery remains a future gate; bounded retry recovery is now
-durable locally. Authenticated deployments persist bounded success/failure audit records
+duplicate suppression, and timed retransmission. Remote execution events also
+carry a durable attempt identity and monotone sequence; SQLite atomically records
+that identity with the build projection, so replay after a server restart is
+applied at most once and conflicting reuse is rejected. Bounded retry recovery
+is durable locally. Authenticated deployments persist bounded success/failure audit records
 without request bodies or Bearer values and expose them only to administrators.
 Server deployments can exchange an authenticated API token for a twelve-hour
 opaque session token; only its SHA-256 digest and scoped principal snapshot are
@@ -495,9 +497,9 @@ persists a terminal failed state when no replacement is available. The bounded
 replacement budget and selected agent are persisted, so a server restart
 resumes the current recovery slot instead of granting another one. Non-secret
 remote attempts can also be preserved and redispatched with the same build
-identity after a server restart; session-scoped delivery IDs, ACKs, duplicate
-suppression, and timed retransmission are covered locally, while durable
-cross-restart exactly-once delivery remains a future gate.
+identity after a server restart. Remote event attempt IDs and sequences are
+persisted atomically with the event projection, making replay after restart
+idempotent and rejecting a conflicting sequence payload.
 
 Connect a worker for heartbeat and capability discovery:
 

@@ -1027,6 +1027,7 @@ async fn run_agent_assignment(
 ) -> Result<AgentAssignmentResult, Box<dyn std::error::Error>> {
     let AgentMessage::Assign {
         build_id,
+        attempt_id,
         plan,
         pipeline,
         parameters,
@@ -1091,6 +1092,7 @@ async fn run_agent_assignment(
     );
     tokio::pin!(execution);
     let mut terminal_event_sent = false;
+    let mut event_sequence = 0_u64;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     loop {
         tokio::select! {
@@ -1124,6 +1126,8 @@ async fn run_agent_assignment(
                         transport,
                         event,
                         build_id,
+                        attempt_id,
+                        &mut event_sequence,
                         &execution_pipeline,
                         &build_workspace,
                     ).await?;
@@ -1183,6 +1187,8 @@ async fn run_agent_assignment(
                         transport,
                         event,
                         build_id,
+                        attempt_id,
+                        &mut event_sequence,
                         &execution_pipeline,
                         &build_workspace,
                     ).await?;
@@ -1212,6 +1218,8 @@ async fn send_execution_event(
     transport: &mut AgentWireState,
     event: BuildEvent,
     build_id: uuid::Uuid,
+    attempt_id: uuid::Uuid,
+    event_sequence: &mut u64,
     pipeline: &Pipeline,
     workspace: &Path,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -1236,9 +1244,14 @@ async fn send_execution_event(
         }
     }
     let terminal = matches!(event, BuildEvent::BuildFinished { .. });
+    *event_sequence = (*event_sequence)
+        .checked_add(1)
+        .ok_or("remote event sequence overflow")?;
     transport
         .send_message(AgentMessage::Event {
             protocol_version: PROTOCOL_VERSION,
+            attempt_id,
+            sequence: *event_sequence,
             event,
         })
         .await?;

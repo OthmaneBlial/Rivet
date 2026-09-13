@@ -2179,14 +2179,21 @@ async fn dispatch_agent_message(
             "already_registered".into(),
             "an agent can register only once per connection".into(),
         )),
-        AgentMessage::Event { event, .. } => {
+        AgentMessage::Event {
+            protocol_version,
+            attempt_id,
+            sequence,
+            event,
+        } => {
             route_agent_build_message(
                 state,
                 lease.agent_id,
                 lease.session_id,
                 build_id_from_event(&event),
                 AgentMessage::Event {
-                    protocol_version: PROTOCOL_VERSION,
+                    protocol_version,
+                    attempt_id,
+                    sequence,
                     event,
                 },
             )
@@ -3042,6 +3049,7 @@ fn spawn_remote_recovery_dispatcher(
                             attempt.parameters,
                             cancellation,
                             events,
+                            attempt.attempt_id,
                             Some(details),
                         );
                         pending.remove(&build_id);
@@ -3378,8 +3386,8 @@ async fn enqueue_project_build(
             return Err(error.into());
         }
     };
-    if let Some(reservation) = reservation.as_ref() {
-        if let Err(error) = state.storage.create_remote_attempt(
+    let remote_attempt = if let Some(reservation) = reservation.as_ref() {
+        match state.storage.create_remote_attempt(
             plan.build_id,
             plan.project_id,
             reservation.agent_id,
@@ -3390,14 +3398,19 @@ async fn enqueue_project_build(
             &pipeline,
             &parameters,
         ) {
-            state.agents.release(reservation).await;
-            let _ = state.storage.apply_event(&BuildEvent::BuildCancelled {
-                build_id: plan.build_id,
-                timestamp: Utc::now(),
-            });
-            return Err(error.into());
+            Ok(record) => Some(record),
+            Err(error) => {
+                state.agents.release(reservation).await;
+                let _ = state.storage.apply_event(&BuildEvent::BuildCancelled {
+                    build_id: plan.build_id,
+                    timestamp: Utc::now(),
+                });
+                return Err(error.into());
+            }
         }
-    }
+    } else {
+        None
+    };
     let cancellation = CancellationToken::new();
     state
         .active_builds
@@ -3436,6 +3449,10 @@ async fn enqueue_project_build(
             parameters,
             cancellation,
             events,
+            remote_attempt
+                .as_ref()
+                .expect("remote attempt exists for a remote reservation")
+                .attempt_id,
             None,
         );
     } else {
@@ -3495,6 +3512,7 @@ fn spawn_remote_build_task(
     parameters: BTreeMap<String, String>,
     cancellation: CancellationToken,
     events: mpsc::Sender<BuildEvent>,
+    attempt_id: Uuid,
     resume_details: Option<BuildDetails>,
 ) {
     let build_id = plan.build_id;
@@ -3509,6 +3527,7 @@ fn spawn_remote_build_task(
             parameters,
             cancellation,
             events,
+            attempt_id,
             resume_details,
         )
         .await;
@@ -3600,6 +3619,7 @@ async fn run_remote_build_with_recovery(
     parameters: BTreeMap<String, String>,
     cancellation: CancellationToken,
     events: mpsc::Sender<BuildEvent>,
+    mut attempt_id: Uuid,
     resume_details: Option<BuildDetails>,
 ) -> Result<(), RemoteBuildError> {
     let mut reservation = initial_reservation;
@@ -3650,6 +3670,7 @@ async fn run_remote_build_with_recovery(
             cancellation.clone(),
             events.clone(),
             received_messages,
+            attempt_id,
             suppress_build_started,
             &mut active_stages,
             &mut active_steps,
@@ -3685,12 +3706,17 @@ async fn run_remote_build_with_recovery(
                     .await;
                 reservation = match replacement {
                     Ok(reservation) => {
+                        let replacement_attempt_id = Uuid::new_v4();
                         match state.storage.advance_remote_attempt(
                             plan.build_id,
                             reservation.agent_id,
+                            replacement_attempt_id,
                             MAX_REMOTE_RECOVERY_ATTEMPTS,
                         )? {
-                            Some(_) => reservation,
+                            Some(_) => {
+                                attempt_id = replacement_attempt_id;
+                                reservation
+                            }
                             None => {
                                 state.agents.release(&reservation).await;
                                 finish_remote_failed(
@@ -3755,6 +3781,7 @@ async fn run_remote_build(
     cancellation: CancellationToken,
     events: mpsc::Sender<BuildEvent>,
     messages: mpsc::Receiver<AgentMessage>,
+    attempt_id: Uuid,
     suppress_build_started: bool,
     active_stages: &mut HashSet<rivet_core::StageId>,
     active_steps: &mut HashSet<rivet_core::StepId>,
@@ -3770,6 +3797,7 @@ async fn run_remote_build(
         cancellation,
         events,
         messages,
+        attempt_id,
         suppress_build_started,
         active_stages,
         active_steps,
@@ -3788,6 +3816,7 @@ async fn run_remote_build_inner(
     cancellation: CancellationToken,
     events: mpsc::Sender<BuildEvent>,
     mut messages: mpsc::Receiver<AgentMessage>,
+    attempt_id: Uuid,
     suppress_build_started: bool,
     active_stages: &mut HashSet<rivet_core::StageId>,
     active_steps: &mut HashSet<rivet_core::StepId>,
@@ -3810,6 +3839,7 @@ async fn run_remote_build_inner(
                 &state,
                 &reservation,
                 &plan,
+                attempt_id,
                 &events,
                 &mut messages,
                 &mut accepted,
@@ -3824,6 +3854,7 @@ async fn run_remote_build_inner(
     let assignment = AgentMessage::Assign {
         protocol_version: PROTOCOL_VERSION,
         build_id: plan.build_id,
+        attempt_id,
         project_id: plan.project_id,
         plan: plan.clone(),
         pipeline: pipeline.clone(),
@@ -3837,6 +3868,7 @@ async fn run_remote_build_inner(
                 &state,
                 &reservation,
                 &plan,
+                attempt_id,
                 &events,
                 &mut messages,
                 &mut accepted,
@@ -3874,6 +3906,7 @@ async fn run_remote_build_inner(
                     &state,
                     &reservation,
                     &plan,
+                    attempt_id,
                     &events,
                     &mut messages,
                     &mut accepted,
@@ -3896,6 +3929,7 @@ async fn run_remote_build_inner(
                     &state,
                     &reservation,
                     &plan,
+                    attempt_id,
                     &events,
                     &mut messages,
                     &mut accepted,
@@ -4013,17 +4047,22 @@ async fn run_remote_build_inner(
                             artifacts_complete = true;
                         }
                     }
-                    AgentMessage::Event { event, .. } => {
+                    AgentMessage::Event {
+                        attempt_id: event_attempt_id,
+                        sequence,
+                        event,
+                        ..
+                    } => {
+                        if event_attempt_id != attempt_id {
+                            return Err(RemoteBuildError::InvalidEvent {
+                                build_id: plan.build_id,
+                                reason: "event belongs to a different remote attempt".into(),
+                            });
+                        }
                         validate_remote_event(&event, &plan, accepted, ready)?;
                         if matches!(event, BuildEvent::BuildStarted { .. }) {
                             *build_started = true;
                         }
-                        if suppress_build_started
-                            && matches!(event, BuildEvent::BuildStarted { .. })
-                        {
-                            continue;
-                        }
-                        track_remote_activity(&event, active_stages, active_steps);
                         let terminal = matches!(event, BuildEvent::BuildFinished { .. });
                         if matches!(
                             &event,
@@ -4039,7 +4078,21 @@ async fn run_remote_build_inner(
                                     .into(),
                             });
                         }
-                        events.send(event).await.map_err(|_| RemoteBuildError::EventChannelClosed)?;
+                        let applied = state.storage.apply_remote_event(
+                            plan.build_id,
+                            attempt_id,
+                            sequence,
+                            &event,
+                        )?;
+                        if applied {
+                            track_remote_activity(&event, active_stages, active_steps);
+                            if suppress_build_started
+                                && matches!(event, BuildEvent::BuildStarted { .. })
+                            {
+                                continue;
+                            }
+                            events.send(event).await.map_err(|_| RemoteBuildError::EventChannelClosed)?;
+                        }
                         if terminal {
                             return Ok(());
                         }
@@ -4214,6 +4267,7 @@ async fn finish_remote_cancelled(
     state: &AppState,
     reservation: &AgentReservation,
     plan: &ExecutionPlan,
+    attempt_id: Uuid,
     events: &mpsc::Sender<BuildEvent>,
     messages: &mut mpsc::Receiver<AgentMessage>,
     accepted: &mut bool,
@@ -4247,13 +4301,28 @@ async fn finish_remote_cancelled(
                     AgentMessage::WorkspaceReady { build_id, .. } if build_id == plan.build_id => {
                         *ready = *accepted;
                     }
-                    AgentMessage::Event { event, .. } => {
+                    AgentMessage::Event {
+                        attempt_id: event_attempt_id,
+                        sequence,
+                        event,
+                        ..
+                    } => {
+                        if event_attempt_id != attempt_id {
+                            continue;
+                        }
                         if validate_remote_event(&event, plan, *accepted, *ready).is_err() {
                             continue;
                         }
-                        track_remote_activity(&event, active_stages, active_steps);
                         let terminal = matches!(event, BuildEvent::BuildFinished { .. });
-                        events.send(event).await.map_err(|_| RemoteBuildError::EventChannelClosed)?;
+                        if state.storage.apply_remote_event(
+                            plan.build_id,
+                            attempt_id,
+                            sequence,
+                            &event,
+                        )? {
+                            track_remote_activity(&event, active_stages, active_steps);
+                            events.send(event).await.map_err(|_| RemoteBuildError::EventChannelClosed)?;
+                        }
                         if terminal {
                             return Ok(());
                         }
@@ -6158,9 +6227,10 @@ agent = { os = "macos", arch = "aarch64", labels = ["recovery"] }
             )
             .expect("remote attempt");
         let replacement_agent = uuid::Uuid::new_v4();
+        let replacement_attempt = uuid::Uuid::new_v4();
         assert_eq!(
             storage
-                .advance_remote_attempt(build.id, replacement_agent, 1)
+                .advance_remote_attempt(build.id, replacement_agent, replacement_attempt, 1)
                 .expect("persist replacement recovery slot"),
             Some(1)
         );
@@ -6171,6 +6241,7 @@ agent = { os = "macos", arch = "aarch64", labels = ["recovery"] }
             .next()
             .expect("reloaded attempt");
         assert_eq!(attempt.agent_id, replacement_agent);
+        assert_eq!(attempt.attempt_id, replacement_attempt);
         assert_eq!(attempt.recovery_attempts, 1);
         let state = AppState::new(storage);
         let (outbound, mut received) = mpsc::channel(16);
@@ -6206,6 +6277,7 @@ agent = { os = "macos", arch = "aarch64", labels = ["recovery"] }
             payload:
                 AgentMessage::Assign {
                     build_id: assigned_build,
+                    attempt_id: assigned_attempt,
                     plan: assigned_plan,
                     ..
                 },
@@ -6215,6 +6287,7 @@ agent = { os = "macos", arch = "aarch64", labels = ["recovery"] }
             panic!("expected a recovery assignment");
         };
         assert_eq!(assigned_build, build.id);
+        assert_eq!(assigned_attempt, attempt.attempt_id);
         assert_eq!(assigned_plan, attempt.plan);
 
         shutdown.cancel();

@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **92 / 100 points** (**92.63 weighted evidence
+The current verified total is **92 / 100 points** (**92.64 weighted evidence
 points**, displayed conservatively as 92%).
 
 | Workstream | Weight | Current state | Gate for completion |
@@ -20,7 +20,7 @@ points**, displayed conservatively as 92%).
 | Tauri desktop control room | 10 | partial | native bundle, embedded engine health, rendered light-default/dark-toggle UX, artifact/retry views, schedule controls, desktop SCM preparation and runtime parameter controls, credential lifecycle view, online/offline recovery, real client build flow, and an ephemeral loopback engine origin in the packaged launch pass; final Tauri-window interaction and release QA remain |
 | Git/SCM integration | 8 | partial | direct Git inspect/checkout/fetch/clean operations, bounded provider refspec fetches, REST/CLI surfaces, explicit build-admission preparation, persisted build source identity, provider-neutral credential IDs, ephemeral HTTP/SSH auth handoff, project-scoped credential resolution, provider push/PR adapters, and strict deployment-controlled SSH host-key policy pass; broader provider lifecycle remains |
 | Triggers and scheduling | 5 | partial | manual/API entry points, validated persistent UTC cron schedules/server dispatch, signed generic webhook delivery, and signed GitHub/GitLab push plus PR/MR adapters pass; broader repository-event and upstream triggers remain |
-| Remote agents | 10 | partial | authenticated versioned registration/heartbeat contract, explicit pipeline requirements with local safety refusal, reconnecting agent CLI, reconnect-safe sessions, stale detection, capacity-aware online matching, explicit CPU/memory capability matching and reservation, rendered fleet view, matching capacity reservation, bounded workspace and artifact transfer, shared-runner remote execution, typed event/output relay, cancellation, bounded step retry policy, one bounded replacement-agent attempt with clean terminal failure, persisted event-redelivery idempotence, idempotent startup reconciliation of persisted incomplete builds, redacted durable remote-attempt metadata with same-build/plan startup redispatch, persisted replacement-agent selection and retry budget, and bounded session-scoped reliable delivery with ACKs, duplicate suppression, and timed retransmission pass locally; durable cross-restart exactly-once delivery remains |
+| Remote agents | 10 | verified | authenticated versioned registration/heartbeat contract, explicit pipeline requirements with local safety refusal, reconnecting agent CLI, reconnect-safe sessions, stale detection, capacity-aware online matching, explicit CPU/memory capability matching and reservation, rendered fleet view, matching capacity reservation, bounded workspace and artifact transfer, shared-runner remote execution, typed event/output relay, cancellation, bounded step retry policy, one bounded replacement-agent attempt with clean terminal failure, persisted event-redelivery idempotence, idempotent startup reconciliation of persisted incomplete builds, redacted durable remote-attempt metadata with same-build/plan startup redispatch, persisted replacement-agent selection and retry budget, bounded session-scoped reliable delivery with ACKs, duplicate suppression, timed retransmission, and durable attempt/sequence identities atomically projected with build events; local replay and conflict tests pass |
 | Container execution | 4 | partial | validated image pull/network/workspace-volume declarations, bounded Docker command assembly, signal proxying, cleanup flags, and a local runtime-shim execution test pass; Docker/Podman daemon behavior, image policy enforcement, timeout/cancellation, and artifact extraction remain unverified |
 | Artifacts | 4 | partial | local and remote workspace collection, upload/download, bounded checksum-verified transfer, metadata, storage boundary, and explicit retention pruning for completed builds pass; remote object backends remain |
 | CI cache | 3 | partial | validated exact project-scoped primary/fallback keys, safe relative paths, atomic local archive save/restore, corrupt-entry recovery, fallback selection, and bounded local age-ordered pruning pass; remote cache backends remain |
@@ -40,8 +40,7 @@ scaffold, passing unrelated test, or interface alone does not complete a gate.
 
 The next gates are the final Tauri-window
 flow inside the packaged app, API
-deployment hardening, durable cross-restart exactly-once delivery and retry
-recovery, broader provider lifecycle and deployment-specific keychain policy coverage, user
+deployment hardening, broader provider lifecycle and deployment-specific keychain policy coverage, user
 accounts and external identity providers, live compatibility capture adapters
 and a permanent differential regression corpus, broader repository-event
 mapping, upstream triggers, full Groovy/plugin migration

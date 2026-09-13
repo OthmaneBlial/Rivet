@@ -117,6 +117,12 @@ pub enum StorageError {
     InvalidSessionRole,
     #[error("invalid remote recovery attempt count in database: {0}")]
     InvalidRemoteRecoveryAttempts(i64),
+    #[error("remote event build ID does not match the persisted build")]
+    RemoteEventBuildMismatch,
+    #[error("remote event identity is invalid")]
+    InvalidRemoteEventIdentity,
+    #[error("remote event sequence {sequence} was already recorded with a different payload")]
+    RemoteEventSequenceConflict { sequence: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -256,6 +262,7 @@ pub struct AuthSessionRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteAttemptRecord {
     pub build_id: BuildId,
+    pub attempt_id: Uuid,
     pub project_id: ProjectId,
     pub agent_id: Uuid,
     pub requirements_json: String,
@@ -357,6 +364,20 @@ impl Storage {
             13,
             Some(include_str!(
                 "../migrations/013_remote_attempt_recovery.sql"
+            )),
+        )?;
+        apply_migration(
+            &connection,
+            14,
+            Some(include_str!(
+                "../migrations/014_remote_attempt_identity.sql"
+            )),
+        )?;
+        apply_migration(
+            &connection,
+            15,
+            Some(include_str!(
+                "../migrations/015_remote_event_deliveries.sql"
             )),
         )?;
         backfill_event_hashes(&connection)?;
@@ -896,6 +917,7 @@ impl Storage {
     ) -> Result<RemoteAttemptRecord, StorageError> {
         let record = RemoteAttemptRecord {
             build_id,
+            attempt_id: Uuid::new_v4(),
             project_id,
             agent_id,
             requirements_json: requirements_json.to_owned(),
@@ -911,12 +933,13 @@ impl Storage {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         connection.execute(
             "INSERT INTO remote_attempts(
-                build_id, project_id, agent_id, requirements_json,
+                build_id, attempt_id, project_id, agent_id, requirements_json,
                 plan_json, pipeline_json, parameters_json, created_at
                 , recovery_attempts
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 record.build_id.to_string(),
+                record.attempt_id.to_string(),
                 record.project_id.to_string(),
                 record.agent_id.to_string(),
                 &record.requirements_json,
@@ -933,9 +956,9 @@ impl Storage {
     pub fn list_remote_attempts(&self) -> Result<Vec<RemoteAttemptRecord>, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
-            "SELECT build_id, project_id, agent_id, requirements_json,
-                    plan_json, pipeline_json, parameters_json, created_at,
-                    recovery_attempts
+            "SELECT build_id, attempt_id, project_id, agent_id,
+                    requirements_json, plan_json, pipeline_json,
+                    parameters_json, created_at, recovery_attempts
              FROM remote_attempts ORDER BY created_at ASC, build_id ASC",
         )?;
         let rows = statement.query_map([], raw_remote_attempt)?;
@@ -978,17 +1001,23 @@ impl Storage {
         &self,
         build_id: BuildId,
         agent_id: Uuid,
+        attempt_id: Uuid,
         max_recovery_attempts: usize,
     ) -> Result<Option<usize>, StorageError> {
+        if attempt_id.is_nil() {
+            return Err(StorageError::InvalidRemoteEventIdentity);
+        }
         let max_recovery_attempts = i64::try_from(max_recovery_attempts)
             .map_err(|_| StorageError::InvalidRemoteRecoveryAttempts(i64::MAX))?;
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let changed = connection.execute(
             "UPDATE remote_attempts
-             SET agent_id = ?1, recovery_attempts = recovery_attempts + 1
-             WHERE build_id = ?2 AND recovery_attempts < ?3",
+             SET agent_id = ?1, attempt_id = ?2,
+                 recovery_attempts = recovery_attempts + 1
+             WHERE build_id = ?3 AND recovery_attempts < ?4",
             params![
                 agent_id.to_string(),
+                attempt_id.to_string(),
                 build_id.to_string(),
                 max_recovery_attempts
             ],
@@ -1025,25 +1054,105 @@ impl Storage {
             transaction.commit()?;
             return Ok(());
         }
+        Self::project_event(&transaction, event)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically record and project an event received from a remote agent.
+    /// The durable identity is separate from the timestamp-bearing domain
+    /// event, so retransmission after a server restart cannot duplicate logs
+    /// or state transitions.
+    pub fn apply_remote_event(
+        &self,
+        build_id: BuildId,
+        attempt_id: Uuid,
+        sequence: u64,
+        event: &BuildEvent,
+    ) -> Result<bool, StorageError> {
+        if attempt_id.is_nil() || sequence == 0 {
+            return Err(StorageError::InvalidRemoteEventIdentity);
+        }
+        if event_build_id(event) != build_id {
+            return Err(StorageError::RemoteEventBuildMismatch);
+        }
+        let database_sequence =
+            i64::try_from(sequence).map_err(|_| StorageError::InvalidRemoteEventIdentity)?;
+        let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let transaction = connection.transaction()?;
+        let event_json = serde_json::to_string(event)?;
+        let digest = event_hash(&event_json);
+        let existing_hash: Option<String> = transaction
+            .query_row(
+                "SELECT event_hash FROM remote_event_deliveries
+                 WHERE build_id = ?1 AND attempt_id = ?2 AND sequence = ?3",
+                params![
+                    build_id.to_string(),
+                    attempt_id.to_string(),
+                    database_sequence
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_hash) = existing_hash {
+            if existing_hash != digest {
+                return Err(StorageError::RemoteEventSequenceConflict { sequence });
+            }
+            transaction.commit()?;
+            return Ok(false);
+        }
+        transaction.execute(
+            "INSERT INTO remote_event_deliveries(
+                build_id, attempt_id, sequence, event_hash, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                build_id.to_string(),
+                attempt_id.to_string(),
+                database_sequence,
+                digest,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO build_events(build_id, timestamp, event_json, event_hash)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                build_id.to_string(),
+                event.timestamp().to_rfc3339(),
+                event_json,
+                digest,
+            ],
+        )?;
+        if inserted == 1 {
+            Self::project_event(&transaction, event)?;
+        }
+        transaction.commit()?;
+        Ok(inserted == 1)
+    }
+
+    fn project_event(
+        transaction: &Transaction<'_>,
+        event: &BuildEvent,
+    ) -> Result<(), StorageError> {
         match event {
             BuildEvent::BuildQueued {
                 build_id,
                 timestamp,
                 ..
-            } => transition_build(&transaction, *build_id, BuildStatus::Queued, *timestamp)?,
+            } => transition_build(transaction, *build_id, BuildStatus::Queued, *timestamp)?,
             BuildEvent::BuildStarted {
                 build_id,
                 timestamp,
-            } => transition_build(&transaction, *build_id, BuildStatus::Running, *timestamp)?,
+            } => transition_build(transaction, *build_id, BuildStatus::Running, *timestamp)?,
             BuildEvent::BuildFinished {
                 build_id,
                 status,
                 timestamp,
-            } => transition_build(&transaction, *build_id, status.clone(), *timestamp)?,
+            } => transition_build(transaction, *build_id, status.clone(), *timestamp)?,
             BuildEvent::BuildCancelled {
                 build_id,
                 timestamp,
-            } => transition_build(&transaction, *build_id, BuildStatus::Cancelled, *timestamp)?,
+            } => transition_build(transaction, *build_id, BuildStatus::Cancelled, *timestamp)?,
             BuildEvent::StageStarted {
                 stage_id,
                 timestamp,
@@ -1133,7 +1242,6 @@ impl Storage {
                 )?;
             }
         }
-        transaction.commit()?;
         Ok(())
     }
 
@@ -1705,6 +1813,7 @@ type RawRemoteAttempt = (
     String,
     String,
     String,
+    String,
     i64,
 );
 
@@ -1842,21 +1951,23 @@ fn raw_remote_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRemoteAtte
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
+        row.get(9)?,
     ))
 }
 
 fn parse_remote_attempt(raw: RawRemoteAttempt) -> Result<RemoteAttemptRecord, StorageError> {
     let recovery_attempts =
-        usize::try_from(raw.8).map_err(|_| StorageError::InvalidRemoteRecoveryAttempts(raw.8))?;
+        usize::try_from(raw.9).map_err(|_| StorageError::InvalidRemoteRecoveryAttempts(raw.9))?;
     Ok(RemoteAttemptRecord {
         build_id: parse_uuid(&raw.0)?,
-        project_id: parse_uuid(&raw.1)?,
-        agent_id: parse_uuid(&raw.2)?,
-        requirements_json: raw.3,
-        plan: serde_json::from_str(&raw.4)?,
-        pipeline: serde_json::from_str(&raw.5)?,
-        parameters: serde_json::from_str(&raw.6)?,
-        created_at: parse_timestamp(&raw.7)?,
+        attempt_id: parse_uuid(&raw.1)?,
+        project_id: parse_uuid(&raw.2)?,
+        agent_id: parse_uuid(&raw.3)?,
+        requirements_json: raw.4,
+        plan: serde_json::from_str(&raw.5)?,
+        pipeline: serde_json::from_str(&raw.6)?,
+        parameters: serde_json::from_str(&raw.7)?,
+        created_at: parse_timestamp(&raw.8)?,
         recovery_attempts,
     })
 }
@@ -2904,24 +3015,58 @@ program = "true"
         let attempts = reopened.list_remote_attempts().expect("attempts");
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].build_id, build.id);
+        assert_eq!(attempts[0].attempt_id, created.attempt_id);
         assert_eq!(attempts[0].agent_id, agent_id);
         assert_eq!(attempts[0].recovery_attempts, 0);
         assert_eq!(attempts[0].parameters, parameters);
-        let replacement_agent = Uuid::new_v4();
+        let remote_event = BuildEvent::BuildStarted {
+            build_id: build.id,
+            timestamp: Utc::now(),
+        };
+        assert!(
+            reopened
+                .apply_remote_event(build.id, created.attempt_id, 1, &remote_event)
+                .expect("apply remote event")
+        );
+        assert!(
+            !reopened
+                .apply_remote_event(build.id, created.attempt_id, 1, &remote_event)
+                .expect("deduplicate remote event")
+        );
+        let conflicting_event = BuildEvent::BuildStarted {
+            build_id: build.id,
+            timestamp: Utc::now() + chrono::Duration::seconds(1),
+        };
+        assert!(matches!(
+            reopened.apply_remote_event(build.id, created.attempt_id, 1, &conflicting_event),
+            Err(StorageError::RemoteEventSequenceConflict { sequence: 1 })
+        ));
         assert_eq!(
             reopened
-                .advance_remote_attempt(build.id, replacement_agent, 1)
+                .get_build_details(build.id)
+                .expect("details")
+                .expect("build")
+                .build
+                .status,
+            BuildStatus::Running
+        );
+        let replacement_agent = Uuid::new_v4();
+        let replacement_attempt = Uuid::new_v4();
+        assert_eq!(
+            reopened
+                .advance_remote_attempt(build.id, replacement_agent, replacement_attempt, 1)
                 .expect("advance remote attempt"),
             Some(1)
         );
         assert_eq!(
             reopened
-                .advance_remote_attempt(build.id, Uuid::new_v4(), 1)
+                .advance_remote_attempt(build.id, Uuid::new_v4(), Uuid::new_v4(), 1)
                 .expect("bounded remote attempt"),
             None
         );
         let advanced = reopened.list_remote_attempts().expect("advanced attempt");
         assert_eq!(advanced[0].agent_id, replacement_agent);
+        assert_eq!(advanced[0].attempt_id, replacement_attempt);
         assert_eq!(advanced[0].recovery_attempts, 1);
         assert!(
             reopened
@@ -2936,7 +3081,7 @@ program = "true"
                 .expect("build")
                 .build
                 .status,
-            BuildStatus::Queued
+            BuildStatus::Running
         );
         assert!(reopened.delete_remote_attempt(build.id).expect("delete"));
         assert!(
