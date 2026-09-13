@@ -38,6 +38,7 @@ fn main() {
                         bind,
                         auth_token: None,
                         auth_policy_file: None,
+                        auth_users_file: None,
                         webhook_secret: None,
                         github_webhook_secret: None,
                         gitlab_webhook_secret: None,

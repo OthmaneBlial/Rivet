@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.73 / 100** · displayed conservatively as the
+Weighted evidence score: **92.75 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -29,7 +29,8 @@ controls, signed generic webhook delivery with idempotent redelivery,
 policy-backed API identities with role/project authorization,
 secret-parameter redaction/masking, a passphrase-encrypted SCM credential vault
 with typed HTTP/SSH credentials, non-secret credential references, project allow-lists,
-and deployment-specific OS-keychain service/account isolation, and a packaged desktop launch with an
+deployment-specific OS-keychain service/account isolation, and local user accounts
+with Argon2id password verification, opaque sessions, and a packaged desktop launch with an
 ephemeral loopback engine origin, project-scoped local CI cache restore and
 save, explicit Docker/Podman container command assembly with bounded workspace mounts,
 and a bounded Jenkinsfile migration analyzer with line-level support findings
@@ -270,13 +271,30 @@ legacy records without it remain non-expiring. Authenticated requests also
 produce bounded audit records available to administrators at
 `GET /api/v1/audit`; request bodies and Bearer values are never recorded.
 
-For a server deployment, an already authenticated operator or viewer can call
-`POST /api/v1/auth/sessions` to receive one opaque twelve-hour session token.
-Use it as `Authorization: Bearer <session-token>` and revoke it with
-`DELETE /api/v1/auth/sessions/current`. Rivet stores only the token digest in
-SQLite, expires sessions at lookup time, prunes expired/revoked rows, and
-records session creation/revocation in the administrator audit stream. User
-accounts and external identity providers remain future gates.
+For a server deployment, local human accounts can be kept in a separate private
+file. The CLI stores only Argon2id password verifiers and enforces a minimum
+password length, while account lifecycle output never includes password data:
+
+```sh
+cargo run -p rivet -- auth user create admin@example.test \
+  --role admin --users-file /secure/path/rivet.users.json \
+  --password-file /secure/path/admin.password
+cargo run -p rivet -- auth user list \
+  --users-file /secure/path/rivet.users.json
+cargo run -p rivet -- --data-dir .rivet server \
+  --bind 0.0.0.0:7878 --auth-users-file /secure/path/rivet.users.json
+```
+
+The users file must be a private regular file. Accounts can be enabled,
+disabled, removed, or have their password rotated with the corresponding
+`auth user` commands; the last active administrator cannot be disabled or
+removed. `POST /api/v1/auth/login` accepts a username and password and returns
+one opaque twelve-hour session token. Use it as `Authorization: Bearer
+<session-token>` and revoke it with `DELETE /api/v1/auth/sessions/current`.
+Rivet stores only the session digest in SQLite, expires sessions at lookup time,
+prunes expired/revoked rows, and records login and session lifecycle events in
+the administrator audit stream. External identity providers remain a future
+gate.
 
 Recorded Jenkins/Rivet behavior snapshots can be compared locally with the
 same explicit normalizer used by future live adapters:

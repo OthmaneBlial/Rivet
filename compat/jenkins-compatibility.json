@@ -124,8 +124,8 @@
       "category": "Security",
       "feature": "Protected server API transport",
       "status": "partial",
-      "evidence": ["crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
-      "notes": "Public liveness and SQLite-backed readiness probes, optional in-memory Bearer-token protection, mandatory authentication for non-loopback binds, exact CORS origins, request limits, baseline security headers, and a private policy file with digest-backed roles, project-scoped route authorization, local token creation/listing/revocation, optional RFC3339 expiration enforcement, and bounded admin-only authentication audit history are supported; user accounts, sessions, and external identity providers remain planned."
+      "evidence": ["crates/rivet-auth/src/lib.rs", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs", "scripts/local-auth-smoke.sh"],
+      "notes": "Public liveness and SQLite-backed readiness probes, optional in-memory Bearer-token protection, mandatory authentication for non-loopback binds, exact CORS origins, request limits, baseline security headers, and private policy files with digest-backed tokens, project-scoped route authorization, Argon2id local user accounts, password login, persisted opaque sessions, and bounded admin-only authentication audit history are supported; external identity providers remain planned."
     },
     {
       "category": "Security",

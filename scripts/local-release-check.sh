@@ -40,10 +40,13 @@ else
     exit 1
 fi
 
-echo "[7/8] exercising the real local CLI workflow"
+echo "[7/9] exercising the real local CLI workflow"
 ./scripts/local-e2e-smoke.sh
 
-echo "[8/8] writing the local release manifest"
+echo "[8/9] exercising local user authentication"
+./scripts/local-auth-smoke.sh
+
+echo "[9/9] writing the local release manifest"
 jq -n \
     --arg commit "$(git rev-parse HEAD)" \
     --arg generated_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
@@ -52,7 +55,7 @@ jq -n \
     '{schema_version: 1, source_commit: $commit, generated_at: $generated_at,
       github_actions: false, checks: {format: true, workspace_tests: true,
       cli_release_build: true, desktop_web_build: true, tauri_host_check: true,
-      local_e2e_smoke: true},
+      local_e2e_smoke: true, local_auth_smoke: true},
       artifacts: [{name: $binary, path: $binary, sha256: $sha256}]}' \
     > "$release_output/manifest.json"
 test -x "$release_output/rivet"

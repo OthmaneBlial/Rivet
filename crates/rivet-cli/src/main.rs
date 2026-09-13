@@ -8,7 +8,8 @@ use rivet_agent_protocol::{
     PROTOCOL_VERSION, WorkspaceTransfer,
 };
 use rivet_auth::{
-    ApiTokenRecord, AuthPolicy, AuthPolicyDocument, Role as AuthRole, generate_token, token_digest,
+    AUTH_USERS_VERSION, ApiTokenRecord, AuthPolicy, AuthPolicyDocument, AuthUserRecord, AuthUsers,
+    AuthUsersDocument, Role as AuthRole, generate_token, hash_password, token_digest,
 };
 use rivet_compat::{BehaviorFixture, compare_fixture};
 use rivet_core::{
@@ -292,6 +293,9 @@ enum Command {
         /// Open a private SHA-256 token policy with roles and project scopes.
         #[arg(long)]
         auth_policy_file: Option<PathBuf>,
+        /// Open a private local-account policy with Argon2id password hashes.
+        #[arg(long)]
+        auth_users_file: Option<PathBuf>,
         /// Read the generic webhook HMAC secret from a private file.
         #[arg(long)]
         webhook_secret_file: Option<PathBuf>,
@@ -454,6 +458,58 @@ enum AuthCommand {
     Token {
         #[command(subcommand)]
         command: AuthTokenCommand,
+    },
+    /// Manage private local user accounts.
+    User {
+        #[command(subcommand)]
+        command: AuthUserCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthUserCommand {
+    /// Create a local user with a password read from a private file.
+    Create {
+        username: String,
+        #[arg(long, value_enum, default_value_t = AuthRoleArg::Viewer)]
+        role: AuthRoleArg,
+        #[arg(long = "project")]
+        projects: Vec<String>,
+        #[arg(long)]
+        users_file: PathBuf,
+        #[arg(long)]
+        password_file: PathBuf,
+    },
+    /// List user IDs, roles, project scopes, and disabled state.
+    List {
+        #[arg(long)]
+        users_file: PathBuf,
+    },
+    /// Disable one username without removing its policy record.
+    Disable {
+        username: String,
+        #[arg(long)]
+        users_file: PathBuf,
+    },
+    /// Re-enable one username.
+    Enable {
+        username: String,
+        #[arg(long)]
+        users_file: PathBuf,
+    },
+    /// Replace one user's password from a private file.
+    Password {
+        username: String,
+        #[arg(long)]
+        users_file: PathBuf,
+        #[arg(long)]
+        password_file: PathBuf,
+    },
+    /// Remove one username while keeping at least one active administrator.
+    Remove {
+        username: String,
+        #[arg(long)]
+        users_file: PathBuf,
     },
 }
 
@@ -700,6 +756,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bind,
             token_file,
             auth_policy_file,
+            auth_users_file,
             webhook_secret_file,
             github_webhook_secret_file,
             gitlab_webhook_secret_file,
@@ -736,6 +793,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     bind,
                     auth_token,
                     auth_policy_file,
+                    auth_users_file,
                     webhook_secret,
                     github_webhook_secret,
                     gitlab_webhook_secret,
@@ -755,7 +813,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Scm { command } => inspect_scm(command).await?,
         Command::Schedule { command } => manage_schedule(&cli.data_dir, command)?,
         Command::Credential { command } => manage_credentials(&cli.data_dir, command)?,
-        Command::Auth { command } => manage_auth(command)?,
+        Command::Auth { command } => manage_auth(&cli.data_dir, command)?,
         Command::Cache { command } => manage_cache(&cli.data_dir, command)?,
         Command::Analyze { command } => analyze_file(command)?,
         Command::Compat { command } => compare_compatibility(command)?,
@@ -1781,78 +1839,260 @@ fn read_webhook_secret(path: &Path) -> Result<String, Box<dyn std::error::Error>
     read_private_value(path, "webhook secret")
 }
 
-fn manage_auth(command: AuthCommand) -> Result<(), Box<dyn std::error::Error>> {
-    let AuthCommand::Token { command } = command;
+fn manage_auth(_data_dir: &Path, command: AuthCommand) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        AuthTokenCommand::Create {
-            id,
-            role,
-            projects,
-            policy_file,
-            token_file,
-            expires_at,
-        } => {
-            if policy_file == token_file {
-                return Err("policy file and token file must be different paths".into());
-            }
-            let mut document = load_auth_policy_for_create(&policy_file)?;
-            let token = generate_token()?;
-            let role: AuthRole = role.into();
-            let expires_at = parse_token_expiry(expires_at.as_deref())?;
-            document.tokens.push(ApiTokenRecord {
-                id: id.clone(),
-                sha256: token_digest(&token),
+        AuthCommand::Token { command } => match command {
+            AuthTokenCommand::Create {
+                id,
                 role,
                 projects,
+                policy_file,
+                token_file,
                 expires_at,
-            });
-            AuthPolicy::from_document(document.clone())?;
+            } => {
+                if policy_file == token_file {
+                    return Err("policy file and token file must be different paths".into());
+                }
+                let mut document = load_auth_policy_for_create(&policy_file)?;
+                let token = generate_token()?;
+                let role: AuthRole = role.into();
+                let expires_at = parse_token_expiry(expires_at.as_deref())?;
+                document.tokens.push(ApiTokenRecord {
+                    id: id.clone(),
+                    sha256: token_digest(&token),
+                    role,
+                    projects,
+                    expires_at,
+                });
+                AuthPolicy::from_document(document.clone())?;
 
-            write_private_atomic(&token_file, token.as_bytes(), false, "token file")?;
-            if let Err(error) = write_auth_policy(&policy_file, &document) {
-                let _ = fs::remove_file(&token_file);
-                return Err(error);
+                write_private_atomic(&token_file, token.as_bytes(), false, "token file")?;
+                if let Err(error) = write_auth_policy(&policy_file, &document) {
+                    let _ = fs::remove_file(&token_file);
+                    return Err(error);
+                }
+                println!("Created {role:?} token {id}");
+                println!("Token saved to {}", token_file.display());
             }
-            println!("Created {role:?} token {id}");
-            println!("Token saved to {}", token_file.display());
+            AuthTokenCommand::List { policy_file } => {
+                let document = load_auth_policy_document(&policy_file)?;
+                for token in document.tokens {
+                    let projects = if token.projects.is_empty() {
+                        "*".to_owned()
+                    } else {
+                        token.projects.join(",")
+                    };
+                    let expires_at = token
+                        .expires_at
+                        .map(|value| value.to_rfc3339())
+                        .unwrap_or_else(|| "never".to_owned());
+                    println!(
+                        "{}\t{:?}\t{}\t{}",
+                        token.id, token.role, projects, expires_at
+                    );
+                }
+            }
+            AuthTokenCommand::Revoke { id, policy_file } => {
+                let mut document = load_auth_policy_document(&policy_file)?;
+                let original_len = document.tokens.len();
+                document.tokens.retain(|token| token.id != id);
+                if document.tokens.len() == original_len {
+                    return Err(format!("authentication token not found: {id}").into());
+                }
+                if document.tokens.is_empty() {
+                    return Err(
+                        "cannot revoke the last authentication token; create a replacement first"
+                            .into(),
+                    );
+                }
+                AuthPolicy::from_document(document.clone())?;
+                write_auth_policy(&policy_file, &document)?;
+                println!("Revoked token {id}");
+            }
+        },
+        AuthCommand::User { command } => manage_auth_user(command)?,
+    }
+    Ok(())
+}
+
+fn manage_auth_user(command: AuthUserCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        AuthUserCommand::Create {
+            username,
+            role,
+            projects,
+            users_file,
+            password_file,
+        } => {
+            if users_file == password_file {
+                return Err("users file and password file must be different paths".into());
+            }
+            let password = read_private_value(&password_file, "user password")?;
+            let mut document = load_auth_users_for_create(&users_file)?;
+            if document
+                .users
+                .iter()
+                .any(|user| user.username.eq_ignore_ascii_case(&username))
+            {
+                return Err(format!("authentication username already exists: {username}").into());
+            }
+            document.users.push(AuthUserRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                username: username.clone(),
+                password_hash: hash_password(&password)?,
+                role: role.into(),
+                projects,
+                disabled: false,
+            });
+            write_auth_users(&users_file, &document)?;
+            println!("Created local user {username}");
         }
-        AuthTokenCommand::List { policy_file } => {
-            let document = load_auth_policy_document(&policy_file)?;
-            for token in document.tokens {
-                let projects = if token.projects.is_empty() {
+        AuthUserCommand::List { users_file } => {
+            let document = load_auth_users_document(&users_file)?;
+            for user in document.users {
+                let projects = if user.projects.is_empty() {
                     "*".to_owned()
                 } else {
-                    token.projects.join(",")
+                    user.projects.join(",")
                 };
-                let expires_at = token
-                    .expires_at
-                    .map(|value| value.to_rfc3339())
-                    .unwrap_or_else(|| "never".to_owned());
                 println!(
-                    "{}\t{:?}\t{}\t{}",
-                    token.id, token.role, projects, expires_at
+                    "{}\t{}\t{}\t{}\t{}",
+                    user.id,
+                    user.username,
+                    auth_role_label(user.role),
+                    projects,
+                    if user.disabled { "disabled" } else { "active" }
                 );
             }
         }
-        AuthTokenCommand::Revoke { id, policy_file } => {
-            let mut document = load_auth_policy_document(&policy_file)?;
-            let original_len = document.tokens.len();
-            document.tokens.retain(|token| token.id != id);
-            if document.tokens.len() == original_len {
-                return Err(format!("authentication token not found: {id}").into());
+        AuthUserCommand::Disable {
+            username,
+            users_file,
+        } => update_auth_user_state(&users_file, &username, true)?,
+        AuthUserCommand::Enable {
+            username,
+            users_file,
+        } => update_auth_user_state(&users_file, &username, false)?,
+        AuthUserCommand::Password {
+            username,
+            users_file,
+            password_file,
+        } => {
+            if users_file == password_file {
+                return Err("users file and password file must be different paths".into());
             }
-            if document.tokens.is_empty() {
-                return Err(
-                    "cannot revoke the last authentication token; create a replacement first"
-                        .into(),
-                );
+            let password = read_private_value(&password_file, "user password")?;
+            let mut document = load_auth_users_document(&users_file)?;
+            let user = document
+                .users
+                .iter_mut()
+                .find(|user| user.username.eq_ignore_ascii_case(&username))
+                .ok_or_else(|| format!("authentication username not found: {username}"))?;
+            user.password_hash = hash_password(&password)?;
+            let username = user.username.clone();
+            write_auth_users(&users_file, &document)?;
+            println!("Updated password for local user {username}");
+        }
+        AuthUserCommand::Remove {
+            username,
+            users_file,
+        } => {
+            let mut document = load_auth_users_document(&users_file)?;
+            let position = document
+                .users
+                .iter()
+                .position(|user| user.username.eq_ignore_ascii_case(&username))
+                .ok_or_else(|| format!("authentication username not found: {username}"))?;
+            let user = &document.users[position];
+            if user.role == AuthRole::Admin
+                && !user.disabled
+                && document
+                    .users
+                    .iter()
+                    .filter(|candidate| candidate.role == AuthRole::Admin && !candidate.disabled)
+                    .count()
+                    <= 1
+            {
+                return Err("cannot remove the last active administrator".into());
             }
-            AuthPolicy::from_document(document.clone())?;
-            write_auth_policy(&policy_file, &document)?;
-            println!("Revoked token {id}");
+            let removed = document.users.remove(position);
+            write_auth_users(&users_file, &document)?;
+            println!("Removed local user {}", removed.username);
         }
     }
     Ok(())
+}
+
+fn auth_role_label(role: AuthRole) -> &'static str {
+    match role {
+        AuthRole::Admin => "admin",
+        AuthRole::Operator => "operator",
+        AuthRole::Viewer => "viewer",
+        AuthRole::Agent => "agent",
+    }
+}
+
+fn update_auth_user_state(
+    path: &Path,
+    username: &str,
+    disabled: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut document = load_auth_users_document(path)?;
+    let position = document
+        .users
+        .iter()
+        .position(|user| user.username.eq_ignore_ascii_case(username))
+        .ok_or_else(|| format!("authentication username not found: {username}"))?;
+    if disabled
+        && document.users[position].role == AuthRole::Admin
+        && !document.users[position].disabled
+        && document
+            .users
+            .iter()
+            .filter(|user| user.role == AuthRole::Admin && !user.disabled)
+            .count()
+            <= 1
+    {
+        return Err("cannot disable the last active administrator".into());
+    }
+    document.users[position].disabled = disabled;
+    let username = document.users[position].username.clone();
+    write_auth_users(path, &document)?;
+    println!(
+        "{} local user {username}",
+        if disabled { "Disabled" } else { "Enabled" }
+    );
+    Ok(())
+}
+
+fn load_auth_users_for_create(
+    path: &Path,
+) -> Result<AuthUsersDocument, Box<dyn std::error::Error>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => load_auth_users_document(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AuthUsersDocument {
+            version: AUTH_USERS_VERSION,
+            users: Vec::new(),
+        }),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn load_auth_users_document(path: &Path) -> Result<AuthUsersDocument, Box<dyn std::error::Error>> {
+    let bytes = read_private_bytes(path, "authentication users file")?;
+    let document: AuthUsersDocument = serde_json::from_slice(&bytes)?;
+    AuthUsers::from_document(document.clone())?;
+    Ok(document)
+}
+
+fn write_auth_users(
+    path: &Path,
+    document: &AuthUsersDocument,
+) -> Result<(), Box<dyn std::error::Error>> {
+    AuthUsers::from_document(document.clone())?;
+    let mut bytes = serde_json::to_vec_pretty(document)?;
+    bytes.push(b'\n');
+    write_private_atomic(path, &bytes, true, "authentication users file")
 }
 
 fn manage_cache(data_dir: &Path, command: CacheCommand) -> Result<(), Box<dyn std::error::Error>> {

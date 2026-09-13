@@ -20,7 +20,7 @@ use rivet_agent_protocol::{
     PROTOCOL_VERSION, WorkspaceTransfer,
 };
 use rivet_auth::{
-    AuthError, AuthPolicy, Permission, Principal, Role, generate_token, token_digest,
+    AuthError, AuthPolicy, AuthUsers, Permission, Principal, Role, generate_token, token_digest,
 };
 use rivet_core::{
     BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, Pipeline, Project, ScheduleId,
@@ -84,6 +84,7 @@ pub struct AppState {
     events: broadcast::Sender<BuildEvent>,
     auth_digest: Option<[u8; 32]>,
     auth_policy: Option<Arc<AuthPolicy>>,
+    auth_users: Option<Arc<AuthUsers>>,
     webhook_secret: Option<Vec<u8>>,
     github_webhook_secret: Option<Vec<u8>>,
     gitlab_webhook_secret: Option<Vec<u8>>,
@@ -210,6 +211,8 @@ pub struct ServerConfig {
     pub bind: SocketAddr,
     pub auth_token: Option<String>,
     pub auth_policy_file: Option<PathBuf>,
+    /// Optional private local-account policy with Argon2id password hashes.
+    pub auth_users_file: Option<PathBuf>,
     pub webhook_secret: Option<String>,
     pub github_webhook_secret: Option<String>,
     pub gitlab_webhook_secret: Option<String>,
@@ -242,6 +245,10 @@ pub enum ServerError {
     AuthPolicyFile { path: PathBuf, message: String },
     #[error("authentication policy is invalid: {0}")]
     AuthPolicy(#[from] AuthError),
+    #[error("could not read authentication users file {path}: {message}")]
+    AuthUsersFile { path: PathBuf, message: String },
+    #[error("authentication users policy is invalid: {0}")]
+    AuthUsers(AuthError),
     #[error("Rivet webhook secret cannot be empty")]
     EmptyWebhookSecret,
     #[error("{provider} webhook secret cannot be empty")]
@@ -283,6 +290,10 @@ enum ApiError {
     ArtifactRead(#[source] std::io::Error),
     #[error("credential vault is not configured")]
     CredentialsUnavailable,
+    #[error("local user authentication is not configured")]
+    AuthUsersUnavailable,
+    #[error("invalid username or password")]
+    InvalidCredentials,
     #[error("extension runtime is not configured")]
     ExtensionsUnavailable,
     #[error(transparent)]
@@ -346,6 +357,8 @@ impl IntoResponse for ApiError {
             Self::ArtifactNotFound(_) => StatusCode::NOT_FOUND,
             Self::ArtifactRead(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::CredentialsUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::AuthUsersUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::InvalidCredentials => StatusCode::UNAUTHORIZED,
             Self::ExtensionsUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::ExtensionManager(_) => StatusCode::BAD_REQUEST,
             Self::Credentials(error) => match error {
@@ -416,6 +429,12 @@ struct AuthSessionResponse {
     id: uuid::Uuid,
     session_token: String,
     expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthLoginRequest {
+    username: String,
+    password: String,
 }
 
 const AUTH_SESSION_TTL_SECONDS: i64 = 12 * 60 * 60;
@@ -578,6 +597,7 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
     Ok(Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/ready", get(readiness))
+        .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/me", get(auth_me))
         .route("/api/v1/auth/sessions", post(create_session))
         .route(
@@ -794,6 +814,7 @@ pub async fn serve(storage_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(
             bind,
             auth_token: None,
             auth_policy_file: None,
+            auth_users_file: None,
             webhook_secret: None,
             github_webhook_secret: None,
             gitlab_webhook_secret: None,
@@ -838,6 +859,12 @@ pub async fn serve_with_listener(
         .auth_policy_file
         .as_deref()
         .map(load_auth_policy)
+        .transpose()?
+        .map(Arc::new);
+    let auth_users = config
+        .auth_users_file
+        .as_deref()
+        .map(load_auth_users)
         .transpose()?
         .map(Arc::new);
     let credentials = match (
@@ -904,6 +931,7 @@ pub async fn serve_with_listener(
         credentials,
     );
     state.auth_policy = auth_policy;
+    state.auth_users = auth_users;
     state.extensions = Arc::new(extensions);
     state.extension_manager = extension_manager;
     state.github_webhook_secret = config
@@ -940,6 +968,7 @@ fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
     if !config.bind.ip().is_loopback()
         && config.auth_token.is_none()
         && config.auth_policy_file.is_none()
+        && config.auth_users_file.is_none()
     {
         return Err(ServerError::AuthRequired(config.bind));
     }
@@ -1064,6 +1093,40 @@ fn load_auth_policy(path: &Path) -> Result<AuthPolicy, ServerError> {
     AuthPolicy::from_json(&bytes).map_err(ServerError::AuthPolicy)
 }
 
+fn load_auth_users(path: &Path) -> Result<AuthUsers, ServerError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| ServerError::AuthUsersFile {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(ServerError::AuthUsersFile {
+            path: path.to_path_buf(),
+            message: "symbolic links are not accepted".into(),
+        });
+    }
+    if !metadata.is_file() {
+        return Err(ServerError::AuthUsersFile {
+            path: path.to_path_buf(),
+            message: "path is not a regular file".into(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(ServerError::AuthUsersFile {
+                path: path.to_path_buf(),
+                message: "file must not be group- or world-readable".into(),
+            });
+        }
+    }
+    let bytes = std::fs::read(path).map_err(|error| ServerError::AuthUsersFile {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    AuthUsers::from_json(&bytes).map_err(ServerError::AuthUsers)
+}
+
 impl AppState {
     pub fn new(storage: Storage) -> Self {
         let (events, _) = broadcast::channel(1024);
@@ -1075,6 +1138,7 @@ impl AppState {
             events,
             auth_digest: None,
             auth_policy: None,
+            auth_users: None,
             webhook_secret: None,
             github_webhook_secret: None,
             gitlab_webhook_secret: None,
@@ -1122,6 +1186,29 @@ async fn auth_me(Extension(principal): Extension<Principal>) -> Json<AuthMeRespo
     })
 }
 
+async fn login(
+    State(state): State<AppState>,
+    axum::extract::Json(request): axum::extract::Json<AuthLoginRequest>,
+) -> Result<Json<AuthSessionResponse>, ApiError> {
+    let users = state
+        .auth_users
+        .as_deref()
+        .ok_or(ApiError::AuthUsersUnavailable)?;
+    let principal = users
+        .authenticate(&request.username, &request.password)
+        .ok_or_else(|| {
+            record_auth_audit(&state.storage, None, "/api/v1/auth/login", "failure");
+            ApiError::InvalidCredentials
+        })?;
+    record_auth_audit(
+        &state.storage,
+        Some(principal.id()),
+        "/api/v1/auth/login",
+        "success",
+    );
+    issue_session(&state, &principal).await
+}
+
 async fn create_session(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1133,6 +1220,13 @@ async fn create_session(
         ));
     }
 
+    issue_session(&state, &principal).await
+}
+
+async fn issue_session(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<Json<AuthSessionResponse>, ApiError> {
     let created_at = Utc::now();
     let expires_at = created_at + chrono::Duration::seconds(AUTH_SESSION_TTL_SECONDS);
     let raw_token = generate_token()?;
@@ -1336,12 +1430,16 @@ async fn authenticate(
     mut request: axum::http::Request<Body>,
     next: Next,
 ) -> Response {
-    let auth_enabled = state.auth_digest.is_some() || state.auth_policy.is_some();
+    let auth_enabled =
+        state.auth_digest.is_some() || state.auth_policy.is_some() || state.auth_users.is_some();
     if !auth_enabled {
         request.extensions_mut().insert(Principal::local_admin());
         return next.run(request).await;
     }
-    if matches!(request.uri().path(), "/api/v1/health" | "/api/v1/ready") {
+    if matches!(
+        request.uri().path(),
+        "/api/v1/health" | "/api/v1/ready" | "/api/v1/auth/login"
+    ) {
         return next.run(request).await;
     }
     let principal = request
@@ -4869,7 +4967,10 @@ mod tests {
         AgentCapabilities, AgentHeartbeat, AgentMessage, AgentRegistration, AgentRequirements,
         AgentTransportMessage, PROTOCOL_VERSION,
     };
-    use rivet_auth::{ApiTokenRecord, AuthPolicyDocument, Role};
+    use rivet_auth::{
+        AUTH_USERS_VERSION, ApiTokenRecord, AuthPolicyDocument, AuthUserRecord, AuthUsers,
+        AuthUsersDocument, Role, hash_password,
+    };
     use rivet_extension_protocol::{
         ExtensionKind, ExtensionMessage, ExtensionPermission, encode_message,
     };
@@ -4919,12 +5020,101 @@ mod tests {
         assert!(payload.get("error").is_none());
     }
 
+    #[tokio::test]
+    async fn local_user_login_issues_a_session_and_protects_routes() {
+        let storage = Storage::open_in_memory().expect("storage");
+        let password_hash = hash_password("a-correct-local-password").expect("password hash");
+        let mut state = AppState::new(storage);
+        state.auth_users = Some(Arc::new(
+            AuthUsers::from_document(AuthUsersDocument {
+                version: AUTH_USERS_VERSION,
+                users: vec![AuthUserRecord {
+                    id: "operator-1".into(),
+                    username: "operator@example.test".into(),
+                    password_hash,
+                    role: Role::Operator,
+                    projects: vec!["demo".into()],
+                    disabled: false,
+                }],
+            })
+            .expect("users"),
+        ));
+        let app = router(state);
+        let login_body = serde_json::to_vec(&serde_json::json!({
+            "username": "OPERATOR@example.test",
+            "password": "a-correct-local-password"
+        }))
+        .expect("login body");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(login_body))
+                    .expect("login request"),
+            )
+            .await
+            .expect("login response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("login response body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("login JSON");
+        let session_token = payload["session_token"].as_str().expect("session token");
+        assert!(!session_token.is_empty());
+        assert!(
+            !body
+                .windows(b"a-correct-local-password".len())
+                .any(|window| { window == b"a-correct-local-password" })
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .header("authorization", format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("me request"),
+            )
+            .await
+            .expect("me response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("me body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("me JSON");
+        assert_eq!(payload["id"], "operator-1");
+        assert_eq!(payload["role"], "operator");
+
+        let wrong_body = serde_json::to_vec(&serde_json::json!({
+            "username": "operator@example.test",
+            "password": "wrong-password"
+        }))
+        .expect("wrong login body");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(wrong_body))
+                    .expect("wrong login request"),
+            )
+            .await
+            .expect("wrong login response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
     fn keychain_service_requires_an_explicit_account() {
         let config = ServerConfig {
             bind: "127.0.0.1:7878".parse().expect("bind"),
             auth_token: None,
             auth_policy_file: None,
+            auth_users_file: None,
             webhook_secret: None,
             github_webhook_secret: None,
             gitlab_webhook_secret: None,
@@ -4951,6 +5141,7 @@ mod tests {
             bind: "127.0.0.1:7878".parse().expect("bind"),
             auth_token: None,
             auth_policy_file: None,
+            auth_users_file: None,
             webhook_secret: None,
             github_webhook_secret: None,
             gitlab_webhook_secret: None,

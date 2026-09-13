@@ -4,6 +4,7 @@
 //! supplied at runtime, hashed for comparison, and never represented by a
 //! persisted or debug-printable value in this crate.
 
+use argon2::Argon2;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,6 +19,14 @@ const TOKEN_DIGEST_BYTES: usize = 32;
 const GENERATED_TOKEN_BYTES: usize = 32;
 const MAX_TOKEN_ID_BYTES: usize = 64;
 const MAX_PROJECT_NAME_BYTES: usize = 128;
+const MAX_USERNAME_BYTES: usize = 128;
+const PASSWORD_SALT_BYTES: usize = 16;
+const PASSWORD_DERIVED_BYTES: usize = 32;
+const MIN_PASSWORD_BYTES: usize = 12;
+const MAX_PASSWORD_BYTES: usize = 4096;
+const PASSWORD_HASH_PREFIX: &str = "rivet-argon2id-v1";
+
+pub const AUTH_USERS_VERSION: u8 = 1;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthError {
@@ -37,6 +46,22 @@ pub enum AuthError {
     Randomness(String),
     #[error("authentication policy JSON is invalid: {0}")]
     InvalidJson(String),
+    #[error("authentication user policy must contain at least one user")]
+    EmptyUserPolicy,
+    #[error("authentication username is empty, too long, or contains control characters")]
+    InvalidUsername,
+    #[error("authentication user IDs must be unique: {0}")]
+    DuplicateUserId(String),
+    #[error("authentication usernames must be unique: {0}")]
+    DuplicateUsername(String),
+    #[error(
+        "authentication password must contain at least {MIN_PASSWORD_BYTES} bytes and at most {MAX_PASSWORD_BYTES} bytes"
+    )]
+    WeakPassword,
+    #[error("authentication password hash is invalid")]
+    InvalidPasswordHash,
+    #[error("authentication password hashing failed: {0}")]
+    PasswordHashing(String),
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -81,6 +106,171 @@ pub struct ApiTokenRecord {
     pub projects: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Private, file-backed local accounts. The password field contains only an
+/// Argon2id-derived verifier; this record is never returned by an API route.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AuthUserRecord {
+    pub id: String,
+    pub username: String,
+    pub password_hash: String,
+    pub role: Role,
+    #[serde(default)]
+    pub projects: Vec<String>,
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AuthUsersDocument {
+    pub version: u8,
+    pub users: Vec<AuthUserRecord>,
+}
+
+impl AuthUsersDocument {
+    pub fn empty() -> Self {
+        Self {
+            version: AUTH_USERS_VERSION,
+            users: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthUsers {
+    document: AuthUsersDocument,
+}
+
+impl AuthUsers {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, AuthError> {
+        let document: AuthUsersDocument = serde_json::from_slice(bytes)
+            .map_err(|error| AuthError::InvalidJson(error.to_string()))?;
+        Self::from_document(document)
+    }
+
+    pub fn from_document(document: AuthUsersDocument) -> Result<Self, AuthError> {
+        if document.version != AUTH_USERS_VERSION {
+            return Err(AuthError::UnsupportedVersion(document.version));
+        }
+        if document.users.is_empty() {
+            return Err(AuthError::EmptyUserPolicy);
+        }
+
+        let mut ids = BTreeSet::new();
+        let mut usernames = BTreeSet::new();
+        for user in &document.users {
+            validate_token_id(&user.id)?;
+            if !ids.insert(user.id.clone()) {
+                return Err(AuthError::DuplicateUserId(user.id.clone()));
+            }
+            validate_username(&user.username)?;
+            let username_key = user.username.to_ascii_lowercase();
+            if !usernames.insert(username_key) {
+                return Err(AuthError::DuplicateUsername(user.username.clone()));
+            }
+            validate_password_hash(&user.password_hash)?;
+            for project in &user.projects {
+                validate_project_scope(project)?;
+            }
+        }
+        Ok(Self { document })
+    }
+
+    pub fn document(&self) -> &AuthUsersDocument {
+        &self.document
+    }
+
+    pub fn authenticate(&self, username: &str, password: &str) -> Option<Principal> {
+        let user = self
+            .document
+            .users
+            .iter()
+            .find(|user| user.username.eq_ignore_ascii_case(username))?;
+        if user.disabled || !verify_password(&user.password_hash, password) {
+            return None;
+        }
+        Some(Principal::from_parts(
+            user.id.clone(),
+            user.role,
+            user.projects.clone(),
+        ))
+    }
+}
+
+/// Hash a local account password for private policy-file storage.
+pub fn hash_password(password: &str) -> Result<String, AuthError> {
+    validate_password(password)?;
+    let mut salt = [0_u8; PASSWORD_SALT_BYTES];
+    getrandom::fill(&mut salt).map_err(|error| AuthError::PasswordHashing(error.to_string()))?;
+    let mut derived = [0_u8; PASSWORD_DERIVED_BYTES];
+    Argon2::default()
+        .hash_password_into(password.as_bytes(), &salt, &mut derived)
+        .map_err(|error| AuthError::PasswordHashing(error.to_string()))?;
+    Ok(format!(
+        "{PASSWORD_HASH_PREFIX}${}${}",
+        hex::encode(salt),
+        hex::encode(derived)
+    ))
+}
+
+fn verify_password(hash: &str, password: &str) -> bool {
+    let Ok((salt, expected)) = parse_password_hash(hash) else {
+        return false;
+    };
+    if validate_password(password).is_err() {
+        return false;
+    }
+    let mut derived = [0_u8; PASSWORD_DERIVED_BYTES];
+    if Argon2::default()
+        .hash_password_into(password.as_bytes(), &salt, &mut derived)
+        .is_err()
+    {
+        return false;
+    }
+    bool::from(derived.as_slice().ct_eq(expected.as_slice()))
+}
+
+fn validate_password_hash(hash: &str) -> Result<(), AuthError> {
+    parse_password_hash(hash).map(|_| ())
+}
+
+fn parse_password_hash(
+    hash: &str,
+) -> Result<([u8; PASSWORD_SALT_BYTES], [u8; PASSWORD_DERIVED_BYTES]), AuthError> {
+    let fields = hash.split('$').collect::<Vec<_>>();
+    if fields.len() != 3 || fields[0] != PASSWORD_HASH_PREFIX {
+        return Err(AuthError::InvalidPasswordHash);
+    }
+    let salt = hex::decode(fields[1]).map_err(|_| AuthError::InvalidPasswordHash)?;
+    let derived = hex::decode(fields[2]).map_err(|_| AuthError::InvalidPasswordHash)?;
+    let salt = salt
+        .try_into()
+        .map_err(|_| AuthError::InvalidPasswordHash)?;
+    let derived = derived
+        .try_into()
+        .map_err(|_| AuthError::InvalidPasswordHash)?;
+    Ok((salt, derived))
+}
+
+fn validate_password(password: &str) -> Result<(), AuthError> {
+    if password.len() < MIN_PASSWORD_BYTES
+        || password.len() > MAX_PASSWORD_BYTES
+        || password.chars().all(char::is_whitespace)
+    {
+        return Err(AuthError::WeakPassword);
+    }
+    Ok(())
+}
+
+fn validate_username(username: &str) -> Result<(), AuthError> {
+    if username.trim().is_empty()
+        || username.len() > MAX_USERNAME_BYTES
+        || username.chars().any(char::is_control)
+    {
+        return Err(AuthError::InvalidUsername);
+    }
+    Ok(())
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -441,5 +631,86 @@ mod tests {
         ))
         .expect("legacy token record");
         assert!(legacy.expires_at.is_none());
+    }
+
+    #[test]
+    fn local_user_passwords_are_salted_and_verified_without_plaintext() {
+        let first = hash_password("a-correct-local-password").expect("hash");
+        let second = hash_password("a-correct-local-password").expect("hash");
+        assert_ne!(first, second);
+        assert!(!first.contains("a-correct-local-password"));
+
+        let users = AuthUsers::from_document(AuthUsersDocument {
+            version: AUTH_USERS_VERSION,
+            users: vec![AuthUserRecord {
+                id: "user-1".into(),
+                username: "operator@example.test".into(),
+                password_hash: first,
+                role: Role::Operator,
+                projects: vec!["demo".into()],
+                disabled: false,
+            }],
+        })
+        .expect("users");
+        let principal = users
+            .authenticate("OPERATOR@example.test", "a-correct-local-password")
+            .expect("principal");
+        assert_eq!(principal.id(), "user-1");
+        assert!(principal.can_project(Permission::Build, "demo"));
+        assert!(
+            users
+                .authenticate("operator@example.test", "wrong-password")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn local_user_policy_rejects_duplicates_disabled_users_and_weak_passwords() {
+        assert!(matches!(
+            hash_password("short"),
+            Err(AuthError::WeakPassword)
+        ));
+        let hash = hash_password("a-correct-local-password").expect("hash");
+        let duplicate = AuthUsers::from_document(AuthUsersDocument {
+            version: AUTH_USERS_VERSION,
+            users: vec![
+                AuthUserRecord {
+                    id: "user-1".into(),
+                    username: "one@example.test".into(),
+                    password_hash: hash.clone(),
+                    role: Role::Viewer,
+                    projects: vec![],
+                    disabled: false,
+                },
+                AuthUserRecord {
+                    id: "user-2".into(),
+                    username: "ONE@example.test".into(),
+                    password_hash: hash,
+                    role: Role::Viewer,
+                    projects: vec![],
+                    disabled: false,
+                },
+            ],
+        });
+        assert!(matches!(duplicate, Err(AuthError::DuplicateUsername(_))));
+
+        let disabled_hash = hash_password("a-correct-local-password").expect("hash");
+        let disabled = AuthUsers::from_document(AuthUsersDocument {
+            version: AUTH_USERS_VERSION,
+            users: vec![AuthUserRecord {
+                id: "disabled".into(),
+                username: "disabled@example.test".into(),
+                password_hash: disabled_hash,
+                role: Role::Viewer,
+                projects: vec![],
+                disabled: true,
+            }],
+        })
+        .expect("disabled users");
+        assert!(
+            disabled
+                .authenticate("disabled@example.test", "a-correct-local-password")
+                .is_none()
+        );
     }
 }
