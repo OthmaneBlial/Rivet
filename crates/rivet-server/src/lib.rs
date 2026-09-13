@@ -17,7 +17,7 @@ use hmac::{Hmac, Mac};
 use rivet_agent_protocol::{
     AgentMessage, AgentRequirements, MAX_WORKSPACE_CHUNK_BYTES, PROTOCOL_VERSION, WorkspaceTransfer,
 };
-use rivet_auth::{AuthError, AuthPolicy, Principal};
+use rivet_auth::{AuthError, AuthPolicy, Permission, Principal};
 use rivet_core::{
     BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, Pipeline, Project, ScheduleId,
     SourceSnapshot,
@@ -96,7 +96,7 @@ pub enum ServerError {
     Storage(#[from] StorageError),
     #[error("could not bind Rivet server: {0}")]
     Bind(#[from] std::io::Error),
-    #[error("binding Rivet outside loopback requires an authentication token: {0}")]
+    #[error("binding Rivet outside loopback requires an authentication token or policy file: {0}")]
     AuthRequired(SocketAddr),
     #[error("Rivet authentication token cannot be empty")]
     EmptyAuthToken,
@@ -135,6 +135,8 @@ enum ApiError {
     ArtifactRead(#[source] std::io::Error),
     #[error("{0}")]
     BadRequest(String),
+    #[error("permission denied: {0}")]
+    Forbidden(String),
     #[error("webhook delivery signatures are not configured")]
     WebhookNotConfigured,
     #[error("invalid webhook signature")]
@@ -170,6 +172,7 @@ impl IntoResponse for ApiError {
             Self::InvalidRepository(_) | Self::InvalidPipeline(_) | Self::BadRequest(_) => {
                 StatusCode::BAD_REQUEST
             }
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::WebhookNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
             Self::InvalidWebhookSignature => StatusCode::UNAUTHORIZED,
             Self::EmptyWebhookEventId
@@ -433,7 +436,9 @@ fn default_remote() -> String {
 async fn get_scm(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
 ) -> Result<Json<GitSnapshot>, ApiError> {
+    require_project(&principal, Permission::Read, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     let repository = GitRepository::open(project.repository_path).await?;
     Ok(Json(repository.inspect().await?))
@@ -442,8 +447,10 @@ async fn get_scm(
 async fn prepare_scm(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
     Json(request): Json<PrepareScmRequest>,
 ) -> Result<Json<GitSnapshot>, ApiError> {
+    require_project(&principal, Permission::Build, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     let repository = GitRepository::open(project.repository_path).await?;
     if request.credential_id.is_some() && !request.fetch {
@@ -732,6 +739,41 @@ fn hash_token(token: &[u8]) -> [u8; 32] {
     Sha256::digest(token).into()
 }
 
+fn require_global(principal: &Principal, permission: Permission) -> Result<(), ApiError> {
+    if principal.can_global(permission) {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(format!(
+            "{} permission is required",
+            permission_label(permission)
+        )))
+    }
+}
+
+fn require_project(
+    principal: &Principal,
+    permission: Permission,
+    project: &str,
+) -> Result<(), ApiError> {
+    if principal.can_project(permission, project) {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(format!(
+            "{} permission is required for this project",
+            permission_label(permission)
+        )))
+    }
+}
+
+fn permission_label(permission: Permission) -> &'static str {
+    match permission {
+        Permission::Read => "read",
+        Permission::Build => "build",
+        Permission::Administer => "administer",
+        Permission::ConnectAgent => "agent-connect",
+    }
+}
+
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
@@ -741,8 +783,10 @@ async fn health() -> Json<HealthResponse> {
 }
 
 async fn analyze_jenkinsfile(
+    Extension(principal): Extension<Principal>,
     Json(request): Json<JenkinsfileAnalysisRequest>,
 ) -> Result<Json<JenkinsfileAnalysisResponse>, ApiError> {
+    require_global(&principal, Permission::Read)?;
     const MAX_JENKINSFILE_BYTES: usize = 200 * 1024;
     if request.source.len() > MAX_JENKINSFILE_BYTES {
         return Err(ApiError::BadRequest(format!(
@@ -757,31 +801,51 @@ async fn analyze_jenkinsfile(
     Ok(Json(JenkinsfileAnalysisResponse { analysis, draft }))
 }
 
-async fn queue_status(State(state): State<AppState>) -> Json<QueueStatusResponse> {
+async fn queue_status(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<QueueStatusResponse>, ApiError> {
+    require_global(&principal, Permission::Read)?;
     let QueueStats {
         queued,
         running,
         capacity,
     } = state.scheduler.stats();
-    Json(QueueStatusResponse {
+    Ok(Json(QueueStatusResponse {
         queued,
         running,
         capacity,
-    })
+    }))
 }
 
-async fn list_projects(State(state): State<AppState>) -> Result<Json<Vec<Project>>, ApiError> {
-    Ok(Json(state.storage.list_projects()?))
+async fn list_projects(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<Project>>, ApiError> {
+    require_global(&principal, Permission::Read)?;
+    let projects = state
+        .storage
+        .list_projects()?
+        .into_iter()
+        .filter(|project| principal.can_project(Permission::Read, &project.name))
+        .collect();
+    Ok(Json(projects))
 }
 
-async fn list_agents(State(state): State<AppState>) -> Json<Vec<AgentSummary>> {
-    Json(state.agents.list(Utc::now()).await)
+async fn list_agents(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<AgentSummary>>, ApiError> {
+    require_global(&principal, Permission::Read)?;
+    Ok(Json(state.agents.list(Utc::now()).await))
 }
 
 async fn match_agents(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Json(request): Json<AgentMatchRequest>,
 ) -> Result<Json<Vec<AgentSummary>>, ApiError> {
+    require_global(&principal, Permission::Read)?;
     state
         .agents
         .matching(&request.requirements, Utc::now())
@@ -792,9 +856,11 @@ async fn match_agents(
 
 async fn connect_agent(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     websocket: WebSocketUpgrade,
-) -> impl IntoResponse {
-    websocket.on_upgrade(move |socket| handle_agent_socket(socket, state))
+) -> Result<impl IntoResponse, ApiError> {
+    require_global(&principal, Permission::ConnectAgent)?;
+    Ok(websocket.on_upgrade(move |socket| handle_agent_socket(socket, state)))
 }
 
 async fn handle_agent_socket(mut socket: WebSocket, state: AppState) {
@@ -1098,7 +1164,9 @@ async fn send_agent_error(socket: &mut WebSocket, code: &str, message: &str) -> 
 async fn list_schedules(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
 ) -> Result<Json<Vec<ScheduleRecord>>, ApiError> {
+    require_project(&principal, Permission::Read, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     Ok(Json(state.storage.list_schedules(project.id)?))
 }
@@ -1106,8 +1174,10 @@ async fn list_schedules(
 async fn create_schedule(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
     Json(request): Json<CreateScheduleRequest>,
 ) -> Result<(StatusCode, Json<ScheduleRecord>), ApiError> {
+    require_project(&principal, Permission::Build, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     let schedule_name = validate_schedule_name(request.name)?;
     let expression = CronExpression::parse(&request.expression)
@@ -1129,8 +1199,10 @@ async fn create_schedule(
 async fn update_schedule(
     State(state): State<AppState>,
     AxumPath((name, schedule_id)): AxumPath<(String, ScheduleId)>,
+    Extension(principal): Extension<Principal>,
     Json(request): Json<UpdateScheduleRequest>,
 ) -> Result<Json<ScheduleRecord>, ApiError> {
+    require_project(&principal, Permission::Build, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     state
         .storage
@@ -1145,7 +1217,9 @@ async fn update_schedule(
 async fn delete_schedule(
     State(state): State<AppState>,
     AxumPath((name, schedule_id)): AxumPath<(String, ScheduleId)>,
+    Extension(principal): Extension<Principal>,
 ) -> Result<StatusCode, ApiError> {
+    require_project(&principal, Permission::Build, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     if state.storage.delete_schedule(project.id, schedule_id)? {
         Ok(StatusCode::NO_CONTENT)
@@ -1159,6 +1233,7 @@ async fn delete_schedule(
 
 async fn webhook_build(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<WebhookBuildResponse>), ApiError> {
@@ -1171,6 +1246,7 @@ async fn webhook_build(
         .map_err(|error| ApiError::BadRequest(format!("invalid webhook JSON: {error}")))?;
     let event_id = validate_webhook_event_id(request.event_id)?;
     let project_name = request.project.trim();
+    require_project(&principal, Permission::Build, project_name)?;
     let project = project_by_name(&state.storage, project_name)?;
 
     if !state
@@ -1356,8 +1432,10 @@ fn validate_schedule_name(name: String) -> Result<String, ApiError> {
 
 async fn create_project(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Json(request): Json<CreateProjectRequest>,
 ) -> Result<(StatusCode, Json<Project>), ApiError> {
+    require_global(&principal, Permission::Administer)?;
     let repository = canonical_directory(&request.repository_path)?;
     let pipeline_path = request
         .pipeline_path
@@ -1380,7 +1458,9 @@ async fn create_project(
 async fn list_builds(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
 ) -> Result<Json<Vec<BuildRecord>>, ApiError> {
+    require_project(&principal, Permission::Read, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     Ok(Json(state.storage.list_builds(project.id)?))
 }
@@ -1388,7 +1468,9 @@ async fn list_builds(
 async fn get_build(
     State(state): State<AppState>,
     AxumPath((name, number)): AxumPath<(String, i64)>,
+    Extension(principal): Extension<Principal>,
 ) -> Result<Json<BuildDetails>, ApiError> {
+    require_project(&principal, Permission::Read, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     let build = build_by_number(&state.storage, project.id, &name, number)?;
     state
@@ -1404,7 +1486,9 @@ async fn get_build(
 async fn get_logs(
     State(state): State<AppState>,
     AxumPath((name, number)): AxumPath<(String, i64)>,
+    Extension(principal): Extension<Principal>,
 ) -> Result<Json<Vec<LogRecord>>, ApiError> {
+    require_project(&principal, Permission::Read, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     let build = build_by_number(&state.storage, project.id, &name, number)?;
     Ok(Json(state.storage.logs(build.id)?))
@@ -1413,7 +1497,9 @@ async fn get_logs(
 async fn get_artifacts(
     State(state): State<AppState>,
     AxumPath((name, number)): AxumPath<(String, i64)>,
+    Extension(principal): Extension<Principal>,
 ) -> Result<Json<Vec<ArtifactRecord>>, ApiError> {
+    require_project(&principal, Permission::Read, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     let build = build_by_number(&state.storage, project.id, &name, number)?;
     Ok(Json(state.storage.artifacts(build.id)?))
@@ -1422,7 +1508,9 @@ async fn get_artifacts(
 async fn download_artifact(
     State(state): State<AppState>,
     AxumPath((name, number, artifact_id)): AxumPath<(String, i64, uuid::Uuid)>,
+    Extension(principal): Extension<Principal>,
 ) -> Result<Response, ApiError> {
+    require_project(&principal, Permission::Read, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     let build = build_by_number(&state.storage, project.id, &name, number)?;
     let Some((artifact, path)) = state.storage.artifact_file(artifact_id)? else {
@@ -1455,8 +1543,10 @@ async fn download_artifact(
 async fn queue_build(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
     request: Option<Json<QueueBuildRequest>>,
 ) -> Result<(StatusCode, Json<QueueBuildResponse>), ApiError> {
+    require_project(&principal, Permission::Build, &name)?;
     let request = request.map(|Json(request)| request).unwrap_or_default();
     let project = project_by_name(&state.storage, &name)?;
     Ok((
@@ -1468,8 +1558,10 @@ async fn queue_build(
 async fn retry_build(
     State(state): State<AppState>,
     AxumPath((name, number)): AxumPath<(String, i64)>,
+    Extension(principal): Extension<Principal>,
     request: Option<Json<QueueBuildRequest>>,
 ) -> Result<(StatusCode, Json<QueueBuildResponse>), ApiError> {
+    require_project(&principal, Permission::Build, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     let pipeline = Pipeline::load(&project.pipeline_path)?;
     let original = build_by_number(&state.storage, project.id, &name, number)?;
@@ -2627,7 +2719,9 @@ fn resolve_git_credential(
 async fn cancel_build(
     State(state): State<AppState>,
     AxumPath((name, number)): AxumPath<(String, i64)>,
+    Extension(principal): Extension<Principal>,
 ) -> Result<StatusCode, ApiError> {
+    require_project(&principal, Permission::Build, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     let build = build_by_number(&state.storage, project.id, &name, number)?;
     let cancellation = state.active_builds.lock().await.get(&build.id).cloned();
@@ -2646,8 +2740,10 @@ async fn cancel_build(
 async fn build_events(
     State(state): State<AppState>,
     AxumPath((name, number)): AxumPath<(String, i64)>,
+    Extension(principal): Extension<Principal>,
     websocket: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, ApiError> {
+    require_project(&principal, Permission::Read, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     let build = build_by_number(&state.storage, project.id, &name, number)?;
     let receiver = state.events.subscribe();
@@ -3185,6 +3281,122 @@ mod tests {
         assert_eq!(payload["role"], "operator");
         assert_eq!(payload["projects"][0], "demo");
         assert_eq!(payload["local_mode"], false);
+    }
+
+    #[tokio::test]
+    async fn policy_project_scopes_filter_reads_and_block_mutations() {
+        let directory = tempdir().expect("tempdir");
+        let repository = directory.path().join("repository");
+        fs::create_dir_all(&repository).expect("repository");
+        let pipeline_path = repository.join("Rivetfile.toml");
+        fs::write(
+            &pipeline_path,
+            "version = 1\nname = \"scope\"\n[[stages]]\nname = \"Test\"\n[[stages.steps]]\nname = \"noop\"\nprogram = \"true\"\n",
+        )
+        .expect("pipeline");
+        let pipeline = Pipeline::load(&pipeline_path).expect("pipeline");
+        let storage = Storage::open_in_memory().expect("storage");
+        for name in ["allowed", "hidden"] {
+            let project = Project::new(
+                name,
+                repository.to_string_lossy().into_owned(),
+                pipeline_path.to_string_lossy().into_owned(),
+            )
+            .expect("project");
+            storage
+                .create_project(&project, &pipeline)
+                .expect("create project");
+        }
+        let raw_token = "scoped-operator-fixture-token";
+        let policy = AuthPolicy::from_document(AuthPolicyDocument {
+            version: 1,
+            tokens: vec![ApiTokenRecord {
+                id: "operator".into(),
+                sha256: hex::encode(Sha256::digest(raw_token.as_bytes())),
+                role: Role::Operator,
+                projects: vec!["allowed".into()],
+            }],
+        })
+        .expect("policy");
+        let mut state = AppState::new(storage);
+        state.auth_policy = Some(Arc::new(policy));
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {raw_token}"),
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let projects: Vec<Project> = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("projects body"),
+        )
+        .expect("projects JSON");
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| project.name.as_str())
+                .collect::<Vec<_>>(),
+            ["allowed"]
+        );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/allowed/builds")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {raw_token}"),
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/hidden/builds")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {raw_token}"),
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {raw_token}"),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"new","repository_path":"/not-used"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
