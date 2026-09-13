@@ -16,6 +16,7 @@ hex.workspace = true
 futures-util = "0.3"
 rivet-core = { path = "../rivet-core" }
 rivet-agent-protocol = { path = "../rivet-agent-protocol" }
+rivet-credentials = { path = "../rivet-credentials" }
 rivet-migration = { path = "../rivet-migration" }
 rivet-runner = { path = "../rivet-runner" }
 rivet-scm = { path = "../rivet-scm" }

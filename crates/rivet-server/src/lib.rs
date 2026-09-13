@@ -21,8 +21,9 @@ use rivet_core::{
     BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, Pipeline, Project, ScheduleId,
     SourceSnapshot,
 };
+use rivet_credentials::{CredentialError, CredentialVault};
 use rivet_runner::{QueueHandle, QueueStats, Scheduler};
-use rivet_scm::{GitPrepareOptions, GitRepository, GitSnapshot, ScmError};
+use rivet_scm::{GitHttpCredential, GitPrepareOptions, GitRepository, GitSnapshot, ScmError};
 use rivet_storage::{
     ArtifactRecord, BuildDetails, BuildRecord, LogRecord, ScheduleRecord, Storage, StorageError,
 };
@@ -65,6 +66,7 @@ pub struct AppState {
     events: broadcast::Sender<BuildEvent>,
     auth_digest: Option<[u8; 32]>,
     webhook_secret: Option<Vec<u8>>,
+    credentials: Option<Arc<CredentialVault>>,
     agents: AgentRegistry,
     remote_messages: Arc<Mutex<HashMap<BuildId, RemoteBuildRoute>>>,
 }
@@ -80,6 +82,8 @@ pub struct ServerConfig {
     pub bind: SocketAddr,
     pub auth_token: Option<String>,
     pub webhook_secret: Option<String>,
+    pub credentials_file: Option<PathBuf>,
+    pub credentials_passphrase: Option<String>,
     pub allowed_origins: Vec<String>,
 }
 
@@ -95,6 +99,10 @@ pub enum ServerError {
     EmptyAuthToken,
     #[error("Rivet webhook secret cannot be empty")]
     EmptyWebhookSecret,
+    #[error("credential vault configuration requires both a file and a passphrase")]
+    IncompleteCredentialVaultConfig,
+    #[error("could not open credential vault: {0}")]
+    Credentials(#[from] CredentialError),
     #[error("invalid allowed origin: {0}")]
     InvalidAllowedOrigin(String),
 }
@@ -165,7 +173,8 @@ impl IntoResponse for ApiError {
             Self::ArtifactRead(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Scm(error) => match error {
                 rivet_scm::ScmError::InvalidRepository(_)
-                | rivet_scm::ScmError::NotGitRepository(_) => StatusCode::BAD_REQUEST,
+                | rivet_scm::ScmError::NotGitRepository(_)
+                | rivet_scm::ScmError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
                 rivet_scm::ScmError::Command { .. }
                 | rivet_scm::ScmError::InvalidOutput { .. }
                 | rivet_scm::ScmError::Filesystem(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -227,6 +236,8 @@ pub struct WebhookBuildRequest {
     pub remote: Option<String>,
     #[serde(default)]
     pub fetch: bool,
+    #[serde(default)]
+    pub credential_id: Option<String>,
     #[serde(default)]
     pub parameters: BTreeMap<String, String>,
 }
@@ -394,6 +405,9 @@ pub struct PrepareScmRequest {
     pub clean: bool,
     #[serde(default)]
     pub clean_ignored: bool,
+    /// Non-secret ID resolved from the server's encrypted credential vault.
+    #[serde(default)]
+    pub credential_id: Option<String>,
 }
 
 fn default_remote() -> String {
@@ -416,15 +430,28 @@ async fn prepare_scm(
 ) -> Result<Json<GitSnapshot>, ApiError> {
     let project = project_by_name(&state.storage, &name)?;
     let repository = GitRepository::open(project.repository_path).await?;
+    if request.credential_id.is_some() && !request.fetch {
+        return Err(ApiError::BadRequest(
+            "an SCM credential requires fetch=true".into(),
+        ));
+    }
+    let credential = resolve_git_credential(
+        state.credentials.as_deref(),
+        request.credential_id.as_deref(),
+    )?;
     Ok(Json(
         repository
-            .prepare(&GitPrepareOptions {
-                remote: request.remote,
-                fetch: request.fetch,
-                revision: request.revision,
-                clean: request.clean,
-                clean_ignored: request.clean_ignored,
-            })
+            .prepare_with_credential(
+                &GitPrepareOptions {
+                    remote: request.remote,
+                    fetch: request.fetch,
+                    revision: request.revision,
+                    clean: request.clean,
+                    clean_ignored: request.clean_ignored,
+                    credential_id: request.credential_id,
+                },
+                credential.as_ref(),
+            )
             .await?,
     ))
 }
@@ -436,6 +463,8 @@ pub async fn serve(storage_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(
             bind,
             auth_token: None,
             webhook_secret: None,
+            credentials_file: None,
+            credentials_passphrase: None,
             allowed_origins: default_allowed_origins(),
         },
     )
@@ -465,10 +494,19 @@ pub async fn serve_with_listener(
     let bind = listener.local_addr()?;
     let config = ServerConfig { bind, ..config };
     validate_config(&config)?;
+    let credentials = match (
+        config.credentials_file.as_ref(),
+        config.credentials_passphrase.as_deref(),
+    ) {
+        (Some(path), Some(passphrase)) => Some(Arc::new(CredentialVault::open(path, passphrase)?)),
+        (None, None) => None,
+        _ => return Err(ServerError::IncompleteCredentialVaultConfig),
+    };
     let state = AppState::with_security(
         Storage::open(storage_path)?,
         config.auth_token.as_deref(),
         config.webhook_secret.as_deref(),
+        credentials,
     );
     let allowed_origins = if config.allowed_origins.is_empty() {
         default_allowed_origins()
@@ -499,6 +537,16 @@ fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
     {
         return Err(ServerError::EmptyWebhookSecret);
     }
+    if config.credentials_file.is_some() != config.credentials_passphrase.is_some() {
+        return Err(ServerError::IncompleteCredentialVaultConfig);
+    }
+    if config
+        .credentials_passphrase
+        .as_deref()
+        .is_some_and(|passphrase| passphrase.trim().is_empty())
+    {
+        return Err(ServerError::IncompleteCredentialVaultConfig);
+    }
     Ok(())
 }
 
@@ -513,6 +561,7 @@ impl AppState {
             events,
             auth_digest: None,
             webhook_secret: None,
+            credentials: None,
             agents: AgentRegistry::default(),
             remote_messages: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -520,18 +569,24 @@ impl AppState {
 
     #[cfg(test)]
     fn with_token(storage: Storage, token: &str) -> Self {
-        Self::with_security(storage, Some(token), None)
+        Self::with_security(storage, Some(token), None, None)
     }
 
     #[cfg(test)]
     fn with_webhook_secret(storage: Storage, secret: &str) -> Self {
-        Self::with_security(storage, None, Some(secret))
+        Self::with_security(storage, None, Some(secret), None)
     }
 
-    fn with_security(storage: Storage, token: Option<&str>, webhook_secret: Option<&str>) -> Self {
+    fn with_security(
+        storage: Storage,
+        token: Option<&str>,
+        webhook_secret: Option<&str>,
+        credentials: Option<Arc<CredentialVault>>,
+    ) -> Self {
         let mut state = Self::new(storage);
         state.auth_digest = token.map(|token| hash_token(token.as_bytes()));
         state.webhook_secret = webhook_secret.map(|secret| secret.as_bytes().to_vec());
+        state.credentials = credentials;
         state
     }
 }
@@ -1073,6 +1128,7 @@ async fn webhook_build(
             revision: request.revision,
             clean: false,
             clean_ignored: false,
+            credential_id: request.credential_id,
         })
     } else {
         None
@@ -1358,7 +1414,12 @@ async fn enqueue_project_build(
     request: QueueBuildRequest,
 ) -> Result<QueueBuildResponse, ApiError> {
     let repository_root = PathBuf::from(&project.repository_path);
-    let source = capture_source_snapshot(&repository_root, request.scm.as_ref()).await?;
+    let source = capture_source_snapshot(
+        &repository_root,
+        request.scm.as_ref(),
+        state.credentials.as_deref(),
+    )
+    .await?;
     let pipeline = Pipeline::load(&project.pipeline_path)?;
     let parameters = pipeline.resolve_parameters(&request.parameters)?;
     let plan = ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), project.id);
@@ -2412,19 +2473,31 @@ fn finalize_artifacts(
 async fn capture_source_snapshot(
     path: &Path,
     prepare: Option<&PrepareScmRequest>,
+    credentials: Option<&CredentialVault>,
 ) -> Result<Option<SourceSnapshot>, ApiError> {
     match GitRepository::open(path).await {
         Ok(repository) => {
             let snapshot = match prepare {
                 Some(request) => {
+                    if request.credential_id.is_some() && !request.fetch {
+                        return Err(ApiError::BadRequest(
+                            "an SCM credential requires fetch=true".into(),
+                        ));
+                    }
+                    let credential =
+                        resolve_git_credential(credentials, request.credential_id.as_deref())?;
                     repository
-                        .prepare(&GitPrepareOptions {
-                            remote: request.remote.clone(),
-                            fetch: request.fetch,
-                            revision: request.revision.clone(),
-                            clean: request.clean,
-                            clean_ignored: request.clean_ignored,
-                        })
+                        .prepare_with_credential(
+                            &GitPrepareOptions {
+                                remote: request.remote.clone(),
+                                fetch: request.fetch,
+                                revision: request.revision.clone(),
+                                clean: request.clean,
+                                clean_ignored: request.clean_ignored,
+                                credential_id: request.credential_id.clone(),
+                            },
+                            credential.as_ref(),
+                        )
                         .await?
                 }
                 None => repository.inspect().await?,
@@ -2441,6 +2514,29 @@ async fn capture_source_snapshot(
             }
         }
     }
+}
+
+fn resolve_git_credential(
+    credentials: Option<&CredentialVault>,
+    credential_id: Option<&str>,
+) -> Result<Option<GitHttpCredential>, ApiError> {
+    let Some(credential_id) = credential_id else {
+        return Ok(None);
+    };
+    if credential_id.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "SCM credential ID cannot be empty".into(),
+        ));
+    }
+    let vault = credentials.ok_or_else(|| {
+        ApiError::BadRequest("this server has no configured SCM credential vault".into())
+    })?;
+    let credential = vault.get(credential_id).map_err(|error| {
+        ApiError::BadRequest(format!("could not resolve SCM credential: {error}"))
+    })?;
+    GitHttpCredential::new(credential.username(), credential.secret())
+        .map(Some)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))
 }
 
 async fn cancel_build(
