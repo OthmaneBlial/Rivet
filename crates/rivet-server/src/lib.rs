@@ -56,6 +56,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use uuid::Uuid;
 
 mod agent_registry;
 mod workspace_archive;
@@ -96,6 +97,7 @@ pub struct AppState {
 #[derive(Clone)]
 struct RemoteBuildRoute {
     agent_id: rivet_agent_protocol::AgentId,
+    session_id: Uuid,
     messages: mpsc::Sender<AgentMessage>,
 }
 
@@ -1674,20 +1676,24 @@ async fn handle_agent_socket(mut socket: WebSocket, state: AppState) {
             }
         }
     }
-    notify_agent_disconnect(&state, lease.agent_id).await;
+    notify_agent_disconnect(&state, lease.agent_id, lease.session_id).await;
     state
         .agents
         .unregister(lease.agent_id, lease.session_id)
         .await;
 }
 
-async fn notify_agent_disconnect(state: &AppState, agent_id: rivet_agent_protocol::AgentId) {
+async fn notify_agent_disconnect(
+    state: &AppState,
+    agent_id: rivet_agent_protocol::AgentId,
+    session_id: Uuid,
+) {
     let routes = state
         .remote_messages
         .lock()
         .await
         .iter()
-        .filter(|(_, route)| route.agent_id == agent_id)
+        .filter(|(_, route)| route.agent_id == agent_id && route.session_id == session_id)
         .map(|(build_id, route)| (*build_id, route.messages.clone()))
         .collect::<Vec<_>>();
     for (build_id, messages) in routes {
@@ -1735,6 +1741,7 @@ async fn dispatch_agent_message(
             route_agent_build_message(
                 state,
                 lease.agent_id,
+                lease.session_id,
                 build_id_from_event(&event),
                 AgentMessage::Event {
                     protocol_version: PROTOCOL_VERSION,
@@ -1750,7 +1757,8 @@ async fn dispatch_agent_message(
         | AgentMessage::ArtifactChunk { build_id, .. }
         | AgentMessage::Log { build_id, .. }
         | AgentMessage::Finished { build_id, .. } => {
-            route_agent_build_message(state, lease.agent_id, build_id, message).await?;
+            route_agent_build_message(state, lease.agent_id, lease.session_id, build_id, message)
+                .await?;
             Ok(None)
         }
         AgentMessage::Error {
@@ -1762,6 +1770,7 @@ async fn dispatch_agent_message(
             route_agent_build_message(
                 state,
                 lease.agent_id,
+                lease.session_id,
                 build_id,
                 AgentMessage::Error {
                     protocol_version: PROTOCOL_VERSION,
@@ -1790,6 +1799,7 @@ async fn dispatch_agent_message(
 async fn route_agent_build_message(
     state: &AppState,
     agent_id: rivet_agent_protocol::AgentId,
+    session_id: Uuid,
     build_id: BuildId,
     message: AgentMessage,
 ) -> Result<(), (String, String)> {
@@ -1805,10 +1815,10 @@ async fn route_agent_build_message(
                 format!("agent message refers to unassigned build {build_id}"),
             )
         })?;
-    if route.agent_id != agent_id {
+    if route.agent_id != agent_id || route.session_id != session_id {
         return Err((
-            "agent_identity_mismatch".into(),
-            format!("agent is not assigned to build {build_id}"),
+            "agent_session_fenced".into(),
+            format!("agent session is not assigned to build {build_id}"),
         ));
     }
     route.messages.send(message).await.map_err(|_| {
@@ -3122,6 +3132,7 @@ async fn run_remote_build_with_recovery(
             plan.build_id,
             RemoteBuildRoute {
                 agent_id: reservation.agent_id,
+                session_id: reservation.session_id,
                 messages: route_sender,
             },
         );
@@ -4955,6 +4966,57 @@ mod tests {
         ));
         socket.close(None).await.expect("close");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_agent_sessions_cannot_relay_or_close_a_current_remote_route() {
+        let state = AppState::new(Storage::open_in_memory().expect("storage"));
+        let agent_id = uuid::Uuid::new_v4();
+        let current_session = uuid::Uuid::new_v4();
+        let stale_session = uuid::Uuid::new_v4();
+        let build_id = uuid::Uuid::new_v4();
+        let (sender, mut receiver) = mpsc::channel(4);
+        state.remote_messages.lock().await.insert(
+            build_id,
+            RemoteBuildRoute {
+                agent_id,
+                session_id: current_session,
+                messages: sender,
+            },
+        );
+
+        let stale_result = route_agent_build_message(
+            &state,
+            agent_id,
+            stale_session,
+            build_id,
+            AgentMessage::Error {
+                protocol_version: PROTOCOL_VERSION,
+                build_id: Some(build_id),
+                code: "stale".into(),
+                message: "must be fenced".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            stale_result.expect_err("stale session must fail").0,
+            "agent_session_fenced"
+        );
+        assert!(receiver.try_recv().is_err());
+
+        notify_agent_disconnect(&state, agent_id, stale_session).await;
+        assert!(receiver.try_recv().is_err());
+
+        notify_agent_disconnect(&state, agent_id, current_session).await;
+        let notification = receiver.recv().await.expect("current route notification");
+        assert!(matches!(
+            notification,
+            AgentMessage::Error {
+                build_id: Some(id),
+                code,
+                ..
+            } if id == build_id && code == "agent_disconnected"
+        ));
     }
 
     #[tokio::test]
