@@ -4,18 +4,20 @@
 //! extension declares whether it is a WASM module or a direct subprocess,
 //! receives JSON messages over a length-prefixed stream, and can only ask for
 //! capabilities named in its manifest. This crate validates and frames the
-//! contract; it does not grant permissions or execute extension code on its
-//! behalf.
+//! contract; the manager below owns the subprocess lifecycle and host-side
+//! permission check, while WASM execution remains deliberately unavailable.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 pub const PROTOCOL_NAME: &str = "rivet-extension";
@@ -451,13 +453,164 @@ impl FrameDecoder {
 ///
 /// The program and arguments are passed directly to `Command`; no shell is
 /// involved. The host uses a one-request-at-a-time exchange, which keeps the
-/// first protocol boundary deterministic until multiplexing and permission
-/// enforcement are added by the extension manager.
+/// first protocol boundary deterministic while the extension manager owns
+/// lifecycle and permission enforcement.
 pub struct SubprocessExtension {
     manifest: ExtensionManifest,
     child: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
+}
+
+/// Owns the lifecycle of locally catalogued subprocess extensions.
+///
+/// The manager deliberately keeps the policy boundary in the host: a
+/// manifest is not enough to launch arbitrary code, an entrypoint must be a
+/// regular executable under the configured root, and every request goes
+/// through the manifest permission check. WASM manifests are rejected until a
+/// sandboxed runtime with an explicit host ABI is available.
+pub struct ExtensionManager {
+    root: PathBuf,
+    manifests: BTreeMap<String, ExtensionManifest>,
+    sessions: Arc<Mutex<BTreeMap<String, SubprocessExtension>>>,
+}
+
+impl ExtensionManager {
+    pub fn new(
+        root: impl AsRef<Path>,
+        catalog: &ExtensionCatalog,
+    ) -> Result<Self, ExtensionManagerError> {
+        let root = root.as_ref();
+        let metadata =
+            fs::symlink_metadata(root).map_err(|error| ExtensionManagerError::Filesystem {
+                path: root.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ExtensionManagerError::InvalidRoot(root.to_path_buf()));
+        }
+        let root = fs::canonicalize(root).map_err(|error| ExtensionManagerError::Filesystem {
+            path: root.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        let manifests = catalog
+            .manifests()
+            .iter()
+            .map(|manifest| (manifest.id.clone(), manifest.clone()))
+            .collect();
+        Ok(Self {
+            root,
+            manifests,
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+        })
+    }
+
+    pub fn manifest(&self, id: &str) -> Option<&ExtensionManifest> {
+        self.manifests.get(id)
+    }
+
+    pub async fn active_extensions(&self) -> Vec<String> {
+        self.sessions.lock().await.keys().cloned().collect()
+    }
+
+    pub async fn launch<I, S>(&self, id: &str, args: I) -> Result<(), ExtensionManagerError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let manifest = self
+            .manifests
+            .get(id)
+            .cloned()
+            .ok_or_else(|| ExtensionManagerError::UnknownExtension(id.to_owned()))?;
+        if !matches!(manifest.kind, ExtensionKind::Subprocess) {
+            return Err(ExtensionManagerError::WasmRuntimeUnavailable(id.to_owned()));
+        }
+        let program = resolve_entrypoint(&self.root, &manifest)?;
+        let extension = SubprocessExtension::spawn(manifest, program, args).await?;
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(id) {
+            drop(sessions);
+            let _ = extension.terminate().await;
+            return Err(ExtensionManagerError::AlreadyRunning(id.to_owned()));
+        }
+        sessions.insert(id.to_owned(), extension);
+        Ok(())
+    }
+
+    pub async fn request(
+        &self,
+        id: &str,
+        permission: ExtensionPermission,
+        method: impl Into<String>,
+        payload: Value,
+    ) -> Result<Value, ExtensionManagerError> {
+        let mut sessions = self.sessions.lock().await;
+        let extension = sessions
+            .get_mut(id)
+            .ok_or_else(|| ExtensionManagerError::NotRunning(id.to_owned()))?;
+        extension
+            .request_with_permission(permission, method, payload)
+            .await
+            .map_err(ExtensionManagerError::Host)
+    }
+
+    pub async fn shutdown(&self, id: &str) -> Result<(), ExtensionManagerError> {
+        let extension = self
+            .sessions
+            .lock()
+            .await
+            .remove(id)
+            .ok_or_else(|| ExtensionManagerError::NotRunning(id.to_owned()))?;
+        extension
+            .shutdown()
+            .await
+            .map_err(ExtensionManagerError::Host)
+    }
+
+    pub async fn terminate(&self, id: &str) -> Result<(), ExtensionManagerError> {
+        let extension = self
+            .sessions
+            .lock()
+            .await
+            .remove(id)
+            .ok_or_else(|| ExtensionManagerError::NotRunning(id.to_owned()))?;
+        extension
+            .terminate()
+            .await
+            .map_err(ExtensionManagerError::Host)
+    }
+}
+
+fn resolve_entrypoint(
+    root: &Path,
+    manifest: &ExtensionManifest,
+) -> Result<PathBuf, ExtensionManagerError> {
+    let candidate = root.join(&manifest.entrypoint);
+    let metadata =
+        fs::symlink_metadata(&candidate).map_err(|error| ExtensionManagerError::Filesystem {
+            path: candidate.clone(),
+            message: error.to_string(),
+        })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ExtensionManagerError::InvalidEntrypoint(candidate));
+    }
+    let resolved =
+        fs::canonicalize(&candidate).map_err(|error| ExtensionManagerError::Filesystem {
+            path: candidate.clone(),
+            message: error.to_string(),
+        })?;
+    if !resolved.starts_with(root) {
+        return Err(ExtensionManagerError::EntrypointOutsideRoot(resolved));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(ExtensionManagerError::NotExecutable(resolved));
+        }
+    }
+    Ok(resolved)
 }
 
 impl SubprocessExtension {
@@ -486,35 +639,55 @@ impl SubprocessExtension {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        command.kill_on_drop(true);
         let mut child = command.spawn().map_err(ExtensionHostError::Spawn)?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or(ExtensionHostError::MissingPipe("stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(ExtensionHostError::MissingPipe("stdout"))?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = child.kill().await;
+                return Err(ExtensionHostError::MissingPipe("stdin"));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.kill().await;
+                return Err(ExtensionHostError::MissingPipe("stdout"));
+            }
+        };
         let mut extension = Self {
             manifest,
             child,
             stdin,
             stdout,
         };
-        extension
+        if let Err(error) = extension
             .write_message(&ExtensionMessage::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 manifest: extension.manifest.clone(),
             })
-            .await?;
-        let response = extension.read_message().await?;
+            .await
+        {
+            let _ = extension.terminate().await;
+            return Err(error);
+        }
+        let response = match extension.read_message().await {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = extension.terminate().await;
+                return Err(error);
+            }
+        };
         match response {
             ExtensionMessage::Ready { extension_id, .. }
                 if extension_id == extension.manifest.id =>
             {
                 Ok(extension)
             }
-            _ => Err(ExtensionHostError::UnexpectedHandshake),
+            _ => {
+                let _ = extension.terminate().await;
+                Err(ExtensionHostError::UnexpectedHandshake)
+            }
         }
     }
 
@@ -633,6 +806,30 @@ pub enum ExtensionHostError {
     UnexpectedResponse,
     #[error("extension returned {code}: {message}")]
     Remote { code: String, message: String },
+}
+
+#[derive(Debug, Error)]
+pub enum ExtensionManagerError {
+    #[error("extension manager root is not a regular directory: {0}")]
+    InvalidRoot(PathBuf),
+    #[error("could not inspect extension path {path}: {message}")]
+    Filesystem { path: PathBuf, message: String },
+    #[error("extension {0:?} is not present in the validated catalog")]
+    UnknownExtension(String),
+    #[error("WASM extension {0:?} cannot run before a sandboxed runtime is configured")]
+    WasmRuntimeUnavailable(String),
+    #[error("extension entrypoint is not a regular file: {0}")]
+    InvalidEntrypoint(PathBuf),
+    #[error("extension entrypoint resolves outside its configured root: {0}")]
+    EntrypointOutsideRoot(PathBuf),
+    #[error("extension entrypoint is not executable: {0}")]
+    NotExecutable(PathBuf),
+    #[error("extension {0:?} already has an active session")]
+    AlreadyRunning(String),
+    #[error("extension {0:?} has no active session")]
+    NotRunning(String),
+    #[error(transparent)]
+    Host(#[from] ExtensionHostError),
 }
 
 fn validate_version(version: u16) -> Result<(), ExtensionProtocolError> {
@@ -843,6 +1040,85 @@ mod tests {
         assert!(matches!(
             ExtensionCatalog::from_directory(Some(directory.path())),
             Err(ExtensionCatalogError::DuplicateId(id)) if id == "coverage.reporter"
+        ));
+    }
+
+    #[test]
+    fn manager_resolves_only_regular_executables_inside_the_root() {
+        let directory = tempfile::tempdir().expect("extension root");
+        let mut subprocess = manifest(ExtensionKind::Subprocess);
+        subprocess.entrypoint = "runner".into();
+        std::fs::write(
+            directory.path().join("manifest.json"),
+            serde_json::to_vec(&subprocess).expect("manifest JSON"),
+        )
+        .expect("write manifest");
+        let runner = directory.path().join("runner");
+        std::fs::write(&runner, b"#!/bin/sh\nexit 0\n").expect("write runner");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&runner)
+                .expect("runner metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&runner, permissions).expect("runner permissions");
+        }
+
+        let catalog = ExtensionCatalog::from_directory(Some(directory.path())).expect("catalog");
+        let manager = ExtensionManager::new(directory.path(), &catalog).expect("manager");
+        let resolved = resolve_entrypoint(
+            &manager.root,
+            manager.manifest("coverage.reporter").unwrap(),
+        )
+        .expect("resolved runner");
+        assert_eq!(resolved, runner.canonicalize().expect("canonical runner"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manager_rejects_symlinked_entrypoints() {
+        let directory = tempfile::tempdir().expect("extension root");
+        let outside = tempfile::tempdir().expect("outside root");
+        let mut subprocess = manifest(ExtensionKind::Subprocess);
+        subprocess.entrypoint = "runner".into();
+        std::fs::write(
+            directory.path().join("manifest.json"),
+            serde_json::to_vec(&subprocess).expect("manifest JSON"),
+        )
+        .expect("write manifest");
+        let outside_runner = outside.path().join("runner");
+        std::fs::write(&outside_runner, b"#!/bin/sh\nexit 0\n").expect("write runner");
+        std::os::unix::fs::symlink(&outside_runner, directory.path().join("runner"))
+            .expect("symlink runner");
+
+        let catalog = ExtensionCatalog::from_directory(Some(directory.path())).expect("catalog");
+        let manager = ExtensionManager::new(directory.path(), &catalog).expect("manager");
+        assert!(matches!(
+            resolve_entrypoint(
+                &manager.root,
+                manager.manifest("coverage.reporter").unwrap()
+            ),
+            Err(ExtensionManagerError::InvalidEntrypoint(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn manager_rejects_wasm_until_a_runtime_is_configured() {
+        let directory = tempfile::tempdir().expect("extension root");
+        let wasm = manifest(ExtensionKind::Wasm);
+        std::fs::write(
+            directory.path().join("manifest.json"),
+            serde_json::to_vec(&wasm).expect("manifest JSON"),
+        )
+        .expect("write manifest");
+        let catalog = ExtensionCatalog::from_directory(Some(directory.path())).expect("catalog");
+        let manager = ExtensionManager::new(directory.path(), &catalog).expect("manager");
+        assert!(matches!(
+            manager
+                .launch("coverage.reporter", std::iter::empty::<&str>())
+                .await,
+            Err(ExtensionManagerError::WasmRuntimeUnavailable(id)) if id == "coverage.reporter"
         ));
     }
 
