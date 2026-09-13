@@ -25,6 +25,8 @@ use walkdir::WalkDir;
 const MAX_AUDIT_PAGE_SIZE: usize = 1000;
 const MAX_AUDIT_FIELD_BYTES: usize = 256;
 const SESSION_DIGEST_BYTES: usize = 32;
+const MAX_ANNOTATION_KIND_BYTES: usize = 64;
+const MAX_ANNOTATION_MESSAGE_BYTES: usize = 4096;
 
 #[derive(Clone)]
 pub struct Storage {
@@ -73,6 +75,8 @@ pub enum StorageError {
     InvalidTimestamp(String),
     #[error("invalid {kind} status in database: {value}")]
     InvalidStatus { kind: &'static str, value: String },
+    #[error("annotation {field} is empty, too long, or contains control characters")]
+    InvalidAnnotationField { field: &'static str },
     #[error("build {0} does not exist")]
     MissingBuild(BuildId),
     #[error("stage {0} does not exist")]
@@ -178,6 +182,16 @@ pub struct ArtifactRecord {
     pub relative_path: String,
     pub size_bytes: u64,
     pub checksum: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnnotationRecord {
+    pub id: Uuid,
+    pub build_id: BuildId,
+    pub stage_id: Option<StageId>,
+    pub kind: String,
+    pub message: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -329,6 +343,11 @@ impl Storage {
             &connection,
             11,
             Some(include_str!("../migrations/011_remote_attempts.sql")),
+        )?;
+        apply_migration(
+            &connection,
+            12,
+            Some(include_str!("../migrations/012_build_annotations.sql")),
         )?;
         backfill_event_hashes(&connection)?;
         Ok(Self {
@@ -1364,6 +1383,86 @@ impl Storage {
             .collect()
     }
 
+    /// Persist a bounded, human-readable build annotation. An optional stage
+    /// must belong to the same build so consumers cannot attach metadata to a
+    /// different execution graph by accident.
+    pub fn add_annotation(
+        &self,
+        build_id: BuildId,
+        stage_id: Option<StageId>,
+        kind: &str,
+        message: &str,
+    ) -> Result<AnnotationRecord, StorageError> {
+        validate_annotation_field(kind, "kind", MAX_ANNOTATION_KIND_BYTES)?;
+        validate_annotation_field(message, "message", MAX_ANNOTATION_MESSAGE_BYTES)?;
+        let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let transaction = connection.transaction()?;
+        let build_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM builds WHERE id = ?1)",
+            params![build_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !build_exists {
+            return Err(StorageError::MissingBuild(build_id));
+        }
+        if let Some(stage_id) = stage_id {
+            let stage_build_id: Option<String> = transaction
+                .query_row(
+                    "SELECT build_id FROM build_stages WHERE id = ?1",
+                    params![stage_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if stage_build_id.as_deref() != Some(build_id.to_string().as_str()) {
+                return Err(StorageError::MissingStage(stage_id));
+            }
+        }
+        let annotation = AnnotationRecord {
+            id: Uuid::new_v4(),
+            build_id,
+            stage_id,
+            kind: kind.to_owned(),
+            message: message.to_owned(),
+            created_at: Utc::now(),
+        };
+        transaction.execute(
+            "INSERT INTO build_annotations(
+                id, build_id, stage_id, kind, message, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                annotation.id.to_string(),
+                annotation.build_id.to_string(),
+                annotation.stage_id.map(|id| id.to_string()),
+                annotation.kind,
+                annotation.message,
+                annotation.created_at.to_rfc3339(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(annotation)
+    }
+
+    pub fn annotations(&self, build_id: BuildId) -> Result<Vec<AnnotationRecord>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT id, build_id, stage_id, kind, message, created_at
+             FROM build_annotations
+             WHERE build_id = ?1 ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = statement.query_map(params![build_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        rows.map(|row| row.map_err(StorageError::from).and_then(parse_annotation))
+            .collect()
+    }
+
     pub fn artifact_file(
         &self,
         artifact_id: Uuid,
@@ -1508,6 +1607,7 @@ type RawStep = (
     Option<String>,
 );
 type RawArtifact = (String, String, String, String, i64, String, String);
+type RawAnnotation = (String, String, Option<String>, String, String, String);
 type RawSchedule = (
     String,
     String,
@@ -1547,6 +1647,17 @@ fn validate_audit_field(value: &str, field: &'static str) -> Result<(), StorageE
         || value.chars().any(char::is_control)
     {
         return Err(StorageError::InvalidAuditField { field });
+    }
+    Ok(())
+}
+
+fn validate_annotation_field(
+    value: &str,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<(), StorageError> {
+    if value.trim().is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(StorageError::InvalidAnnotationField { field });
     }
     Ok(())
 }
@@ -1827,6 +1938,19 @@ fn parse_artifact(raw: RawArtifact) -> Result<ArtifactRecord, StorageError> {
         size_bytes: u64::try_from(raw.4).map_err(|_| StorageError::InvalidArtifactSize(raw.4))?,
         checksum: raw.5,
         created_at: parse_timestamp(&raw.6)?,
+    })
+}
+
+fn parse_annotation(raw: RawAnnotation) -> Result<AnnotationRecord, StorageError> {
+    validate_annotation_field(&raw.3, "kind", MAX_ANNOTATION_KIND_BYTES)?;
+    validate_annotation_field(&raw.4, "message", MAX_ANNOTATION_MESSAGE_BYTES)?;
+    Ok(AnnotationRecord {
+        id: parse_uuid(&raw.0)?,
+        build_id: parse_uuid(&raw.1)?,
+        stage_id: raw.2.as_deref().map(parse_uuid).transpose()?,
+        kind: raw.3,
+        message: raw.4,
+        created_at: parse_timestamp(&raw.5)?,
     })
 }
 
@@ -2128,6 +2252,45 @@ program = "true"
                 .build
                 .status,
             BuildStatus::Queued
+        );
+    }
+
+    #[test]
+    fn build_annotations_are_scoped_validated_and_reopenable() {
+        let directory = tempdir().expect("tempdir");
+        let database = directory.path().join("rivet.db");
+        let (project, pipeline, plan) = fixture();
+        let storage = Storage::open(&database).expect("open");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let build = storage
+            .create_build(&project, &plan, &pipeline, None)
+            .expect("build");
+        let stage_id = plan.stages[0].id;
+        let annotation = storage
+            .add_annotation(build.id, Some(stage_id), "warning", "lint issue")
+            .expect("annotation");
+        assert_eq!(annotation.build_id, build.id);
+        assert_eq!(annotation.stage_id, Some(stage_id));
+        assert_eq!(
+            storage.annotations(build.id).expect("annotations"),
+            vec![annotation.clone()]
+        );
+        assert!(matches!(
+            storage.add_annotation(build.id, None, "", "message"),
+            Err(StorageError::InvalidAnnotationField { field: "kind" })
+        ));
+        assert!(matches!(
+            storage.add_annotation(build.id, Some(Uuid::new_v4()), "warning", "message"),
+            Err(StorageError::MissingStage(_))
+        ));
+        drop(storage);
+
+        let reopened = Storage::open(&database).expect("reopen");
+        assert_eq!(
+            reopened.annotations(build.id).expect("annotations"),
+            vec![annotation]
         );
     }
 

@@ -152,7 +152,7 @@
       "feature": "Versioned WASM/subprocess extension boundary",
       "status": "partial",
       "evidence": ["crates/rivet-extension-protocol/src/lib.rs", "apps/desktop/src/extensionModel.ts", "apps/desktop/src/App.tsx"],
-      "notes": "Manifests, explicit permissions, bounded length-prefixed JSON frames, a direct-argument subprocess host, bounded local catalog discovery/API, a desktop model, a root-confined subprocess lifecycle manager with per-request permission enforcement, server/desktop lifecycle controls, a capability-free WASM ABI with bounded memory/output and fuel metering, and bounded read-only builds/details/logs/artifacts host methods are present. Trigger and annotation capabilities remain planned."
+      "notes": "Manifests, explicit permissions, bounded length-prefixed JSON frames, a direct-argument subprocess host, bounded local catalog discovery/API, a desktop model, a root-confined subprocess lifecycle manager with per-request permission enforcement, server/desktop lifecycle controls, a capability-free WASM ABI with bounded memory/output and fuel metering, bounded read-only builds/details/logs/artifacts host methods, and persisted stage-scoped annotation host writes are present. Trigger capability remains planned."
     },
     {
       "category": "Differential testing",

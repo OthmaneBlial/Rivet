@@ -544,6 +544,24 @@ impl ExtensionManager {
         self.sessions.lock().await.keys().cloned().collect()
     }
 
+    /// Validate that an extension can receive a request before the server
+    /// performs any host-side operation associated with that request.
+    pub async fn validate_request(
+        &self,
+        id: &str,
+        permission: ExtensionPermission,
+    ) -> Result<(), ExtensionManagerError> {
+        if !self.sessions.lock().await.contains_key(id) {
+            return Err(ExtensionManagerError::NotRunning(id.to_owned()));
+        }
+        let manifest = self
+            .manifests
+            .get(id)
+            .ok_or_else(|| ExtensionManagerError::UnknownExtension(id.to_owned()))?;
+        ensure_permission(manifest, permission)?;
+        Ok(())
+    }
+
     pub async fn launch<I, S>(&self, id: &str, args: I) -> Result<(), ExtensionManagerError>
     where
         I: IntoIterator<Item = S>,
@@ -1390,6 +1408,18 @@ mod tests {
             .launch("coverage.reporter", std::iter::empty::<&str>())
             .await
             .expect("launch WASM extension");
+        manager
+            .validate_request("coverage.reporter", ExtensionPermission::ReadBuilds)
+            .await
+            .expect("declared request permission");
+        assert!(matches!(
+            manager
+                .validate_request("coverage.reporter", ExtensionPermission::WriteAnnotations)
+                .await,
+            Err(ExtensionManagerError::Host(
+                ExtensionHostError::PermissionDenied(ExtensionPermission::WriteAnnotations)
+            ))
+        ));
         let result = manager
             .request(
                 "coverage.reporter",

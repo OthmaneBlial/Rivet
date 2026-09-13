@@ -39,8 +39,8 @@ use rivet_scm::{
     GitSshCredential, ScmError, validate_known_hosts_file,
 };
 use rivet_storage::{
-    ArtifactRecord, AuditEventRecord, BuildDetails, BuildRecord, LogRecord, RemoteAttemptRecord,
-    ScheduleRecord, Storage, StorageError,
+    AnnotationRecord, ArtifactRecord, AuditEventRecord, BuildDetails, BuildRecord, LogRecord,
+    RemoteAttemptRecord, ScheduleRecord, Storage, StorageError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -113,6 +113,7 @@ const MAX_EXTENSION_STAGE_RECORDS: usize = 100;
 const MAX_EXTENSION_STEP_RECORDS: usize = 500;
 const MAX_EXTENSION_LOG_RECORDS: usize = 500;
 const MAX_EXTENSION_ARTIFACT_RECORDS: usize = 100;
+const MAX_EXTENSION_ANNOTATION_RECORDS: usize = 100;
 
 struct PendingAgentDelivery {
     envelope: AgentTransportMessage,
@@ -426,6 +427,14 @@ pub struct QueueBuildRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CreateAnnotationRequest {
+    pub kind: String,
+    pub message: String,
+    #[serde(default)]
+    pub stage_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CreateScheduleRequest {
     pub name: String,
     pub expression: String,
@@ -605,6 +614,10 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
         .route(
             "/api/v1/projects/{name}/builds/{number}/logs",
             get(get_logs),
+        )
+        .route(
+            "/api/v1/projects/{name}/builds/{number}/annotations",
+            get(list_annotations).post(create_annotation),
         )
         .route(
             "/api/v1/projects/{name}/builds/{number}/artifacts",
@@ -1656,6 +1669,10 @@ async fn request_extension(
         method,
         payload: input,
     } = request;
+    manager
+        .validate_request(&id, permission)
+        .await
+        .map_err(ApiError::ExtensionManager)?;
     let payload = extension_host_payload(&state, permission, &method, input)?;
     let result = manager
         .request(&id, permission, method, payload)
@@ -1740,6 +1757,16 @@ fn extension_host_payload(
                 "truncated": truncated,
             })
         }
+        "build.annotations" => {
+            let build_id = extension_uuid(&input, "build_id")?;
+            ensure_extension_build_exists(&state.storage, build_id)?;
+            let annotations = state.storage.annotations(build_id)?;
+            let truncated = annotations.len() > MAX_EXTENSION_ANNOTATION_RECORDS;
+            json!({
+                "annotations": annotations.into_iter().take(MAX_EXTENSION_ANNOTATION_RECORDS).collect::<Vec<_>>(),
+                "truncated": truncated,
+            })
+        }
         "build.artifacts" => {
             let build_id = extension_uuid(&input, "build_id")?;
             ensure_extension_build_exists(&state.storage, build_id)?;
@@ -1749,6 +1776,27 @@ fn extension_host_payload(
                 "artifacts": artifacts.into_iter().take(MAX_EXTENSION_ARTIFACT_RECORDS).collect::<Vec<_>>(),
                 "truncated": truncated,
             })
+        }
+        "build.annotate" => {
+            let build_id = extension_uuid(&input, "build_id")?;
+            ensure_extension_build_exists(&state.storage, build_id)?;
+            let stage_id = match input.get("stage_id") {
+                None | Some(Value::Null) => None,
+                Some(_) => Some(extension_uuid(&input, "stage_id")?),
+            };
+            let kind = input.get("kind").and_then(Value::as_str).ok_or_else(|| {
+                ApiError::BadRequest("extension payload requires \"kind\"".into())
+            })?;
+            let message = input
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ApiError::BadRequest("extension payload requires \"message\"".into())
+                })?;
+            let annotation = state
+                .storage
+                .add_annotation(build_id, stage_id, kind, message)?;
+            json!({ "annotation": annotation })
         }
         _ => unreachable!("extension_host_permission only returns known methods"),
     };
@@ -1764,7 +1812,9 @@ fn extension_host_permission(method: &str) -> Option<ExtensionPermission> {
     match method {
         "builds.list" | "build.details" => Some(ExtensionPermission::ReadBuilds),
         "build.logs" => Some(ExtensionPermission::ReadLogs),
+        "build.annotations" => Some(ExtensionPermission::ReadBuilds),
         "build.artifacts" => Some(ExtensionPermission::ReadArtifacts),
+        "build.annotate" => Some(ExtensionPermission::WriteAnnotations),
         _ => None,
     }
 }
@@ -3058,6 +3108,34 @@ async fn get_artifacts(
     let project = project_by_name(&state.storage, &name)?;
     let build = build_by_number(&state.storage, project.id, &name, number)?;
     Ok(Json(state.storage.artifacts(build.id)?))
+}
+
+async fn list_annotations(
+    State(state): State<AppState>,
+    AxumPath((name, number)): AxumPath<(String, i64)>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<AnnotationRecord>>, ApiError> {
+    require_project(&principal, Permission::Read, &name)?;
+    let project = project_by_name(&state.storage, &name)?;
+    let build = build_by_number(&state.storage, project.id, &name, number)?;
+    Ok(Json(state.storage.annotations(build.id)?))
+}
+
+async fn create_annotation(
+    State(state): State<AppState>,
+    AxumPath((name, number)): AxumPath<(String, i64)>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<CreateAnnotationRequest>,
+) -> Result<Json<AnnotationRecord>, ApiError> {
+    require_project(&principal, Permission::Build, &name)?;
+    let project = project_by_name(&state.storage, &name)?;
+    let build = build_by_number(&state.storage, project.id, &name, number)?;
+    Ok(Json(state.storage.add_annotation(
+        build.id,
+        request.stage_id,
+        &request.kind,
+        &request.message,
+    )?))
 }
 
 async fn download_artifact(
@@ -4702,6 +4780,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_annotations_api_persists_and_reads_stage_scoped_metadata() {
+        let directory = tempdir().expect("workspace");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "annotation-api"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+        let project = Project::new(
+            "annotation-api",
+            directory.path().to_string_lossy().into_owned(),
+            "Rivetfile.toml",
+        )
+        .expect("project");
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project persistence");
+        let plan = ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), project.id);
+        let build = storage
+            .create_build(&project, &plan, &pipeline, None)
+            .expect("build persistence");
+        let state = AppState::new(storage);
+        let app = router(state);
+        let uri = "/api/v1/projects/annotation-api/builds/1/annotations";
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "kind": "warning",
+                            "message": "lint issue",
+                            "stage_id": plan.stages[0].id,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("annotation request"),
+            )
+            .await
+            .expect("annotation response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("annotation body");
+        let created: AnnotationRecord = serde_json::from_slice(&body).expect("annotation JSON");
+        assert_eq!(created.build_id, build.id);
+        assert_eq!(created.stage_id, Some(plan.stages[0].id));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("annotation list request"),
+            )
+            .await
+            .expect("annotation list response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("annotation list body");
+        let listed: Vec<AnnotationRecord> =
+            serde_json::from_slice(&body).expect("annotation list JSON");
+        assert_eq!(listed, vec![created]);
+    }
+
+    #[tokio::test]
     async fn queue_items_report_priority_order_without_build_parameters() {
         let directory = tempdir().expect("tempdir");
         let pipeline_path = directory.path().join("Rivetfile.toml");
@@ -4907,7 +5062,10 @@ mod tests {
             version: "1.0.0".into(),
             kind: ExtensionKind::Wasm,
             entrypoint: "coverage.wasm".into(),
-            permissions: vec![ExtensionPermission::ReadBuilds],
+            permissions: vec![
+                ExtensionPermission::ReadBuilds,
+                ExtensionPermission::WriteAnnotations,
+            ],
         };
         fs::write(
             directory.path().join("coverage.json"),
@@ -4954,6 +5112,12 @@ program = "true"
             .storage
             .create_project(&host_project, &host_pipeline)
             .expect("host project persistence");
+        let host_plan =
+            ExecutionPlan::from_pipeline(&host_pipeline, Uuid::new_v4(), host_project.id);
+        let host_build = state
+            .storage
+            .create_build(&host_project, &host_plan, &host_pipeline, None)
+            .expect("host build persistence");
         state.extensions = Arc::new(catalog);
         state.extension_manager = Some(Arc::new(manager));
 
@@ -4997,6 +5161,30 @@ program = "true"
             .await
             .expect("extension request body");
         assert_eq!(&body[..], br#"{"ok":true}"#);
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/extensions/coverage.reporter/request")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"permission":"write_annotations","method":"build.annotate","payload":{{"build_id":"{}","kind":"quality","message":"coverage note"}}}}"#,
+                        host_build.id
+                    )))
+                    .expect("annotation request"),
+            )
+            .await
+            .expect("annotation response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .storage
+                .annotations(host_build.id)
+                .expect("host annotations")
+                .len(),
+            1
+        );
 
         let response = router(state)
             .oneshot(
@@ -5067,6 +5255,10 @@ program = "true"
                 timestamp: now,
             })
             .expect("output event");
+        let stage_id = plan.stages[0].id;
+        let existing_annotation = storage
+            .add_annotation(build.id, Some(stage_id), "warning", "lint issue")
+            .expect("annotation");
 
         let state = AppState::new(storage);
         let build_list = extension_host_payload(
@@ -5092,6 +5284,18 @@ program = "true"
         .expect("build logs host method");
         assert_eq!(logs["data"]["logs"][0]["line"], "safe output");
 
+        let annotations = extension_host_payload(
+            &state,
+            ExtensionPermission::ReadBuilds,
+            "build.annotations",
+            json!({ "build_id": build.id }),
+        )
+        .expect("build annotations host method");
+        assert_eq!(
+            annotations["data"]["annotations"][0]["id"],
+            existing_annotation.id.to_string()
+        );
+
         let details = extension_host_payload(
             &state,
             ExtensionPermission::ReadBuilds,
@@ -5104,6 +5308,28 @@ program = "true"
             Some(build_id.as_str())
         );
 
+        let created = extension_host_payload(
+            &state,
+            ExtensionPermission::WriteAnnotations,
+            "build.annotate",
+            json!({
+                "build_id": build.id,
+                "stage_id": stage_id,
+                "kind": "quality",
+                "message": "coverage is below target"
+            }),
+        )
+        .expect("build annotate host method");
+        assert_eq!(created["data"]["annotation"]["kind"], "quality");
+        assert_eq!(
+            state
+                .storage
+                .annotations(build.id)
+                .expect("annotations")
+                .len(),
+            2
+        );
+
         let denied = extension_host_payload(
             &state,
             ExtensionPermission::ReadBuilds,
@@ -5112,6 +5338,21 @@ program = "true"
         )
         .expect_err("wrong permission must be rejected");
         assert!(matches!(denied, ApiError::BadRequest(message) if message.contains("ReadLogs")));
+
+        let denied_annotation = extension_host_payload(
+            &state,
+            ExtensionPermission::ReadBuilds,
+            "build.annotate",
+            json!({
+                "build_id": build.id,
+                "kind": "quality",
+                "message": "must not write"
+            }),
+        )
+        .expect_err("wrong annotation permission must be rejected");
+        assert!(
+            matches!(denied_annotation, ApiError::BadRequest(message) if message.contains("WriteAnnotations"))
+        );
 
         let custom = extension_host_payload(
             &state,

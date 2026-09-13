@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.51 / 100** · displayed conservatively as the
+Weighted evidence score: **92.53 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -37,8 +37,9 @@ API and rendered in the desktop control room. The server also exposes
 administrator-only subprocess extension lifecycle status and start/stop
 controls, reflected in the desktop view. A capability-free WASM runtime now
 supports an explicit JSON ABI with no host imports, bounded linear memory,
-bounded output, and fuel metering. Four bounded, read-only build, detail, log,
-and artifact host methods are available under explicit extension permissions.
+bounded output, and fuel metering. Six bounded build, detail, log, artifact,
+and annotation host methods are available under explicit extension permissions;
+annotation writes are persisted with optional stage scope.
 The
 server also exposes a
 versioned agent handshake/heartbeat registry with online/stale state, capacity-aware
@@ -102,12 +103,13 @@ administrator-only runtime status, start/stop actions, and a permission-checked
 reflects that state. The bounded WASM runtime accepts only the
 documented JSON ABI, denies all module imports, caps module/memory/output
 sizes, and meters execution fuel. Filesystem, network, process, and clock
-capabilities are not exposed to WASM modules. Four host methods are now
-versioned and read-only: `builds.list` (project UUID), `build.details`,
-`build.logs`, and `build.artifacts` (build UUID). Each requires its matching
-declared permission, caps returned records, and wraps the original input with a
-host protocol version; unknown extension methods receive their original input
-unchanged.
+capabilities are not exposed to WASM modules. Six host methods are now
+versioned: `builds.list` (project UUID), `build.details`, `build.logs`,
+`build.annotations`, and `build.artifacts` (build UUID) are bounded reads;
+`build.annotate` persists a bounded annotation with an optional stage UUID. Each
+requires its matching declared permission, caps returned records, and wraps the
+original input with a host protocol version; unknown extension methods receive
+their original input unchanged.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
