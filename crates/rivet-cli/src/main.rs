@@ -131,6 +131,9 @@ enum Command {
         /// Read the credential vault passphrase from a private file.
         #[arg(long)]
         credentials_passphrase_file: Option<PathBuf>,
+        /// Load regular JSON extension manifests from this local directory.
+        #[arg(long)]
+        extension_manifest_dir: Option<PathBuf>,
         /// Allow an additional exact browser origin for the API.
         #[arg(long = "allow-origin", value_name = "ORIGIN")]
         allowed_origins: Vec<String>,
@@ -419,6 +422,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             gitlab_webhook_credential_id,
             credentials_file,
             credentials_passphrase_file,
+            extension_manifest_dir,
             allowed_origins,
         } => {
             let auth_token = token_file.as_deref().map(read_auth_token).transpose()?;
@@ -451,6 +455,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     gitlab_webhook_credential_id,
                     credentials_file,
                     credentials_passphrase,
+                    extension_manifest_dir,
                     allowed_origins,
                 },
             )

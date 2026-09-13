@@ -10,6 +10,7 @@ import type {
   QueueStats,
   ScheduleRecord,
 } from "./types";
+import type { ExtensionManifest } from "./extensionModel";
 import { invoke } from "@tauri-apps/api/core";
 
 export const ENGINE_ORIGIN =
@@ -117,6 +118,10 @@ export function queueStats(): Promise<QueueStats> {
 
 export function agents(): Promise<AgentSummary[]> {
   return request<AgentSummary[]>("/api/v1/agents");
+}
+
+export function extensions(): Promise<ExtensionManifest[]> {
+  return request<ExtensionManifest[]>("/api/v1/extensions");
 }
 
 export function analyzeJenkinsfile(

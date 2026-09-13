@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**82% verified** · `████████████████▍░░░░`<br>
-Weighted evidence score: **82.97 / 100** · displayed conservatively as the
+**83% verified** · `████████████████▋░░░`<br>
+Weighted evidence score: **83.37 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -47,9 +47,11 @@ gates.
 Rivet's extension surface is intentionally a separate, versioned contract.
 `rivet-extension-protocol` validates WASM or direct-subprocess manifests,
 declared permissions, relative entrypoints, and bounded length-prefixed JSON
-frames. The desktop control room mirrors that model and shows the protocol
-boundary without pretending that an extension manager or third-party catalog
-already exists.
+frames. An optional local manifest directory is loaded with strict regular
+file checks and duplicate-ID rejection, then exposed through
+`GET /api/v1/extensions`; the desktop control room mirrors that model and
+reports the validated catalog without pretending that a lifecycle manager or
+third-party catalog already exists.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -171,6 +173,18 @@ cargo run -p rivet -- auth token revoke old-operator \
 The token value is not printed by the command and is not recoverable from the
 policy. User accounts, sessions, expiration, audit history, and external
 identity providers remain future gates.
+
+Extension manifests can be loaded by the headless server from an explicit
+local directory:
+
+```sh
+cargo run -p rivet -- --data-dir .rivet server \
+  --extension-manifest-dir /secure/path/rivet-extensions
+```
+
+Only `.json` regular files are considered. Manifests are validated for
+protocol version, relative entrypoint, unique ID, and declared permissions;
+the catalog does not execute or auto-grant an extension.
 
 The versioned API currently exposes health, projects, queued builds, build
 details, persisted logs, cancellation, a live queue snapshot, durable replay,

@@ -1198,6 +1198,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "uuid",
@@ -1258,6 +1259,7 @@ dependencies = [
  "rivet-auth",
  "rivet-core",
  "rivet-credentials",
+ "rivet-extension-protocol",
  "rivet-migration",
  "rivet-runner",
  "rivet-scm",

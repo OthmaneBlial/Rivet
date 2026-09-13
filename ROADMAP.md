@@ -5,8 +5,8 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **82 / 100 points** (**82.97 weighted evidence
-points**, displayed conservatively as 82%).
+The current verified total is **83 / 100 points** (**83.37 weighted evidence
+points**, displayed conservatively as 83%).
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
@@ -26,7 +26,7 @@ points**, displayed conservatively as 82%).
 | CI cache | 3 | partial | validated exact project-scoped keys, safe relative paths, atomic local archive save/restore, and corrupt-entry recovery pass; fallback keys, eviction, and remote cache backends remain |
 | Secrets and credentials | 6 | partial | secret parameters require explicit runtime values, persisted values/API responses are redacted, logs are masked, retries require fresh secret input, and a passphrase-encrypted local credential vault with private-file CLI setup passes; credential ownership, rotation, keychain integration, and project access control remain |
 | Authentication and authorization | 4 | partial | protected remote transport with private Bearer tokens, policy-file token digests, roles, project scopes, route authorization, agent-connect permission checks, and local token creation/listing/revocation pass; users, sessions, expiration, audit history, and external identity providers remain |
-| Extension protocol | 4 | partial | versioned manifest, WASM/subprocess kind model, declared permission vocabulary, bounded length-prefixed JSON framing, direct-argument subprocess host, and desktop extension model pass; catalog discovery, permission enforcement, WASM runtime, and lifecycle UI remain |
+| Extension protocol | 4 | partial | versioned manifest, WASM/subprocess kind model, declared permission vocabulary, bounded length-prefixed JSON framing, direct-argument subprocess host, bounded local catalog discovery/API, and desktop extension model pass; permission enforcement in a lifecycle manager, WASM runtime, and lifecycle UI remain |
 | Jenkins migration analyzer | 3 | partial | bounded Jenkinsfile analysis, headless API delivery, rendered desktop report, and valid drafts for deterministic quoted shell steps pass; full Groovy parsing, plugin semantics, and broad generated Rivetfile conversion remain |
 | Differential compatibility harness | 2 | planned | normalized behavioral fixtures and permanent regressions |
 | Release and operations | 2 | planned | packaging, observability, upgrades, recovery, security and load gates |
@@ -38,7 +38,7 @@ states. “Planned” is zero progress, “partial” receives only the portion 
 by evidence, and “verified” receives the full workstream weight. A local build,
 scaffold, passing unrelated test, or interface alone does not complete a gate.
 
-The next gates are extension catalog discovery/permission enforcement, the
+The next gates are extension permission enforcement in a lifecycle manager, the
 WASM runtime and lifecycle UI, the final Tauri-window flow inside the packaged app, API
 deployment hardening, resuming remote attempts across server restart and
 richer retry policy, credential ownership/rotation/keychain integration, user

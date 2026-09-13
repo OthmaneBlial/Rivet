@@ -10,3 +10,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { version = "1.47", features = ["io-util", "macros", "process", "rt-multi-thread"] }
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

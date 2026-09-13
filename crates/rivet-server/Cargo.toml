@@ -15,6 +15,7 @@ rivet-agent-protocol = { path = "../rivet-agent-protocol" }
 rivet-auth = { path = "../rivet-auth" }
 rivet-credentials = { path = "../rivet-credentials" }
 rivet-core = { path = "../rivet-core" }
+rivet-extension-protocol = { path = "../rivet-extension-protocol" }
 rivet-migration = { path = "../rivet-migration" }
 rivet-runner = { path = "../rivet-runner" }
 rivet-scm = { path = "../rivet-scm" }

@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Component, Path};
 use std::process::Stdio;
 use thiserror::Error;
@@ -30,6 +31,8 @@ const MAX_EVENT_BYTES: usize = 128;
 const MAX_ERROR_CODE_BYTES: usize = 64;
 const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 const MAX_PERMISSIONS: usize = 32;
+const MAX_CATALOG_MANIFESTS: usize = 128;
+const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -38,7 +41,7 @@ pub enum ExtensionKind {
     Subprocess,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtensionPermission {
     ReadBuilds,
@@ -92,6 +95,124 @@ impl ExtensionManifest {
         }
         Ok(())
     }
+
+    pub fn allows(&self, permission: ExtensionPermission) -> bool {
+        self.permissions.contains(&permission)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExtensionCatalog {
+    manifests: Vec<ExtensionManifest>,
+}
+
+impl ExtensionCatalog {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn from_directory(path: Option<&Path>) -> Result<Self, ExtensionCatalogError> {
+        let Some(path) = path else {
+            return Ok(Self::empty());
+        };
+        let metadata =
+            fs::symlink_metadata(path).map_err(|error| ExtensionCatalogError::Filesystem {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ExtensionCatalogError::InvalidDirectory(path.to_path_buf()));
+        }
+
+        let mut entries = fs::read_dir(path)
+            .map_err(|error| ExtensionCatalogError::Filesystem {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ExtensionCatalogError::Filesystem {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        entries.sort_by_key(|entry| entry.path());
+        let mut manifests = Vec::new();
+        let mut ids = HashSet::new();
+        for entry in entries {
+            let manifest_path = entry.path();
+            if !manifest_path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            {
+                continue;
+            }
+            if manifests.len() == MAX_CATALOG_MANIFESTS {
+                return Err(ExtensionCatalogError::TooManyManifests);
+            }
+            let metadata = fs::symlink_metadata(&manifest_path).map_err(|error| {
+                ExtensionCatalogError::Filesystem {
+                    path: manifest_path.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(ExtensionCatalogError::InvalidManifestPath(manifest_path));
+            }
+            if metadata.len() > MAX_MANIFEST_BYTES {
+                return Err(ExtensionCatalogError::ManifestTooLarge(manifest_path));
+            }
+            let bytes =
+                fs::read(&manifest_path).map_err(|error| ExtensionCatalogError::Filesystem {
+                    path: manifest_path.clone(),
+                    message: error.to_string(),
+                })?;
+            let manifest =
+                serde_json::from_slice::<ExtensionManifest>(&bytes).map_err(|error| {
+                    ExtensionCatalogError::InvalidManifest {
+                        path: manifest_path.clone(),
+                        message: error.to_string(),
+                    }
+                })?;
+            manifest
+                .validate()
+                .map_err(|error| ExtensionCatalogError::InvalidManifest {
+                    path: manifest_path.clone(),
+                    message: error.to_string(),
+                })?;
+            if !ids.insert(manifest.id.clone()) {
+                return Err(ExtensionCatalogError::DuplicateId(manifest.id));
+            }
+            manifests.push(manifest);
+        }
+        Ok(Self { manifests })
+    }
+
+    pub fn manifests(&self) -> &[ExtensionManifest] {
+        &self.manifests
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ExtensionCatalogError {
+    #[error("extension catalog directory is not a regular directory: {0}")]
+    InvalidDirectory(std::path::PathBuf),
+    #[error("extension catalog entry is not a regular manifest file: {0}")]
+    InvalidManifestPath(std::path::PathBuf),
+    #[error("extension manifest is larger than the 64 KiB limit: {0}")]
+    ManifestTooLarge(std::path::PathBuf),
+    #[error("could not read extension catalog path {path}: {message}")]
+    Filesystem {
+        path: std::path::PathBuf,
+        message: String,
+    },
+    #[error("invalid extension manifest {path}: {message}")]
+    InvalidManifest {
+        path: std::path::PathBuf,
+        message: String,
+    },
+    #[error("extension catalog contains duplicate ID {0}")]
+    DuplicateId(String),
+    #[error("extension catalog contains more than {MAX_CATALOG_MANIFESTS} manifests")]
+    TooManyManifests,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -430,6 +551,18 @@ impl SubprocessExtension {
         }
     }
 
+    pub async fn request_with_permission(
+        &mut self,
+        permission: ExtensionPermission,
+        method: impl Into<String>,
+        payload: Value,
+    ) -> Result<Value, ExtensionHostError> {
+        if !self.manifest.allows(permission) {
+            return Err(ExtensionHostError::PermissionDenied(permission));
+        }
+        self.request(method, payload).await
+    }
+
     pub async fn shutdown(mut self) -> Result<(), ExtensionHostError> {
         self.write_message(&ExtensionMessage::Shutdown {
             protocol_version: PROTOCOL_VERSION,
@@ -494,6 +627,8 @@ pub enum ExtensionHostError {
     UnexpectedHandshake,
     #[error("extension subprocess host requires a subprocess manifest")]
     WrongExtensionKind,
+    #[error("extension does not declare the {0:?} permission")]
+    PermissionDenied(ExtensionPermission),
     #[error("extension subprocess response did not match the request")]
     UnexpectedResponse,
     #[error("extension returned {code}: {message}")]
@@ -677,6 +812,37 @@ mod tests {
         assert!(matches!(
             frame,
             Err(ExtensionProtocolError::ManifestVersionMismatch)
+        ));
+    }
+
+    #[test]
+    fn catalog_loads_only_bounded_regular_json_manifests() {
+        let directory = tempfile::tempdir().expect("catalog directory");
+        let manifest_path = directory.path().join("coverage.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest(ExtensionKind::Wasm)).expect("manifest JSON"),
+        )
+        .expect("write manifest");
+        std::fs::write(directory.path().join("README.txt"), "ignored").expect("write note");
+
+        let catalog = ExtensionCatalog::from_directory(Some(directory.path())).expect("catalog");
+        assert_eq!(catalog.manifests().len(), 1);
+        assert_eq!(catalog.manifests()[0].id, "coverage.reporter");
+        assert!(catalog.manifests()[0].allows(ExtensionPermission::ReadBuilds));
+        assert!(!catalog.manifests()[0].allows(ExtensionPermission::TriggerBuilds));
+    }
+
+    #[test]
+    fn catalog_rejects_duplicate_manifest_ids() {
+        let directory = tempfile::tempdir().expect("catalog directory");
+        let bytes = serde_json::to_vec(&manifest(ExtensionKind::Subprocess)).expect("manifest");
+        std::fs::write(directory.path().join("first.json"), &bytes).expect("first manifest");
+        std::fs::write(directory.path().join("second.json"), bytes).expect("second manifest");
+
+        assert!(matches!(
+            ExtensionCatalog::from_directory(Some(directory.path())),
+            Err(ExtensionCatalogError::DuplicateId(id)) if id == "coverage.reporter"
         ));
     }
 

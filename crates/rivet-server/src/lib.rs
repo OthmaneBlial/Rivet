@@ -24,6 +24,7 @@ use rivet_core::{
     SourceSnapshot,
 };
 use rivet_credentials::{CredentialError, CredentialVault};
+use rivet_extension_protocol::{ExtensionCatalog, ExtensionCatalogError, ExtensionManifest};
 use rivet_runner::{QueueHandle, QueueStats, Scheduler};
 use rivet_scm::{GitHttpCredential, GitPrepareOptions, GitRepository, GitSnapshot, ScmError};
 use rivet_storage::{
@@ -74,6 +75,7 @@ pub struct AppState {
     github_webhook_credential_id: Option<String>,
     gitlab_webhook_credential_id: Option<String>,
     credentials: Option<Arc<CredentialVault>>,
+    extensions: Arc<ExtensionCatalog>,
     agents: AgentRegistry,
     remote_messages: Arc<Mutex<HashMap<BuildId, RemoteBuildRoute>>>,
 }
@@ -96,6 +98,7 @@ pub struct ServerConfig {
     pub gitlab_webhook_credential_id: Option<String>,
     pub credentials_file: Option<PathBuf>,
     pub credentials_passphrase: Option<String>,
+    pub extension_manifest_dir: Option<PathBuf>,
     pub allowed_origins: Vec<String>,
 }
 
@@ -123,6 +126,8 @@ pub enum ServerError {
     IncompleteCredentialVaultConfig,
     #[error("could not open credential vault: {0}")]
     Credentials(#[from] CredentialError),
+    #[error("could not load extension catalog: {0}")]
+    Extensions(#[from] ExtensionCatalogError),
     #[error("invalid allowed origin: {0}")]
     InvalidAllowedOrigin(String),
 }
@@ -333,6 +338,7 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
     Ok(Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/auth/me", get(auth_me))
+        .route("/api/v1/extensions", get(list_extensions))
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/agents/match", post(match_agents))
         .route("/api/v1/agents/connect", get(connect_agent))
@@ -514,6 +520,7 @@ pub async fn serve(storage_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(
             gitlab_webhook_credential_id: None,
             credentials_file: None,
             credentials_passphrase: None,
+            extension_manifest_dir: None,
             allowed_origins: default_allowed_origins(),
         },
     )
@@ -557,6 +564,7 @@ pub async fn serve_with_listener(
         (None, None) => None,
         _ => return Err(ServerError::IncompleteCredentialVaultConfig),
     };
+    let extensions = ExtensionCatalog::from_directory(config.extension_manifest_dir.as_deref())?;
     let storage = Storage::open(storage_path)?;
     let recovered_builds = storage.recover_incomplete_builds(Utc::now())?;
     for build_id in &recovered_builds {
@@ -572,6 +580,7 @@ pub async fn serve_with_listener(
         credentials,
     );
     state.auth_policy = auth_policy;
+    state.extensions = Arc::new(extensions);
     state.github_webhook_secret = config
         .github_webhook_secret
         .as_deref()
@@ -709,6 +718,7 @@ impl AppState {
             github_webhook_credential_id: None,
             gitlab_webhook_credential_id: None,
             credentials: None,
+            extensions: Arc::new(ExtensionCatalog::empty()),
             agents: AgentRegistry::default(),
             remote_messages: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -907,6 +917,14 @@ async fn list_projects(
         .filter(|project| principal.can_project(Permission::Read, &project.name))
         .collect();
     Ok(Json(projects))
+}
+
+async fn list_extensions(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<ExtensionManifest>>, ApiError> {
+    require_global(&principal, Permission::Read)?;
+    Ok(Json(state.extensions.manifests().to_vec()))
 }
 
 async fn list_agents(
@@ -3183,6 +3201,7 @@ mod tests {
         AgentCapabilities, AgentHeartbeat, AgentRegistration, AgentRequirements, PROTOCOL_VERSION,
     };
     use rivet_auth::{ApiTokenRecord, AuthPolicyDocument, Role};
+    use rivet_extension_protocol::{ExtensionKind, ExtensionPermission};
     use std::fs;
     use tempfile::tempdir;
     use tokio::time::sleep;
@@ -3270,6 +3289,45 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 4096).await.expect("body");
         assert_eq!(&body[..], b"[]");
+    }
+
+    #[tokio::test]
+    async fn extensions_route_returns_only_validated_catalog_manifests() {
+        let directory = tempdir().expect("catalog directory");
+        let manifest = ExtensionManifest {
+            protocol_version: rivet_extension_protocol::PROTOCOL_VERSION,
+            id: "coverage.reporter".into(),
+            name: "Coverage reporter".into(),
+            version: "1.0.0".into(),
+            kind: ExtensionKind::Wasm,
+            entrypoint: "coverage.wasm".into(),
+            permissions: vec![ExtensionPermission::ReadBuilds],
+        };
+        fs::write(
+            directory.path().join("coverage.json"),
+            serde_json::to_vec(&manifest).expect("manifest JSON"),
+        )
+        .expect("manifest");
+        let catalog = ExtensionCatalog::from_directory(Some(directory.path())).expect("catalog");
+        let mut state = AppState::new(Storage::open_in_memory().expect("storage"));
+        state.extensions = Arc::new(catalog);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/extensions")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("body");
+        let manifests: Vec<ExtensionManifest> =
+            serde_json::from_slice(&body).expect("manifests JSON");
+        assert_eq!(manifests, vec![manifest]);
     }
 
     #[tokio::test]

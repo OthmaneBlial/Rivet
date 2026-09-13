@@ -10,6 +10,7 @@ import {
   analyzeJenkinsfile,
   agents as fetchAgents,
   artifacts,
+  extensions as fetchExtensions,
   ENGINE_OFFLINE_MESSAGE,
   eventUrl,
   getEngineOrigin,
@@ -39,6 +40,7 @@ import {
   EXTENSION_PERMISSION_LABELS,
   type ExtensionPermission,
 } from "./extensionModel";
+import type { ExtensionManifest } from "./extensionModel";
 
 const NAV_ITEMS = [
   { label: "Pipelines", mark: "↳", active: true },
@@ -138,6 +140,7 @@ function App() {
   const [buildList, setBuildList] = useState<BuildRecord[]>([]);
   const [queueStatus, setQueueStatus] = useState<{ queued: number; running: number; capacity: number } | null>(null);
   const [agentList, setAgentList] = useState<AgentSummary[]>([]);
+  const [extensionList, setExtensionList] = useState<ExtensionManifest[]>([]);
   const [selectedBuild, setSelectedBuild] = useState<number | null>(null);
   const [details, setDetails] = useState<BuildDetails | null>(null);
   const [logLines, setLogLines] = useState<LogRecord[]>([]);
@@ -234,6 +237,14 @@ function App() {
     }
   }, []);
 
+  const loadExtensionList = useCallback(async () => {
+    try {
+      setExtensionList(await fetchExtensions());
+    } catch {
+      setExtensionList([]);
+    }
+  }, []);
+
   useEffect(() => {
     void initializeEngineOrigin();
     void loadProjects();
@@ -277,6 +288,14 @@ function App() {
     const interval = window.setInterval(() => void loadAgentList(), 3000);
     return () => window.clearInterval(interval);
   }, [engineOnline, loadAgentList]);
+
+  useEffect(() => {
+    if (!engineOnline) {
+      setExtensionList([]);
+      return;
+    }
+    void loadExtensionList();
+  }, [engineOnline, loadExtensionList]);
 
   useEffect(() => {
     if (engineOnline) return;
@@ -520,7 +539,7 @@ function App() {
             onAnalyze={() => void runMigrationAnalysis()}
           />
         ) : activeNav === "Extensions" ? (
-          <ExtensionsPanel />
+          <ExtensionsPanel extensions={extensionList} />
         ) : activeNav === "Agents" ? (
           <AgentsPanel agents={agentList} online={engineOnline} />
         ) : projectsList.length === 0 ? (
@@ -791,7 +810,7 @@ function AgentsPanel({ agents, online }: { agents: AgentSummary[]; online: boole
   );
 }
 
-function ExtensionsPanel() {
+function ExtensionsPanel({ extensions }: { extensions: ExtensionManifest[] }) {
   const permissionEntries = Object.entries(EXTENSION_PERMISSION_LABELS) as [
     ExtensionPermission,
     string,
@@ -814,7 +833,7 @@ function ExtensionsPanel() {
       <section className="metric-grid extensions-metrics" aria-label="Extension protocol metrics">
         <MetricCard label="Protocol" value={`v${EXTENSION_CATALOG.protocol_version}`} detail="versioned contract" accent="cyan" />
         <MetricCard label="Runtimes" value={String(EXTENSION_CATALOG.supported_kinds.length).padStart(2, "0")} detail="WASM / subprocess" accent="amber" />
-        <MetricCard label="Loaded" value={String(EXTENSION_CATALOG.loaded.length).padStart(2, "0")} detail="local catalog" accent="neutral" />
+        <MetricCard label="Loaded" value={String(extensions.length).padStart(2, "0")} detail="local catalog" accent="neutral" />
         <MetricCard label="Permissions" value={String(permissionEntries.length).padStart(2, "0")} detail="declared capabilities" accent="neutral" />
       </section>
 
@@ -853,8 +872,8 @@ function ExtensionsPanel() {
 
       <section className="panel extension-empty-card">
         <span className="extension-empty-mark">◇</span>
-        <div><span className="overline">Catalog status</span><strong>No extensions loaded</strong><p>The protocol and desktop model are ready for a future catalog manager. Nothing is installed, executed, or granted by this view.</p></div>
-        <span className="extension-gate">MANAGER GATED</span>
+        <div><span className="overline">Catalog status</span><strong>{extensions.length ? `${extensions.length} extension${extensions.length === 1 ? "" : "s"} loaded` : "No extensions loaded"}</strong><p>{extensions.length ? "These manifests were validated by the local engine. Runtime permissions are still reviewed at the host boundary." : "The protocol and desktop model are ready for a future catalog manager. Nothing is installed, executed, or granted by this empty view."}</p></div>
+        <span className="extension-gate">{extensions.length ? "MANIFESTS VALIDATED" : "MANAGER GATED"}</span>
       </section>
     </div>
   );
