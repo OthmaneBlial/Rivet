@@ -5,7 +5,7 @@ from Jenkins.
 
 ## Delivery progress
 
-**73% verified** · `██████████████▋░░░░░`<br>
+**75% verified** · `███████████████░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -31,8 +31,9 @@ matching, a reconnecting heartbeat CLI client, and a rendered fleet view. Pipeli
 steps can declare exact remote requirements; the local runner refuses those steps
 until assignment exists. A matching agent can now reserve capacity, receive a
 bounded workspace archive, execute the assigned pipeline through the shared Rust
-runner, and relay typed events, output, and cancellation. Lost-job recovery and
-remote artifact collection remain future gates.
+runner, and relay typed events, output, and cancellation. Remote artifact
+bundles now return through a bounded, checksum-verified channel; lost-job
+recovery remains a future gate.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -158,8 +159,9 @@ ephemeral registry; silent agents become `stale` after the heartbeat window.
 stale or saturated agents. A build with a remote step reserves a matching online
 agent, transfers the repository workspace in bounded chunks, executes it with
 the shared Rust runner, and persists the agent's typed build events and output.
-Cancellation is propagated to the agent; lost-job recovery and remote artifact
-collection remain future gates.
+Cancellation is propagated to the agent, and declared artifacts return through
+the same bounded transfer with checksum verification before local storage.
+Lost-job recovery remains a future gate.
 
 Connect a worker for heartbeat and capability discovery:
 
@@ -248,7 +250,9 @@ save only after a successful build to an atomic archive under Rivet's local
 data directory; a missing or corrupt cache never fails the build. Artifact
 files stay inside the pipeline workspace, are copied to local Rivet storage
 with a SHA-256 checksum, and are available through the build artifacts API or
-`rivet artifacts`.
+`rivet artifacts`. Remote agents package only declared artifact matches and
+return them through bounded checksum-verified archive chunks before the build
+is marked passed.
 
 A step can opt into explicit Docker execution with `[stages.steps.container]`.
 Rivet assembles a direct `docker run` invocation with a private workspace mount,
