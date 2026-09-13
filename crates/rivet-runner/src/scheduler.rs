@@ -1,4 +1,4 @@
-use crate::{RunnerError, execute_pipeline_with_parameters};
+use crate::{RunnerError, execute_pipeline_with_parameters_and_cache};
 use chrono::Utc;
 use rivet_core::{BuildEvent, BuildId, BuildStatus, ExecutionPlan, Pipeline, ProjectId};
 use std::collections::BTreeMap;
@@ -60,6 +60,14 @@ impl Scheduler {
     /// project limit. Queue admission is separate from execution permits, so
     /// callers can persist `queued` before a worker starts.
     pub fn new(global_concurrency: usize, per_project_concurrency: Option<usize>) -> Self {
+        Self::new_with_cache(global_concurrency, per_project_concurrency, None)
+    }
+
+    pub fn new_with_cache(
+        global_concurrency: usize,
+        per_project_concurrency: Option<usize>,
+        cache_root: Option<PathBuf>,
+    ) -> Self {
         assert!(
             global_concurrency > 0,
             "global concurrency must be positive"
@@ -80,11 +88,13 @@ impl Scheduler {
             Arc<Semaphore>,
         >::new()));
         let worker_metrics = metrics.clone();
+        let worker_cache_root = cache_root;
         let worker = tokio::spawn(async move {
             while let Some(request) = receiver.recv().await {
                 let global = global.clone();
                 let project_slots = project_slots.clone();
                 let metrics = worker_metrics.clone();
+                let cache_root = worker_cache_root.clone();
                 let project_id = request.plan.project_id;
                 let project_slot = {
                     let mut slots = project_slots.lock().await;
@@ -129,13 +139,14 @@ impl Scheduler {
                     }
                     metrics.queued.fetch_sub(1, Ordering::Relaxed);
                     metrics.running.fetch_add(1, Ordering::Relaxed);
-                    let result = execute_pipeline_with_parameters(
+                    let result = execute_pipeline_with_parameters_and_cache(
                         &request.plan,
                         &request.pipeline,
                         request.repository_root,
                         &request.parameters,
                         request.cancellation,
                         request.events,
+                        cache_root.as_deref(),
                     )
                     .await;
                     drop(project_permit);

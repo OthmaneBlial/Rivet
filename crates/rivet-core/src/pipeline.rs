@@ -14,6 +14,8 @@ pub struct Pipeline {
     pub parameters: Vec<ParameterSpec>,
     #[serde(default)]
     pub artifacts: Vec<ArtifactSpec>,
+    #[serde(default)]
+    pub caches: Vec<CacheSpec>,
     pub stages: Vec<Stage>,
 }
 
@@ -34,6 +36,13 @@ pub struct ArtifactSpec {
     pub paths: Vec<String>,
     #[serde(default)]
     pub allow_empty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CacheSpec {
+    pub name: String,
+    pub key: String,
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -115,6 +124,22 @@ pub enum PipelineError {
     InvalidArtifactPath { artifact: String, path: String },
     #[error("duplicate artifact name {0:?}")]
     DuplicateArtifact(String),
+    #[error("cache name cannot be empty")]
+    EmptyCacheName,
+    #[error("cache name {0:?} is invalid")]
+    InvalidCacheName(String),
+    #[error("cache key for {0:?} cannot be empty")]
+    EmptyCacheKey(String),
+    #[error("cache key for {name:?} is too long")]
+    CacheKeyTooLong { name: String },
+    #[error("cache key for {name:?} contains a control character")]
+    InvalidCacheKey { name: String },
+    #[error("cache {0:?} must declare at least one path")]
+    EmptyCachePaths(String),
+    #[error("cache {cache:?} has an invalid path {path:?}")]
+    InvalidCachePath { cache: String, path: String },
+    #[error("duplicate cache name {0:?}")]
+    DuplicateCache(String),
 }
 
 impl Pipeline {
@@ -191,6 +216,55 @@ impl Pipeline {
                 {
                     return Err(PipelineError::InvalidArtifactPath {
                         artifact: artifact.name.clone(),
+                        path: path.clone(),
+                    });
+                }
+            }
+        }
+
+        let mut cache_names = HashSet::new();
+        for cache in &self.caches {
+            if cache.name.trim().is_empty() {
+                return Err(PipelineError::EmptyCacheName);
+            }
+            if !valid_cache_name(&cache.name) {
+                return Err(PipelineError::InvalidCacheName(cache.name.clone()));
+            }
+            if !cache_names.insert(cache.name.as_str()) {
+                return Err(PipelineError::DuplicateCache(cache.name.clone()));
+            }
+            if cache.key.trim().is_empty() {
+                return Err(PipelineError::EmptyCacheKey(cache.name.clone()));
+            }
+            if cache.key.len() > 256 {
+                return Err(PipelineError::CacheKeyTooLong {
+                    name: cache.name.clone(),
+                });
+            }
+            if cache.key.chars().any(char::is_control) {
+                return Err(PipelineError::InvalidCacheKey {
+                    name: cache.name.clone(),
+                });
+            }
+            if cache.paths.is_empty() {
+                return Err(PipelineError::EmptyCachePaths(cache.name.clone()));
+            }
+            for path in &cache.paths {
+                let path_value = Path::new(path);
+                if path.trim().is_empty()
+                    || path.contains('\0')
+                    || path.chars().any(char::is_control)
+                    || path_value.is_absolute()
+                    || path_value == Path::new(".")
+                    || path
+                        .chars()
+                        .any(|character| matches!(character, '*' | '?' | '[' | ']'))
+                    || path_value
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    return Err(PipelineError::InvalidCachePath {
+                        cache: cache.name.clone(),
                         path: path.clone(),
                     });
                 }
@@ -346,6 +420,16 @@ fn valid_parameter_name(name: &str) -> bool {
     let mut characters = name.chars();
     matches!(characters.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
         && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn valid_cache_name(name: &str) -> bool {
+    name.chars().enumerate().all(|(index, character)| {
+        if index == 0 {
+            character == '_' || character.is_ascii_alphabetic()
+        } else {
+            character == '_' || character == '-' || character.is_ascii_alphanumeric()
+        }
+    })
 }
 
 #[cfg(test)]
@@ -583,6 +667,49 @@ program = "true"
         assert!(matches!(
             pipeline.resolve_workspace(dir.path()),
             Err(PipelineError::WorkspaceOutsideRepository(_))
+        ));
+    }
+
+    #[test]
+    fn validates_project_scoped_cache_declarations() {
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "cache"
+[[caches]]
+name = "dependencies-v1"
+key = "deps-v1"
+paths = ["target", "node_modules"]
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("cache pipeline");
+        assert_eq!(pipeline.caches[0].name, "dependencies-v1");
+        assert_eq!(pipeline.caches[0].paths, ["target", "node_modules"]);
+
+        let invalid = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "invalid-cache"
+[[caches]]
+name = "dependencies"
+key = "deps-v1"
+paths = ["../outside"]
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        );
+        assert!(matches!(
+            invalid,
+            Err(PipelineError::InvalidCachePath { cache, path })
+                if cache == "dependencies" && path == "../outside"
         ));
     }
 }

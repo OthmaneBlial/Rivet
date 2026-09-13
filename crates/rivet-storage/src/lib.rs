@@ -26,6 +26,7 @@ use walkdir::WalkDir;
 pub struct Storage {
     connection: Arc<Mutex<Connection>>,
     artifact_root: Arc<std::path::PathBuf>,
+    cache_root: Arc<std::path::PathBuf>,
 }
 
 fn apply_migration(
@@ -210,6 +211,14 @@ impl Storage {
                 .unwrap_or_else(|| Path::new("."))
                 .join("artifacts")
         };
+        let cache_root = if path == Path::new(":memory:") {
+            std::env::temp_dir().join(format!("rivet-cache-{}", Uuid::new_v4()))
+        } else {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .join("cache")
+        };
         connection.execute_batch(include_str!("../migrations/001_initial.sql"))?;
         apply_migration(&connection, 1, None)?;
         apply_migration(
@@ -245,11 +254,16 @@ impl Storage {
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             artifact_root: Arc::new(artifact_root),
+            cache_root: Arc::new(cache_root),
         })
     }
 
     pub fn open_in_memory() -> Result<Self, StorageError> {
         Self::open(":memory:")
+    }
+
+    pub fn cache_root(&self) -> std::path::PathBuf {
+        self.cache_root.as_ref().clone()
     }
 
     pub fn create_project(

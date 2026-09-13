@@ -6,7 +6,10 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+hex.workspace = true
 rivet-core = { path = "../rivet-core" }
+sha2.workspace = true
+tar = "0.4"
 thiserror.workspace = true
 tokio = { version = "1.47", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }

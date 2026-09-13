@@ -1,4 +1,4 @@
-use crate::{ProcessOutcome, ProcessSpec, run_process};
+use crate::{CacheStore, ProcessOutcome, ProcessSpec, run_process};
 use chrono::Utc;
 use rivet_core::{
     BuildEvent, BuildStatus, ExecutionPlan, ExecutionStage, ExecutionStep, Pipeline, StageStatus,
@@ -54,12 +54,49 @@ pub async fn execute_pipeline_with_parameters(
     cancellation: CancellationToken,
     events: mpsc::Sender<BuildEvent>,
 ) -> Result<BuildStatus, RunnerError> {
+    execute_pipeline_with_parameters_and_cache(
+        plan,
+        pipeline,
+        repository_root,
+        parameters,
+        cancellation,
+        events,
+        None,
+    )
+    .await
+}
+
+pub async fn execute_pipeline_with_parameters_and_cache(
+    plan: &ExecutionPlan,
+    pipeline: &Pipeline,
+    repository_root: impl AsRef<Path>,
+    parameters: &BTreeMap<String, String>,
+    cancellation: CancellationToken,
+    events: mpsc::Sender<BuildEvent>,
+    cache_root: Option<&Path>,
+) -> Result<BuildStatus, RunnerError> {
     pipeline.validate()?;
     let parameters = pipeline.resolve_parameters(parameters)?;
     let secret_values = pipeline.secret_values(&parameters);
     let workspace = pipeline.resolve_workspace(repository_root)?;
     if cancellation.is_cancelled() {
         return finish_cancelled(plan, &events).await;
+    }
+    if let Some(cache_root) = cache_root {
+        let cache_store = CacheStore::new(cache_root);
+        for cache in &pipeline.caches {
+            match cache_store.restore(plan.project_id, cache, &workspace) {
+                Ok(true) => {
+                    tracing::debug!(cache = %cache.name, key = %cache.key, "restored CI cache")
+                }
+                Ok(false) => {
+                    tracing::debug!(cache = %cache.name, key = %cache.key, "CI cache miss")
+                }
+                Err(error) => {
+                    tracing::warn!(cache = %cache.name, ?error, "could not restore CI cache")
+                }
+            }
+        }
     }
     send(
         &events,
@@ -124,6 +161,22 @@ pub async fn execute_pipeline_with_parameters(
         send_stage_finished(plan, stage, StageStatus::Passed, &events).await?;
     }
 
+    if let Some(cache_root) = cache_root {
+        let cache_store = CacheStore::new(cache_root);
+        for cache in &pipeline.caches {
+            match cache_store.save(plan.project_id, cache, &workspace) {
+                Ok(true) => {
+                    tracing::debug!(cache = %cache.name, key = %cache.key, "saved CI cache")
+                }
+                Ok(false) => {
+                    tracing::debug!(cache = %cache.name, key = %cache.key, "CI cache already exists")
+                }
+                Err(error) => {
+                    tracing::warn!(cache = %cache.name, ?error, "could not save CI cache")
+                }
+            }
+        }
+    }
     finish_build(plan, BuildStatus::Passed, &events).await
 }
 
