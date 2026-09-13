@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.12 / 100** · displayed conservatively as the
+Weighted evidence score: **92.24 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -35,7 +35,10 @@ and a bounded Jenkinsfile migration analyzer with line-level support findings
 plus safe drafts for deterministic shell steps, exposed through the headless
 API and rendered in the desktop control room. The server also exposes
 administrator-only subprocess extension lifecycle status and start/stop
-controls, reflected in the desktop view; WASM execution remains gated. The
+controls, reflected in the desktop view. A capability-free WASM runtime now
+supports an explicit JSON ABI with no host imports, bounded linear memory,
+bounded output, and fuel metering; richer extension capability wiring remains
+gated. The
 server also exposes a
 versioned agent handshake/heartbeat registry with online/stale state, capacity-aware
 matching, a reconnecting heartbeat CLI client, and a rendered fleet view. Pipeline
@@ -70,8 +73,8 @@ versioned SHA-256 manifest:
 
 The release gate first runs `scripts/local-progress-check.sh`, which verifies
 that the README percentage matches the weighted evidence calculation, that
-the internal reference directory remains ignored, and that no GitHub Actions
-workflow has been added.
+repository hygiene checks pass, and that no GitHub Actions workflow has been
+added.
 
 This produces a locally verifiable artifact, not a signed installer, store
 submission, or hosted CI result.
@@ -89,8 +92,10 @@ subprocess lifecycle manager: it resolves only regular executables below an
 explicit root, rejects symlink/path escapes, permits one session per ID, and
 checks the declared permission on every host request. The server exposes
 administrator-only runtime status and subprocess start/stop actions, and the
-desktop view reflects that state. WASM execution remains gated until its
-sandboxed runtime and host ABI are implemented.
+desktop view reflects that state. The bounded WASM runtime accepts only the
+documented JSON ABI, denies all module imports, caps module/memory/output
+sizes, and meters execution fuel. Filesystem, network, process, and clock
+capabilities are not exposed to WASM modules.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument

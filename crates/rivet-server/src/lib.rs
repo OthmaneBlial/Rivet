@@ -29,8 +29,8 @@ use rivet_credentials::{
     CredentialError, CredentialKeychain, CredentialKind, CredentialSummary, CredentialVault,
 };
 use rivet_extension_protocol::{
-    ExtensionCatalog, ExtensionCatalogError, ExtensionKind, ExtensionManager,
-    ExtensionManagerError, ExtensionManifest,
+    ExtensionCatalog, ExtensionCatalogError, ExtensionManager, ExtensionManagerError,
+    ExtensionManifest,
 };
 use rivet_runner::{MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHandle, QueueStats, Scheduler};
 use rivet_scm::{
@@ -1454,8 +1454,7 @@ async fn extension_status(
             .map(|manifest| ExtensionRuntimeStatusResponse {
                 id: manifest.id.clone(),
                 active: active.contains(&manifest.id),
-                runtime_available: state.extension_manager.is_some()
-                    && matches!(&manifest.kind, ExtensionKind::Subprocess),
+                runtime_available: state.extension_manager.is_some(),
             })
             .collect(),
     ))
@@ -1499,14 +1498,16 @@ async fn extension_status_for(
     state: &AppState,
     id: &str,
 ) -> Result<Json<ExtensionRuntimeStatusResponse>, ApiError> {
-    let manifest = state
+    if !state
         .extensions
         .manifests()
         .iter()
-        .find(|manifest| manifest.id == id)
-        .ok_or_else(|| {
-            ApiError::ExtensionManager(ExtensionManagerError::UnknownExtension(id.into()))
-        })?;
+        .any(|manifest| manifest.id == id)
+    {
+        return Err(ApiError::ExtensionManager(
+            ExtensionManagerError::UnknownExtension(id.into()),
+        ));
+    }
     let active = match state.extension_manager.as_ref() {
         Some(manager) => manager
             .active_extensions()
@@ -1518,8 +1519,7 @@ async fn extension_status_for(
     Ok(Json(ExtensionRuntimeStatusResponse {
         id: id.to_owned(),
         active,
-        runtime_available: state.extension_manager.is_some()
-            && matches!(&manifest.kind, ExtensionKind::Subprocess),
+        runtime_available: state.extension_manager.is_some(),
     }))
 }
 
@@ -4313,12 +4313,12 @@ mod tests {
             .expect("status body");
         assert_eq!(
             &body[..],
-            br#"[{"id":"coverage.reporter","active":false,"runtime_available":false}]"#
+            br#"[{"id":"coverage.reporter","active":false,"runtime_available":true}]"#
         );
     }
 
     #[tokio::test]
-    async fn wasm_extension_start_is_explicitly_gated() {
+    async fn wasm_extension_routes_start_through_the_bounded_runtime() {
         let directory = tempdir().expect("catalog directory");
         let manifest = ExtensionManifest {
             protocol_version: rivet_extension_protocol::PROTOCOL_VERSION,
@@ -4334,6 +4334,17 @@ mod tests {
             serde_json::to_vec(&manifest).expect("manifest JSON"),
         )
         .expect("manifest");
+        fs::write(
+            directory.path().join("coverage.wasm"),
+            wat::parse_str(
+                r#"(module
+                    (memory (export "memory") 1 1)
+                    (func (export "rivet_alloc") (param i32) (result i32) i32.const 0)
+                    (func (export "rivet_handle") (param i32 i32) (result i64) i64.const 0))"#,
+            )
+            .expect("WASM module"),
+        )
+        .expect("WASM module file");
         let catalog = ExtensionCatalog::from_directory(Some(directory.path())).expect("catalog");
         let manager = ExtensionManager::new(directory.path(), &catalog).expect("manager");
         let mut state = AppState::new(Storage::open_in_memory().expect("storage"));
@@ -4350,14 +4361,13 @@ mod tests {
             )
             .await
             .expect("start response");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 16 * 1024)
             .await
             .expect("start body");
-        let payload: serde_json::Value = serde_json::from_slice(&body).expect("start JSON");
         assert_eq!(
-            payload["error"],
-            "WASM extension \"coverage.reporter\" cannot run before a sandboxed runtime is configured"
+            &body[..],
+            br#"{"id":"coverage.reporter","active":true,"runtime_available":true}"#
         );
     }
 

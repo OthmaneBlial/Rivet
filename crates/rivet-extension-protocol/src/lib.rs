@@ -4,8 +4,8 @@
 //! extension declares whether it is a WASM module or a direct subprocess,
 //! receives JSON messages over a length-prefixed stream, and can only ask for
 //! capabilities named in its manifest. This crate validates and frames the
-//! contract; the manager below owns the subprocess lifecycle and host-side
-//! permission check, while WASM execution remains deliberately unavailable.
+//! contract; the manager below owns the subprocess lifecycle, a small
+//! capability-free WASM runtime, and the host-side permission check.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +19,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use uuid::Uuid;
+use wasmi::{
+    Config, Engine, ExternType, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
+    TypedFunc,
+};
 
 pub const PROTOCOL_NAME: &str = "rivet-extension";
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -35,6 +39,11 @@ const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 const MAX_PERMISSIONS: usize = 32;
 const MAX_CATALOG_MANIFESTS: usize = 128;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_WASM_MODULE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_WASM_MEMORY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WASM_FUEL: u64 = 5_000_000;
+const MAX_WASM_OUTPUT_BYTES: usize = MAX_FRAME_BYTES;
+const WASM_ABI_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -462,17 +471,39 @@ pub struct SubprocessExtension {
     stdout: ChildStdout,
 }
 
-/// Owns the lifecycle of locally catalogued subprocess extensions.
+/// A capability-free in-process WASM extension.
+///
+/// The ABI is intentionally explicit and small. A module must export a
+/// `memory`, `rivet_alloc(i32) -> i32`, and
+/// `rivet_handle(i32, i32) -> i64`. The packed return value contains the
+/// response length in the high 32 bits and its memory pointer in the low 32
+/// bits. Modules cannot import functions, memory, tables, or globals, so the
+/// host exposes no filesystem, network, clock, or process capability.
+pub struct WasmExtension {
+    manifest: ExtensionManifest,
+    store: Store<StoreLimits>,
+    memory: Memory,
+    alloc: TypedFunc<i32, i32>,
+    handle: TypedFunc<(i32, i32), i64>,
+    free: Option<TypedFunc<(i32, i32), ()>>,
+}
+
+enum ExtensionSession {
+    Subprocess(SubprocessExtension),
+    Wasm(WasmExtension),
+}
+
+/// Owns the lifecycle of locally catalogued extensions.
 ///
 /// The manager deliberately keeps the policy boundary in the host: a
 /// manifest is not enough to launch arbitrary code, an entrypoint must be a
 /// regular executable under the configured root, and every request goes
-/// through the manifest permission check. WASM manifests are rejected until a
-/// sandboxed runtime with an explicit host ABI is available.
+/// through the manifest permission check. WASM modules run with no imports,
+/// bounded linear memory, and deterministic fuel metering.
 pub struct ExtensionManager {
     root: PathBuf,
     manifests: BTreeMap<String, ExtensionManifest>,
-    sessions: Arc<Mutex<BTreeMap<String, SubprocessExtension>>>,
+    sessions: Arc<Mutex<BTreeMap<String, ExtensionSession>>>,
 }
 
 impl ExtensionManager {
@@ -523,15 +554,23 @@ impl ExtensionManager {
             .get(id)
             .cloned()
             .ok_or_else(|| ExtensionManagerError::UnknownExtension(id.to_owned()))?;
-        if !matches!(manifest.kind, ExtensionKind::Subprocess) {
-            return Err(ExtensionManagerError::WasmRuntimeUnavailable(id.to_owned()));
+        if self.sessions.lock().await.contains_key(id) {
+            return Err(ExtensionManagerError::AlreadyRunning(id.to_owned()));
         }
-        let program = resolve_entrypoint(&self.root, &manifest)?;
-        let extension = SubprocessExtension::spawn(manifest, program, args).await?;
+        let extension = match &manifest.kind {
+            ExtensionKind::Subprocess => {
+                let program = resolve_entrypoint(&self.root, &manifest)?;
+                ExtensionSession::Subprocess(
+                    SubprocessExtension::spawn(manifest, program, args).await?,
+                )
+            }
+            ExtensionKind::Wasm => {
+                let module = resolve_entrypoint(&self.root, &manifest)?;
+                ExtensionSession::Wasm(WasmExtension::load(manifest, module)?)
+            }
+        };
         let mut sessions = self.sessions.lock().await;
         if sessions.contains_key(id) {
-            drop(sessions);
-            let _ = extension.terminate().await;
             return Err(ExtensionManagerError::AlreadyRunning(id.to_owned()));
         }
         sessions.insert(id.to_owned(), extension);
@@ -546,13 +585,18 @@ impl ExtensionManager {
         payload: Value,
     ) -> Result<Value, ExtensionManagerError> {
         let mut sessions = self.sessions.lock().await;
-        let extension = sessions
+        let session = sessions
             .get_mut(id)
             .ok_or_else(|| ExtensionManagerError::NotRunning(id.to_owned()))?;
-        extension
-            .request_with_permission(permission, method, payload)
-            .await
-            .map_err(ExtensionManagerError::Host)
+        match session {
+            ExtensionSession::Subprocess(extension) => extension
+                .request_with_permission(permission, method, payload)
+                .await
+                .map_err(ExtensionManagerError::Host),
+            ExtensionSession::Wasm(extension) => extension
+                .request_with_permission(permission, method, payload)
+                .map_err(ExtensionManagerError::Host),
+        }
     }
 
     pub async fn shutdown(&self, id: &str) -> Result<(), ExtensionManagerError> {
@@ -562,10 +606,13 @@ impl ExtensionManager {
             .await
             .remove(id)
             .ok_or_else(|| ExtensionManagerError::NotRunning(id.to_owned()))?;
-        extension
-            .shutdown()
-            .await
-            .map_err(ExtensionManagerError::Host)
+        match extension {
+            ExtensionSession::Subprocess(extension) => extension
+                .shutdown()
+                .await
+                .map_err(ExtensionManagerError::Host),
+            ExtensionSession::Wasm(_) => Ok(()),
+        }
     }
 
     pub async fn terminate(&self, id: &str) -> Result<(), ExtensionManagerError> {
@@ -575,10 +622,13 @@ impl ExtensionManager {
             .await
             .remove(id)
             .ok_or_else(|| ExtensionManagerError::NotRunning(id.to_owned()))?;
-        extension
-            .terminate()
-            .await
-            .map_err(ExtensionManagerError::Host)
+        match extension {
+            ExtensionSession::Subprocess(extension) => extension
+                .terminate()
+                .await
+                .map_err(ExtensionManagerError::Host),
+            ExtensionSession::Wasm(_) => Ok(()),
+        }
     }
 }
 
@@ -603,14 +653,180 @@ fn resolve_entrypoint(
     if !resolved.starts_with(root) {
         return Err(ExtensionManagerError::EntrypointOutsideRoot(resolved));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 == 0 {
-            return Err(ExtensionManagerError::NotExecutable(resolved));
+    if matches!(manifest.kind, ExtensionKind::Subprocess) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return Err(ExtensionManagerError::NotExecutable(resolved));
+            }
         }
     }
     Ok(resolved)
+}
+
+impl WasmExtension {
+    fn load(
+        manifest: ExtensionManifest,
+        module_path: impl AsRef<Path>,
+    ) -> Result<Self, ExtensionHostError> {
+        manifest.validate()?;
+        if !matches!(manifest.kind, ExtensionKind::Wasm) {
+            return Err(ExtensionHostError::WrongExtensionKind);
+        }
+        let metadata = fs::metadata(module_path.as_ref()).map_err(ExtensionHostError::Io)?;
+        if metadata.len() > MAX_WASM_MODULE_BYTES {
+            return Err(ExtensionHostError::WasmModuleTooLarge);
+        }
+        let bytes = fs::read(module_path.as_ref()).map_err(ExtensionHostError::Io)?;
+        let mut config = Config::default();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config);
+        let module = Module::new(&engine, &bytes).map_err(|error| {
+            ExtensionHostError::Wasm(format!("module validation failed: {error}"))
+        })?;
+        if module.imports().next().is_some() {
+            return Err(ExtensionHostError::WasmImportsDenied);
+        }
+        let Some(ExternType::Memory(memory_type)) = module.get_export("memory") else {
+            return Err(ExtensionHostError::WasmMissingExport("memory"));
+        };
+        let initial_pages = usize::try_from(u32::from(memory_type.initial_pages()))
+            .map_err(|_| ExtensionHostError::WasmMemoryTooLarge)?;
+        let initial_bytes = initial_pages.saturating_mul(64 * 1024);
+        if initial_bytes > MAX_WASM_MEMORY_BYTES {
+            return Err(ExtensionHostError::WasmMemoryTooLarge);
+        }
+        let mut store = Store::new(
+            &engine,
+            StoreLimitsBuilder::new()
+                .memory_size(MAX_WASM_MEMORY_BYTES)
+                .memories(1)
+                .instances(1)
+                .tables(4)
+                .table_elements(1024)
+                .build(),
+        );
+        store.limiter(|limits| limits);
+        store
+            .set_fuel(MAX_WASM_FUEL)
+            .map_err(|error| ExtensionHostError::Wasm(format!("fuel setup failed: {error}")))?;
+        let linker = Linker::<StoreLimits>::new(&engine);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .map_err(|error| {
+                ExtensionHostError::Wasm(format!("module instantiation failed: {error}"))
+            })?
+            .start(&mut store)
+            .map_err(|error| ExtensionHostError::Wasm(format!("module start failed: {error}")))?;
+        let memory = instance
+            .get_memory(&store, "memory")
+            .ok_or(ExtensionHostError::WasmMissingExport("memory"))?;
+        let alloc = instance
+            .get_typed_func::<i32, i32>(&store, "rivet_alloc")
+            .map_err(|_| ExtensionHostError::WasmMissingExport("rivet_alloc"))?;
+        let handle = instance
+            .get_typed_func::<(i32, i32), i64>(&store, "rivet_handle")
+            .map_err(|_| ExtensionHostError::WasmMissingExport("rivet_handle"))?;
+        let free = instance
+            .get_export(&store, "rivet_free")
+            .map(|_| {
+                instance
+                    .get_typed_func::<(i32, i32), ()>(&store, "rivet_free")
+                    .map_err(|_| ExtensionHostError::WasmInvalidAbi("rivet_free"))
+            })
+            .transpose()?;
+        Ok(Self {
+            manifest,
+            store,
+            memory,
+            alloc,
+            handle,
+            free,
+        })
+    }
+
+    fn request_with_permission(
+        &mut self,
+        permission: ExtensionPermission,
+        method: impl Into<String>,
+        payload: Value,
+    ) -> Result<Value, ExtensionHostError> {
+        ensure_permission(&self.manifest, permission)?;
+        let request_id = Uuid::new_v4();
+        let request = serde_json::json!({
+            "abi_version": WASM_ABI_VERSION,
+            "request_id": request_id,
+            "method": method.into(),
+            "payload": payload,
+        });
+        let request = serde_json::to_vec(&request).map_err(|error| {
+            ExtensionHostError::Wasm(format!("request encoding failed: {error}"))
+        })?;
+        if request.len() > MAX_FRAME_BYTES {
+            return Err(ExtensionHostError::WasmOutputTooLarge);
+        }
+        let request_len = i32::try_from(request.len())
+            .map_err(|_| ExtensionHostError::WasmInvalidAbi("request length"))?;
+        let request_ptr = self
+            .alloc
+            .call(&mut self.store, request_len)
+            .map_err(|error| ExtensionHostError::Wasm(format!("allocator trapped: {error}")))?;
+        if request_ptr < 0 {
+            return Err(ExtensionHostError::WasmInvalidPointer);
+        }
+        let request_ptr =
+            usize::try_from(request_ptr).map_err(|_| ExtensionHostError::WasmInvalidPointer)?;
+        self.memory
+            .write(&mut self.store, request_ptr, &request)
+            .map_err(|error| ExtensionHostError::Wasm(format!("request write failed: {error}")))?;
+        let packed = self
+            .handle
+            .call(&mut self.store, (request_ptr as i32, request_len))
+            .map_err(|error| ExtensionHostError::Wasm(format!("handler trapped: {error}")))?
+            as u64;
+        let response_ptr = usize::try_from((packed & u64::from(u32::MAX)) as u32)
+            .map_err(|_| ExtensionHostError::WasmInvalidPointer)?;
+        let response_len = usize::try_from((packed >> 32) as u32)
+            .map_err(|_| ExtensionHostError::WasmInvalidPointer)?;
+        if response_len > MAX_WASM_OUTPUT_BYTES {
+            return Err(ExtensionHostError::WasmOutputTooLarge);
+        }
+        let mut response = vec![0_u8; response_len];
+        self.memory
+            .read(&self.store, response_ptr, &mut response)
+            .map_err(|error| ExtensionHostError::Wasm(format!("response read failed: {error}")))?;
+        if let Some(free) = self.free {
+            free.call(&mut self.store, (response_ptr as i32, response_len as i32))
+                .map_err(|error| {
+                    ExtensionHostError::Wasm(format!("response free trapped: {error}"))
+                })?;
+        }
+        let response: Value = serde_json::from_slice(&response).map_err(|error| {
+            ExtensionHostError::Wasm(format!("response JSON is invalid: {error}"))
+        })?;
+        if response.get("abi_version").and_then(Value::as_u64) != Some(u64::from(WASM_ABI_VERSION))
+        {
+            return Err(ExtensionHostError::WasmInvalidResponse("ABI version"));
+        }
+        if let Some(error) = response.get("error") {
+            let code = error
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("wasm_error")
+                .to_owned();
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("WASM extension returned an error")
+                .to_owned();
+            return Err(ExtensionHostError::Remote { code, message });
+        }
+        response
+            .get("result")
+            .cloned()
+            .ok_or(ExtensionHostError::WasmInvalidResponse("result"))
+    }
 }
 
 impl SubprocessExtension {
@@ -804,6 +1020,24 @@ pub enum ExtensionHostError {
     UnexpectedResponse,
     #[error("extension returned {code}: {message}")]
     Remote { code: String, message: String },
+    #[error("WASM module exceeds the 16 MiB module limit")]
+    WasmModuleTooLarge,
+    #[error("WASM modules must not import host capabilities")]
+    WasmImportsDenied,
+    #[error("WASM module is missing the required `{0}` export")]
+    WasmMissingExport(&'static str),
+    #[error("WASM module memory exceeds the 16 MiB limit")]
+    WasmMemoryTooLarge,
+    #[error("WASM extension ABI is invalid for `{0}`")]
+    WasmInvalidAbi(&'static str),
+    #[error("WASM extension returned an invalid pointer")]
+    WasmInvalidPointer,
+    #[error("WASM extension response exceeds the 1 MiB limit")]
+    WasmOutputTooLarge,
+    #[error("WASM extension response is missing a valid `{0}` field")]
+    WasmInvalidResponse(&'static str),
+    #[error("WASM execution failed: {0}")]
+    Wasm(String),
 }
 
 #[derive(Debug, Error)]
@@ -814,8 +1048,6 @@ pub enum ExtensionManagerError {
     Filesystem { path: PathBuf, message: String },
     #[error("extension {0:?} is not present in the validated catalog")]
     UnknownExtension(String),
-    #[error("WASM extension {0:?} cannot run before a sandboxed runtime is configured")]
-    WasmRuntimeUnavailable(String),
     #[error("extension entrypoint is not a regular file: {0}")]
     InvalidEntrypoint(PathBuf),
     #[error("extension entrypoint resolves outside its configured root: {0}")]
@@ -1125,21 +1357,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manager_rejects_wasm_until_a_runtime_is_configured() {
+    async fn manager_runs_a_capability_free_wasm_extension_with_bounded_abi() {
         let directory = tempfile::tempdir().expect("extension root");
-        let wasm = manifest(ExtensionKind::Wasm);
+        let mut wasm = manifest(ExtensionKind::Wasm);
+        wasm.entrypoint = "coverage.wasm".into();
         std::fs::write(
             directory.path().join("manifest.json"),
             serde_json::to_vec(&wasm).expect("manifest JSON"),
         )
         .expect("write manifest");
+        let response = br#"{"abi_version":1,"result":{"ok":true}}"#;
+        let response_data = response
+            .iter()
+            .map(|byte| format!("\\{byte:02x}"))
+            .collect::<String>();
+        let packed = (u64::try_from(response.len()).expect("response length") << 32) | 1024;
+        let module = wat::parse_str(format!(
+            r#"(module
+                (memory (export "memory") 1 2)
+                (data (i32.const 1024) "{response_data}")
+                (func (export "rivet_alloc") (param i32) (result i32) i32.const 0)
+                (func (export "rivet_handle") (param i32 i32) (result i64) i64.const {packed})
+                (func (export "rivet_free") (param i32 i32)))"#
+        ))
+        .expect("WASM module");
+        std::fs::write(directory.path().join("coverage.wasm"), module).expect("write module");
+        let catalog = ExtensionCatalog::from_directory(Some(directory.path())).expect("catalog");
+        let manager = ExtensionManager::new(directory.path(), &catalog).expect("manager");
+        manager
+            .launch("coverage.reporter", std::iter::empty::<&str>())
+            .await
+            .expect("launch WASM extension");
+        let result = manager
+            .request(
+                "coverage.reporter",
+                ExtensionPermission::ReadBuilds,
+                "summary",
+                serde_json::json!({"build": 7}),
+            )
+            .await
+            .expect("WASM response");
+        assert_eq!(result, serde_json::json!({"ok": true}));
+        assert_eq!(manager.active_extensions().await, ["coverage.reporter"]);
+        manager
+            .shutdown("coverage.reporter")
+            .await
+            .expect("shutdown WASM extension");
+        assert!(manager.active_extensions().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wasm_runtime_rejects_imported_host_capabilities() {
+        let directory = tempfile::tempdir().expect("extension root");
+        let mut wasm = manifest(ExtensionKind::Wasm);
+        wasm.entrypoint = "imported.wasm".into();
+        std::fs::write(
+            directory.path().join("manifest.json"),
+            serde_json::to_vec(&wasm).expect("manifest JSON"),
+        )
+        .expect("write manifest");
+        let module = wat::parse_str(
+            r#"(module
+                (import "host" "read_file" (func))
+                (memory (export "memory") 1 1))"#,
+        )
+        .expect("WASM module");
+        std::fs::write(directory.path().join("imported.wasm"), module).expect("write module");
         let catalog = ExtensionCatalog::from_directory(Some(directory.path())).expect("catalog");
         let manager = ExtensionManager::new(directory.path(), &catalog).expect("manager");
         assert!(matches!(
             manager
                 .launch("coverage.reporter", std::iter::empty::<&str>())
                 .await,
-            Err(ExtensionManagerError::WasmRuntimeUnavailable(id)) if id == "coverage.reporter"
+            Err(ExtensionManagerError::Host(
+                ExtensionHostError::WasmImportsDenied
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn wasm_runtime_traps_when_fuel_is_exhausted() {
+        let directory = tempfile::tempdir().expect("extension root");
+        let mut wasm = manifest(ExtensionKind::Wasm);
+        wasm.entrypoint = "fuel.wasm".into();
+        std::fs::write(
+            directory.path().join("manifest.json"),
+            serde_json::to_vec(&wasm).expect("manifest JSON"),
+        )
+        .expect("write manifest");
+        let module = wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1 1)
+                (func (export "rivet_alloc") (param i32) (result i32) i32.const 0)
+                (func (export "rivet_handle") (param i32 i32) (result i64)
+                    (local i32)
+                    i32.const 6000000
+                    local.set 2
+                    (block
+                        (loop
+                            local.get 2
+                            i32.eqz
+                            br_if 1
+                            local.get 2
+                            i32.const 1
+                            i32.sub
+                            local.set 2
+                            br 0))
+                    i64.const 0))"#,
+        )
+        .expect("WASM module");
+        std::fs::write(directory.path().join("fuel.wasm"), module).expect("write module");
+        let catalog = ExtensionCatalog::from_directory(Some(directory.path())).expect("catalog");
+        let manager = ExtensionManager::new(directory.path(), &catalog).expect("manager");
+        manager
+            .launch("coverage.reporter", std::iter::empty::<&str>())
+            .await
+            .expect("launch WASM extension");
+        assert!(matches!(
+            manager
+                .request(
+                    "coverage.reporter",
+                    ExtensionPermission::ReadBuilds,
+                    "summary",
+                    serde_json::json!({}),
+                )
+                .await,
+            Err(ExtensionManagerError::Host(ExtensionHostError::Wasm(message)))
+                if message.contains("fuel")
         ));
     }
 

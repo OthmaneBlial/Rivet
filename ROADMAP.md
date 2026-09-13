@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **92 / 100 points** (**92.12 weighted evidence
+The current verified total is **92 / 100 points** (**92.24 weighted evidence
 points**, displayed conservatively as 92%).
 
 | Workstream | Weight | Current state | Gate for completion |
@@ -26,7 +26,7 @@ points**, displayed conservatively as 92%).
 | CI cache | 3 | partial | validated exact project-scoped primary/fallback keys, safe relative paths, atomic local archive save/restore, corrupt-entry recovery, fallback selection, and bounded local age-ordered pruning pass; remote cache backends remain |
 | Secrets and credentials | 6 | partial | secret parameters require explicit runtime values, persisted values/API responses are redacted, logs are masked, retries require fresh secret input, and a passphrase-encrypted local credential vault with typed HTTP/SSH entries, private-file CLI setup, project allow-lists, admin-only list/rotate/remove API, audit events, scoped build/webhook resolution, and an OS-keychain-backed vault passphrase source passes locally; deployment-specific keychain policy and richer ownership workflows remain |
 | Authentication and authorization | 4 | partial | protected remote transport with private Bearer tokens, policy-file token digests, roles, project scopes, route authorization, agent-connect permission checks, local token creation/listing/revocation, optional RFC3339 token expiration enforcement, bounded admin-only authentication audit history, and persisted opaque session creation/use/expiry/revocation pass; users and external identity providers remain |
-| Extension protocol | 4 | partial | versioned manifest, WASM/subprocess kind model, declared permission vocabulary, bounded length-prefixed JSON framing, direct-argument subprocess host, bounded local catalog discovery/API, desktop extension model, root-confined subprocess lifecycle manager with per-request permission enforcement, and administrator-only server/desktop subprocess lifecycle controls pass; WASM runtime and richer extension capability wiring remain |
+| Extension protocol | 4 | partial | versioned manifest, WASM/subprocess kind model, declared permission vocabulary, bounded length-prefixed JSON framing, direct-argument subprocess host, bounded local catalog discovery/API, desktop extension model, root-confined subprocess lifecycle manager with per-request permission enforcement, administrator-only server/desktop subprocess lifecycle controls, and a capability-free WASM runtime with explicit JSON ABI, denied imports, bounded module/memory/output sizes, and fuel metering pass; richer extension capability wiring remains |
 | Jenkins migration analyzer | 3 | partial | bounded Jenkinsfile analysis, headless API delivery, rendered desktop report, and valid drafts for deterministic quoted shell steps pass; full Groovy parsing, plugin semantics, and broad generated Rivetfile conversion remain |
 | Differential compatibility harness | 2 | partial | bounded JSON snapshots, explicit semantic normalization/comparison, mismatch exit status, and a checked-in regression fixture pass; live Jenkins/Rivet capture adapters and a permanent live regression corpus remain |
 | Release and operations | 2 | partial | local release gate, optimized CLI artifact, desktop web/native checks, and versioned SHA-256 manifest pass; signed installers, observability, upgrades, recovery, security, and load gates remain |
@@ -38,7 +38,7 @@ states. “Planned” is zero progress, “partial” receives only the portion 
 by evidence, and “verified” receives the full workstream weight. A local build,
 scaffold, passing unrelated test, or interface alone does not complete a gate.
 
-The next gates are the WASM runtime and richer extension capability wiring, the final Tauri-window
+The next gates are richer extension capability wiring, the final Tauri-window
 flow inside the packaged app, API
 deployment hardening, resuming remote attempts across server restart and
 cross-restart retry recovery, broader host-key/keychain policy coverage, user
