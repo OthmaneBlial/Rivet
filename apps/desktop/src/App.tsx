@@ -777,7 +777,7 @@ function AgentsPanel({ agents, online }: { agents: AgentSummary[]; online: boole
           </div>
         )}
       </section>
-      <p className="agent-boundary"><span />Capacity discovery is live. Build assignment, remote execution, artifact transfer, and lost-job recovery remain separately gated until their transport semantics are verified.</p>
+      <p className="agent-boundary"><span />Capacity discovery, assignment, remote execution, artifact transfer, and one bounded replacement attempt are verified locally. Durable restart recovery and richer retry policy remain separately gated.</p>
     </div>
   );
 }

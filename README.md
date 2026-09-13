@@ -6,6 +6,8 @@ from Jenkins.
 ## Delivery progress
 
 **75% verified** · `███████████████░░░░░`<br>
+Weighted evidence score: **75.92 / 100** · displayed conservatively as the
+whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -32,8 +34,11 @@ steps can declare exact remote requirements; the local runner refuses those step
 until assignment exists. A matching agent can now reserve capacity, receive a
 bounded workspace archive, execute the assigned pipeline through the shared Rust
 runner, and relay typed events, output, and cancellation. Remote artifact
-bundles now return through a bounded, checksum-verified channel; lost-job
-recovery remains a future gate.
+bundles now return through a bounded, checksum-verified channel. If the assigned
+agent disconnects, the server makes at most one replacement-agent attempt and
+closes unfinished steps, stages, and builds as failed when recovery is
+unavailable; durable recovery across a server restart and richer retry policy
+remain future gates.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -161,7 +166,10 @@ agent, transfers the repository workspace in bounded chunks, executes it with
 the shared Rust runner, and persists the agent's typed build events and output.
 Cancellation is propagated to the agent, and declared artifacts return through
 the same bounded transfer with checksum verification before local storage.
-Lost-job recovery remains a future gate.
+After an agent disconnect, the server makes one bounded replacement attempt and
+persists a terminal failed state when no replacement is available. Durable
+recovery across a server restart, exactly-once guarantees, and richer retry
+policy remain future gates.
 
 Connect a worker for heartbeat and capability discovery:
 
