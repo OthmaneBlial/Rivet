@@ -58,10 +58,11 @@ use agent_registry::{
 };
 use workspace_archive::archive_workspace;
 
-const DEFAULT_ALLOWED_ORIGINS: [&str; 4] = [
+const DEFAULT_ALLOWED_ORIGINS: [&str; 5] = [
     "http://127.0.0.1:1420",
     "http://localhost:1420",
     "tauri://localhost",
+    "http://tauri.localhost",
     "https://tauri.localhost",
 ];
 
@@ -4385,6 +4386,25 @@ mod tests {
                 .get("x-frame-options")
                 .and_then(|value| value.to_str().ok()),
             Some("DENY")
+        );
+
+        let response = router(AppState::new(Storage::open_in_memory().expect("storage")))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .header("origin", "http://tauri.localhost")
+                    .body(Body::empty())
+                    .expect("Tauri webview request"),
+            )
+            .await
+            .expect("Tauri webview response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("http://tauri.localhost")
         );
 
         let response = router(AppState::new(Storage::open_in_memory().expect("storage")))

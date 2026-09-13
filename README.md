@@ -170,9 +170,9 @@ only idempotent reads while the engine is unreachable; state-changing requests
 are deliberately not retried automatically, so a lost response cannot create
 duplicate builds or mutations.
 
-Browser access uses an exact local/Tauri origin allow-list by default. Add an
-exact remote console origin explicitly when needed; wildcard origins are
-rejected:
+Browser access uses an exact local/Tauri origin allow-list by default,
+including the HTTP origin used by Tauri 2 webviews. Add an exact remote
+console origin explicitly when needed; wildcard origins are rejected:
 
 ```sh
 cargo run -p rivet -- --data-dir .rivet server \
