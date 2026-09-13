@@ -14,6 +14,7 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
+use rivet_agent_protocol::{AgentMessage, PROTOCOL_VERSION};
 use rivet_core::{
     BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, Pipeline, Project, ScheduleId,
     SourceSnapshot,
@@ -38,6 +39,10 @@ use tokio::time::{Duration, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 
+mod agent_registry;
+
+use agent_registry::{AgentRegistry, AgentSummary};
+
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Storage,
@@ -46,6 +51,7 @@ pub struct AppState {
     events: broadcast::Sender<BuildEvent>,
     auth_digest: Option<[u8; 32]>,
     webhook_secret: Option<Vec<u8>>,
+    agents: AgentRegistry,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +230,8 @@ struct QueueStatusResponse {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/agents", get(list_agents))
+        .route("/api/v1/agents/connect", get(connect_agent))
         .route(
             "/api/v1/webhooks/generic",
             post(webhook_build).layer(DefaultBodyLimit::max(256 * 1024)),
@@ -386,6 +394,7 @@ impl AppState {
             events,
             auth_digest: None,
             webhook_secret: None,
+            agents: AgentRegistry::default(),
         }
     }
 
@@ -467,6 +476,173 @@ async fn queue_status(State(state): State<AppState>) -> Json<QueueStatusResponse
 
 async fn list_projects(State(state): State<AppState>) -> Result<Json<Vec<Project>>, ApiError> {
     Ok(Json(state.storage.list_projects()?))
+}
+
+async fn list_agents(State(state): State<AppState>) -> Json<Vec<AgentSummary>> {
+    Json(state.agents.list(Utc::now()).await)
+}
+
+async fn connect_agent(
+    State(state): State<AppState>,
+    websocket: WebSocketUpgrade,
+) -> impl IntoResponse {
+    websocket.on_upgrade(move |socket| handle_agent_socket(socket, state.agents.clone()))
+}
+
+async fn handle_agent_socket(mut socket: WebSocket, agents: AgentRegistry) {
+    let first_message = match tokio::time::timeout(Duration::from_secs(10), socket.recv()).await {
+        Ok(Some(Ok(message))) => message,
+        Ok(Some(Err(error))) => {
+            tracing::debug!(?error, "agent websocket failed before registration");
+            return;
+        }
+        Ok(None) | Err(_) => {
+            tracing::debug!("agent websocket did not register before timeout");
+            return;
+        }
+    };
+    let registration = match decode_agent_message(first_message) {
+        Ok(AgentMessage::Register(registration)) => registration,
+        Ok(_) => {
+            let _ = send_agent_error(
+                &mut socket,
+                "registration_required",
+                "first agent message must be register",
+            )
+            .await;
+            return;
+        }
+        Err(error) => {
+            let _ = send_agent_error(&mut socket, "invalid_message", &error).await;
+            return;
+        }
+    };
+    let lease = match agents.register(registration, Utc::now()).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            let _ =
+                send_agent_error(&mut socket, "registration_rejected", &error.to_string()).await;
+            return;
+        }
+    };
+    let registered = AgentMessage::Registered {
+        protocol_version: PROTOCOL_VERSION,
+        agent_id: lease.agent_id,
+        session_id: lease.session_id,
+    };
+    if !send_agent_message(&mut socket, registered).await {
+        agents.unregister(lease.agent_id, lease.session_id).await;
+        return;
+    }
+
+    while let Some(result) = socket.recv().await {
+        let message = match result {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::debug!(agent_id = %lease.agent_id, ?error, "agent websocket failed");
+                break;
+            }
+        };
+        match message {
+            Message::Ping(payload) => {
+                if socket.send(Message::Pong(payload)).await.is_err() {
+                    break;
+                }
+            }
+            Message::Close(_) => break,
+            Message::Pong(_) => continue,
+            message => match decode_agent_message(message) {
+                Ok(AgentMessage::Heartbeat(heartbeat)) => {
+                    let sequence = heartbeat.sequence;
+                    match agents.heartbeat(heartbeat, Utc::now()).await {
+                        Ok(_) => {
+                            if !send_agent_message(
+                                &mut socket,
+                                AgentMessage::HeartbeatAck {
+                                    protocol_version: PROTOCOL_VERSION,
+                                    sequence,
+                                    server_time: Utc::now(),
+                                },
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = send_agent_error(
+                                &mut socket,
+                                "heartbeat_rejected",
+                                &error.to_string(),
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+                }
+                Ok(AgentMessage::Register(_)) => {
+                    let _ = send_agent_error(
+                        &mut socket,
+                        "already_registered",
+                        "an agent can register only once per connection",
+                    )
+                    .await;
+                    break;
+                }
+                Ok(_) => {
+                    let _ = send_agent_error(
+                        &mut socket,
+                        "unsupported_message",
+                        "this server accepts heartbeat messages after registration",
+                    )
+                    .await;
+                    break;
+                }
+                Err(error) => {
+                    let _ = send_agent_error(&mut socket, "invalid_message", &error).await;
+                    break;
+                }
+            },
+        }
+    }
+    agents.unregister(lease.agent_id, lease.session_id).await;
+}
+
+fn decode_agent_message(message: Message) -> Result<AgentMessage, String> {
+    let payload = match message {
+        Message::Text(text) => text.to_string(),
+        Message::Binary(bytes) => String::from_utf8(bytes.to_vec())
+            .map_err(|_| "agent messages must contain valid UTF-8 JSON".to_owned())?,
+        Message::Ping(_) | Message::Pong(_) => {
+            return Err("control frame is not an agent message".into());
+        }
+        Message::Close(_) => return Err("agent websocket closed".into()),
+    };
+    let message: AgentMessage = serde_json::from_str(&payload)
+        .map_err(|error| format!("invalid agent message JSON: {error}"))?;
+    message
+        .validate()
+        .map_err(|error| format!("invalid agent message: {error}"))?;
+    Ok(message)
+}
+
+async fn send_agent_message(socket: &mut WebSocket, message: AgentMessage) -> bool {
+    let Ok(payload) = serde_json::to_string(&message) else {
+        return false;
+    };
+    socket.send(Message::Text(payload.into())).await.is_ok()
+}
+
+async fn send_agent_error(socket: &mut WebSocket, code: &str, message: &str) -> bool {
+    send_agent_message(
+        socket,
+        AgentMessage::Error {
+            protocol_version: PROTOCOL_VERSION,
+            code: code.to_owned(),
+            message: message.to_owned(),
+        },
+    )
+    .await
 }
 
 async fn list_schedules(
@@ -1161,6 +1337,23 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 4096).await.expect("body");
         assert_eq!(&body[..], br#"{"queued":0,"running":0,"capacity":2}"#);
+    }
+
+    #[tokio::test]
+    async fn agents_route_starts_with_an_empty_ephemeral_registry() {
+        let app = router(AppState::new(Storage::open_in_memory().expect("storage")));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/agents")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        assert_eq!(&body[..], b"[]");
     }
 
     #[tokio::test]

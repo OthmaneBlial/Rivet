@@ -967,6 +967,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "rivet-agent-protocol",
  "rivet-core",
  "rivet-runner",
  "rivet-scm",
