@@ -7,7 +7,9 @@ license.workspace = true
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 chrono.workspace = true
+hex.workspace = true
 futures-util = "0.3"
+hmac.workspace = true
 rivet-core = { path = "../rivet-core" }
 rivet-runner = { path = "../rivet-runner" }
 rivet-scm = { path = "../rivet-scm" }

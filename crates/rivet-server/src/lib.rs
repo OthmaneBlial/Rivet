@@ -4,15 +4,16 @@
 //! queueing, process supervision, and state projection remain in the shared
 //! crates so desktop and server modes execute the same code.
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use rivet_core::{
     BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, Pipeline, Project, ScheduleId,
     SourceSnapshot,
@@ -44,12 +45,14 @@ pub struct AppState {
     active_builds: Arc<Mutex<HashMap<BuildId, CancellationToken>>>,
     events: broadcast::Sender<BuildEvent>,
     auth_digest: Option<[u8; 32]>,
+    webhook_secret: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub bind: SocketAddr,
     pub auth_token: Option<String>,
+    pub webhook_secret: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -62,6 +65,8 @@ pub enum ServerError {
     AuthRequired(SocketAddr),
     #[error("Rivet authentication token cannot be empty")]
     EmptyAuthToken,
+    #[error("Rivet webhook secret cannot be empty")]
+    EmptyWebhookSecret,
 }
 
 #[derive(Debug, Error)]
@@ -85,6 +90,18 @@ enum ApiError {
     ArtifactRead(#[source] std::io::Error),
     #[error("{0}")]
     BadRequest(String),
+    #[error("webhook delivery signatures are not configured")]
+    WebhookNotConfigured,
+    #[error("invalid webhook signature")]
+    InvalidWebhookSignature,
+    #[error("webhook event ID cannot be empty")]
+    EmptyWebhookEventId,
+    #[error("webhook event ID is too long")]
+    WebhookEventIdTooLong,
+    #[error("webhook event ID contains control characters")]
+    InvalidWebhookEventId,
+    #[error("webhook event ID already belongs to another project")]
+    WebhookEventConflict,
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -106,6 +123,12 @@ impl IntoResponse for ApiError {
             Self::InvalidRepository(_) | Self::InvalidPipeline(_) | Self::BadRequest(_) => {
                 StatusCode::BAD_REQUEST
             }
+            Self::WebhookNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
+            Self::InvalidWebhookSignature => StatusCode::UNAUTHORIZED,
+            Self::EmptyWebhookEventId
+            | Self::WebhookEventIdTooLong
+            | Self::InvalidWebhookEventId => StatusCode::BAD_REQUEST,
+            Self::WebhookEventConflict => StatusCode::CONFLICT,
             Self::ArtifactNotFound(_) => StatusCode::NOT_FOUND,
             Self::ArtifactRead(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Scm(error) => match error {
@@ -158,6 +181,22 @@ pub struct UpdateScheduleRequest {
     pub enabled: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WebhookBuildRequest {
+    /// A provider delivery ID. Re-deliveries with the same ID are ignored.
+    pub event_id: String,
+    /// The Rivet project receiving the build.
+    pub project: String,
+    #[serde(default)]
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub remote: Option<String>,
+    #[serde(default)]
+    pub fetch: bool,
+    #[serde(default)]
+    pub parameters: BTreeMap<String, String>,
+}
+
 fn default_schedule_enabled() -> bool {
     true
 }
@@ -166,6 +205,13 @@ fn default_schedule_enabled() -> bool {
 struct QueueBuildResponse {
     build: BuildRecord,
     status: BuildStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct WebhookBuildResponse {
+    status: &'static str,
+    deduplicated: bool,
+    build: Option<BuildRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -178,6 +224,10 @@ struct QueueStatusResponse {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
+        .route(
+            "/api/v1/webhooks/generic",
+            post(webhook_build).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
         .route("/api/v1/queue", get(queue_status))
         .route("/api/v1/projects", get(list_projects).post(create_project))
         .route(
@@ -287,6 +337,7 @@ pub async fn serve(storage_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(
         ServerConfig {
             bind,
             auth_token: None,
+            webhook_secret: None,
         },
     )
     .await
@@ -299,11 +350,25 @@ pub async fn serve_with_config(
     if !config.bind.ip().is_loopback() && config.auth_token.is_none() {
         return Err(ServerError::AuthRequired(config.bind));
     }
-    let state = match config.auth_token.as_deref() {
-        Some(token) if token.trim().is_empty() => return Err(ServerError::EmptyAuthToken),
-        Some(token) => AppState::with_token(Storage::open(storage_path)?, token),
-        None => AppState::new(Storage::open(storage_path)?),
-    };
+    if config
+        .auth_token
+        .as_deref()
+        .is_some_and(|token| token.trim().is_empty())
+    {
+        return Err(ServerError::EmptyAuthToken);
+    }
+    if config
+        .webhook_secret
+        .as_deref()
+        .is_some_and(|secret| secret.trim().is_empty())
+    {
+        return Err(ServerError::EmptyWebhookSecret);
+    }
+    let state = AppState::with_security(
+        Storage::open(storage_path)?,
+        config.auth_token.as_deref(),
+        config.webhook_secret.as_deref(),
+    );
     let listener = TcpListener::bind(config.bind).await?;
     tracing::info!(bind = %config.bind, "Rivet server listening");
     spawn_schedule_dispatcher(state.clone());
@@ -320,12 +385,24 @@ impl AppState {
             active_builds: Arc::new(Mutex::new(HashMap::new())),
             events,
             auth_digest: None,
+            webhook_secret: None,
         }
     }
 
+    #[cfg(test)]
     fn with_token(storage: Storage, token: &str) -> Self {
+        Self::with_security(storage, Some(token), None)
+    }
+
+    #[cfg(test)]
+    fn with_webhook_secret(storage: Storage, secret: &str) -> Self {
+        Self::with_security(storage, None, Some(secret))
+    }
+
+    fn with_security(storage: Storage, token: Option<&str>, webhook_secret: Option<&str>) -> Self {
         let mut state = Self::new(storage);
-        state.auth_digest = Some(hash_token(token.as_bytes()));
+        state.auth_digest = token.map(|token| hash_token(token.as_bytes()));
+        state.webhook_secret = webhook_secret.map(|secret| secret.as_bytes().to_vec());
         state
     }
 }
@@ -452,6 +529,127 @@ async fn delete_schedule(
             schedule_id,
         })
     }
+}
+
+async fn webhook_build(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<WebhookBuildResponse>), ApiError> {
+    let secret = state
+        .webhook_secret
+        .as_deref()
+        .ok_or(ApiError::WebhookNotConfigured)?;
+    verify_webhook_signature(secret, &headers, &body)?;
+    let request: WebhookBuildRequest = serde_json::from_slice(&body)
+        .map_err(|error| ApiError::BadRequest(format!("invalid webhook JSON: {error}")))?;
+    let event_id = validate_webhook_event_id(request.event_id)?;
+    let project_name = request.project.trim();
+    let project = project_by_name(&state.storage, project_name)?;
+
+    if !state
+        .storage
+        .claim_webhook_delivery(&event_id, project.id, Utc::now())?
+    {
+        let delivery = state
+            .storage
+            .webhook_delivery(&event_id)?
+            .ok_or_else(|| ApiError::BadRequest("webhook delivery disappeared".into()))?;
+        if delivery.project_id != project.id {
+            return Err(ApiError::WebhookEventConflict);
+        }
+        let build = delivery.build_id.and_then(|build_id| {
+            state
+                .storage
+                .list_builds(project.id)
+                .ok()?
+                .into_iter()
+                .find(|build| build.id == build_id)
+        });
+        return Ok((
+            StatusCode::OK,
+            Json(WebhookBuildResponse {
+                status: if build.is_some() {
+                    "already_queued"
+                } else {
+                    "already_received"
+                },
+                deduplicated: true,
+                build,
+            }),
+        ));
+    }
+
+    let scm = if request.fetch || request.revision.is_some() || request.remote.is_some() {
+        Some(PrepareScmRequest {
+            remote: request.remote.unwrap_or_else(default_remote),
+            fetch: request.fetch,
+            revision: request.revision,
+            clean: false,
+            clean_ignored: false,
+        })
+    } else {
+        None
+    };
+    let queued = match enqueue_project_build(
+        &state,
+        project,
+        QueueBuildRequest {
+            scm,
+            parameters: request.parameters,
+        },
+    )
+    .await
+    {
+        Ok(queued) => queued,
+        Err(error) => {
+            state.storage.release_webhook_delivery(&event_id)?;
+            return Err(error);
+        }
+    };
+    state
+        .storage
+        .complete_webhook_delivery(&event_id, queued.build.id, queued.build.number)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(WebhookBuildResponse {
+            status: "queued",
+            deduplicated: false,
+            build: Some(queued.build),
+        }),
+    ))
+}
+
+fn verify_webhook_signature(
+    secret: &[u8],
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), ApiError> {
+    let encoded = headers
+        .get("x-rivet-signature")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("sha256="))
+        .ok_or(ApiError::InvalidWebhookSignature)?;
+    let signature = hex::decode(encoded).map_err(|_| ApiError::InvalidWebhookSignature)?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret).map_err(|_| ApiError::InvalidWebhookSignature)?;
+    mac.update(body);
+    mac.verify_slice(&signature)
+        .map_err(|_| ApiError::InvalidWebhookSignature)
+}
+
+fn validate_webhook_event_id(event_id: String) -> Result<String, ApiError> {
+    let event_id = event_id.trim();
+    if event_id.is_empty() {
+        return Err(ApiError::EmptyWebhookEventId);
+    }
+    if event_id.len() > 256 {
+        return Err(ApiError::WebhookEventIdTooLong);
+    }
+    if event_id.chars().any(char::is_control) {
+        return Err(ApiError::InvalidWebhookEventId);
+    }
+    Ok(event_id.to_owned())
 }
 
 fn spawn_schedule_dispatcher(state: AppState) {
@@ -1019,6 +1217,147 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn generic_webhook_verifies_signature_and_deduplicates_builds() {
+        let directory = tempdir().expect("tempdir");
+        let repository = directory.path().join("repository");
+        fs::create_dir_all(&repository).expect("repository");
+        let pipeline_path = repository.join("Rivetfile.toml");
+        fs::write(
+            &pipeline_path,
+            r#"
+version = 1
+name = "webhook"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline file");
+        let pipeline = Pipeline::load(&pipeline_path).expect("pipeline");
+        let project = Project::new(
+            "webhook-demo",
+            repository.to_string_lossy().into_owned(),
+            pipeline_path.to_string_lossy().into_owned(),
+        )
+        .expect("project");
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let state = AppState::with_webhook_secret(storage.clone(), "webhook-test-secret");
+        let body = br#"{"event_id":"delivery-1","project":"webhook-demo"}"#.to_vec();
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/webhooks/generic")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let signature = sign_webhook("webhook-test-secret", &body);
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/webhooks/generic")
+                    .header("content-type", "application/json")
+                    .header("x-rivet-signature", &signature)
+                    .body(Body::from(body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let queued: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("body"),
+        )
+        .expect("queued response");
+        assert_eq!(queued["status"], "queued");
+        assert_eq!(queued["deduplicated"], false);
+        assert!(queued["build"]["id"].as_str().is_some());
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/webhooks/generic")
+                    .header("content-type", "application/json")
+                    .header("x-rivet-signature", &signature)
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let duplicate: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("duplicate body"),
+        )
+        .expect("duplicate response");
+        assert_eq!(duplicate["status"], "already_queued");
+        assert_eq!(duplicate["deduplicated"], true);
+
+        for _ in 0..50 {
+            if storage
+                .list_builds(project.id)
+                .expect("builds")
+                .first()
+                .is_some_and(|build| build.status.is_terminal())
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let builds = storage.list_builds(project.id).expect("builds");
+        assert_eq!(builds.len(), 1);
+        assert_eq!(builds[0].status, BuildStatus::Passed);
+    }
+
+    #[tokio::test]
+    async fn generic_webhook_rejects_invalid_signature_and_missing_configuration() {
+        let body = br#"{"event_id":"delivery-1","project":"missing"}"#;
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/webhooks/generic")
+                .header("content-type", "application/json")
+                .header("x-rivet-signature", "sha256=00")
+                .body(Body::from(body.as_slice()))
+                .expect("request")
+        };
+
+        let response = router(AppState::new(Storage::open_in_memory().expect("storage")))
+            .oneshot(request())
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let state = AppState::with_webhook_secret(
+            Storage::open_in_memory().expect("storage"),
+            "webhook-test-secret",
+        );
+        let response = router(state).oneshot(request()).await.expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn sign_webhook(secret: &str, body: &[u8]) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("secret");
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
     }
 
     #[tokio::test]
