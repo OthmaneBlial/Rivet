@@ -94,6 +94,11 @@ impl Scheduler {
                         .clone()
                 };
                 tokio::spawn(async move {
+                    if request.cancellation.is_cancelled() {
+                        metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                        finish_queued_cancellation(request).await;
+                        return;
+                    }
                     let global_permit = match global.acquire_owned().await {
                         Ok(permit) => permit,
                         Err(_) => {
@@ -115,6 +120,13 @@ impl Scheduler {
                             return;
                         }
                     };
+                    if request.cancellation.is_cancelled() {
+                        drop(project_permit);
+                        drop(global_permit);
+                        metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                        finish_queued_cancellation(request).await;
+                        return;
+                    }
                     metrics.queued.fetch_sub(1, Ordering::Relaxed);
                     metrics.running.fetch_add(1, Ordering::Relaxed);
                     let result = execute_pipeline_with_parameters(
@@ -209,6 +221,26 @@ impl Scheduler {
             completion: result,
         })
     }
+}
+
+async fn finish_queued_cancellation(request: QueueRequest) {
+    let timestamp = Utc::now();
+    let _ = request
+        .events
+        .send(BuildEvent::BuildCancelled {
+            build_id: request.plan.build_id,
+            timestamp,
+        })
+        .await;
+    let _ = request
+        .events
+        .send(BuildEvent::BuildFinished {
+            build_id: request.plan.build_id,
+            status: BuildStatus::Cancelled,
+            timestamp: Utc::now(),
+        })
+        .await;
+    let _ = request.completion.send(Ok(BuildStatus::Cancelled));
 }
 
 impl QueueHandle {
@@ -349,5 +381,76 @@ args = ["-c", "sleep 0.4"]
             );
         }
         drop(receivers);
+    }
+
+    #[tokio::test]
+    async fn cancels_a_build_before_it_acquires_a_slot() {
+        let dir = tempdir().expect("tempdir");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "queued-cancel"
+[[stages]]
+name = "run"
+[[stages.steps]]
+name = "wait"
+program = "sh"
+args = ["-c", "sleep 0.4"]
+"#,
+        )
+        .expect("pipeline");
+        let scheduler = Scheduler::new(1, Some(1));
+        let project_id = uuid::Uuid::new_v4();
+        let (first_tx, mut first_rx) = mpsc::channel(64);
+        let first = scheduler
+            .enqueue(
+                ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), project_id),
+                pipeline.clone(),
+                dir.path().to_path_buf(),
+                CancellationToken::new(),
+                first_tx,
+            )
+            .await
+            .expect("first enqueue");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (second_tx, mut second_rx) = mpsc::channel(64);
+        let second = scheduler
+            .enqueue(
+                ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), project_id),
+                pipeline,
+                dir.path().to_path_buf(),
+                CancellationToken::new(),
+                second_tx,
+            )
+            .await
+            .expect("second enqueue");
+        second.cancel();
+        assert_eq!(
+            second.wait().await.expect("scheduler").expect("cancel"),
+            BuildStatus::Cancelled
+        );
+        let mut second_events = Vec::new();
+        while let Some(event) = second_rx.recv().await {
+            second_events.push(event);
+        }
+        assert!(
+            second_events
+                .iter()
+                .any(|event| { matches!(event, BuildEvent::BuildCancelled { .. }) })
+        );
+        assert!(
+            !second_events
+                .iter()
+                .any(|event| matches!(event, BuildEvent::BuildStarted { .. }))
+        );
+
+        assert_eq!(
+            first.wait().await.expect("scheduler").expect("first run"),
+            BuildStatus::Passed
+        );
+        while first_rx.recv().await.is_some() {}
+        assert_eq!(scheduler.stats().queued, 0);
+        assert_eq!(scheduler.stats().running, 0);
     }
 }

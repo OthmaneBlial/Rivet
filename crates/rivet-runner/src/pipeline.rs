@@ -57,6 +57,9 @@ pub async fn execute_pipeline_with_parameters(
     pipeline.validate()?;
     let parameters = pipeline.resolve_parameters(parameters)?;
     let workspace = pipeline.resolve_workspace(repository_root)?;
+    if cancellation.is_cancelled() {
+        return finish_cancelled(plan, &events).await;
+    }
     send(
         &events,
         BuildEvent::BuildStarted {
