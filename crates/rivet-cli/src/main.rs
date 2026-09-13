@@ -537,7 +537,7 @@ async fn run_project_with_options(
     });
 
     let cancellation = CancellationToken::new();
-    let scheduler = Scheduler::new(1, Some(1));
+    let scheduler = Scheduler::new_with_cache(1, Some(1), Some(storage.cache_root()));
     let handle = scheduler
         .enqueue_with_parameters(
             plan,

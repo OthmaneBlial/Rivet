@@ -465,9 +465,10 @@ fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
 impl AppState {
     pub fn new(storage: Storage) -> Self {
         let (events, _) = broadcast::channel(1024);
+        let cache_root = storage.cache_root();
         Self {
             storage,
-            scheduler: Arc::new(Scheduler::new(2, Some(1))),
+            scheduler: Arc::new(Scheduler::new_with_cache(2, Some(1), Some(cache_root))),
             active_builds: Arc::new(Mutex::new(HashMap::new())),
             events,
             auth_digest: None,
