@@ -14,7 +14,7 @@
     {"id": "storage", "weight": 6, "completion": 1.0, "status": "verified"},
     {"id": "api", "weight": 6, "completion": 0.95, "status": "partial"},
     {"id": "cli", "weight": 3, "completion": 0.9, "status": "partial"},
-    {"id": "desktop", "weight": 10, "completion": 0.9, "status": "partial"},
+    {"id": "desktop", "weight": 10, "completion": 0.95, "status": "partial"},
     {"id": "scm", "weight": 8, "completion": 0.8, "status": "partial"},
     {"id": "triggers", "weight": 5, "completion": 0.75, "status": "partial"},
     {"id": "agents", "weight": 10, "completion": 0.25, "status": "partial"},

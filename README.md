@@ -19,8 +19,9 @@ admission, parameterized builds, local artifact storage, protected server
 transport, build retry, pre-execution queue cancellation, build artifact
 downloads, and a light-default desktop theme with an accessible dark-mode
 toggle, persistent UTC cron schedules, server dispatch, desktop schedule
-controls, signed generic webhook delivery with idempotent redelivery, and
-secret-parameter redaction/masking. The server also exposes a versioned agent
+controls, signed generic webhook delivery with idempotent redelivery,
+secret-parameter redaction/masking, and a packaged desktop launch with an
+ephemeral loopback engine origin. The server also exposes a versioned agent
 handshake/heartbeat registry with online and stale state, while remote build
 assignment remains intentionally unimplemented until its transport and
 failure semantics are complete.
