@@ -10,6 +10,7 @@ chrono.workspace = true
 futures-util = "0.3"
 rivet-core = { path = "../rivet-core" }
 rivet-runner = { path = "../rivet-runner" }
+rivet-scm = { path = "../rivet-scm" }
 rivet-storage = { path = "../rivet-storage" }
 serde.workspace = true
 serde_json.workspace = true

@@ -5,14 +5,15 @@ from Jenkins.
 
 ## Delivery progress
 
-**35% verified** · `███████░░░░░░░░░░░`<br>
+**39% verified** · `███████░░░░░░░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
 and unverified work remains at zero until it passes its gate.
 
 Last verified update: **2026-09-13** · native pipeline execution, FIFO queue,
-SQLite history, CLI workflow, headless API, and Tauri desktop/logo milestone.
+SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
+inspection milestone.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -66,7 +67,9 @@ cargo run -p rivet -- --data-dir .rivet server --bind 127.0.0.1:7878
 
 The versioned API currently exposes health, projects, queued builds, build
 details, persisted logs, cancellation, and a per-build WebSocket event stream
-under `/api/v1/`. The server returns `202 Accepted` when a build is queued;
+under `/api/v1/`. It also exposes Git repository inspection and an explicit
+prepare operation for fetch/checkout/clean workflows. The server returns
+`202 Accepted` when a build is queued;
 clients read its durable state from the build resource and subscribe to live
 events separately.
 
@@ -89,3 +92,12 @@ timeout_seconds = 300
 Shell parsing is not implicit. A later pipeline feature may add an explicit
 shell step with a documented threat boundary; direct process execution is the
 safe default.
+
+Inspect the source state behind a project with direct Git arguments:
+
+```sh
+cargo run -p rivet -- scm inspect .
+cargo run -p rivet -- scm prepare . --revision main --clean
+```
+
+`prepare --clean` is intentionally opt-in because it removes untracked files.

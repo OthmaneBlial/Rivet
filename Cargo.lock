@@ -763,8 +763,10 @@ dependencies = [
  "clap",
  "rivet-core",
  "rivet-runner",
+ "rivet-scm",
  "rivet-server",
  "rivet-storage",
+ "serde_json",
  "tokio",
  "tokio-util",
  "uuid",
@@ -798,6 +800,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rivet-scm"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "rivet-server"
 version = "0.1.0"
 dependencies = [
@@ -806,6 +818,7 @@ dependencies = [
  "futures-util",
  "rivet-core",
  "rivet-runner",
+ "rivet-scm",
  "rivet-storage",
  "serde",
  "serde_json",

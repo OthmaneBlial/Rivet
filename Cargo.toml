@@ -2,6 +2,7 @@
 members = [
     "crates/rivet-core",
     "crates/rivet-runner",
+    "crates/rivet-scm",
     "crates/rivet-server",
     "crates/rivet-storage",
     "crates/rivet-cli",

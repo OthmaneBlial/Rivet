@@ -12,8 +12,10 @@ path = "src/main.rs"
 clap.workspace = true
 rivet-core = { path = "../rivet-core" }
 rivet-runner = { path = "../rivet-runner" }
+rivet-scm = { path = "../rivet-scm" }
 rivet-server = { path = "../rivet-server" }
 rivet-storage = { path = "../rivet-storage" }
+serde_json.workspace = true
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 uuid.workspace = true

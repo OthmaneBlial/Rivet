@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use chrono::Utc;
 use rivet_core::{BuildEvent, BuildId, BuildStatus, ExecutionPlan, Pipeline, Project};
 use rivet_runner::{QueueHandle, Scheduler};
+use rivet_scm::{GitPrepareOptions, GitRepository, GitSnapshot};
 use rivet_storage::{BuildDetails, BuildRecord, LogRecord, Storage, StorageError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -62,6 +63,8 @@ enum ApiError {
     Model(#[from] rivet_core::ModelError),
     #[error(transparent)]
     Scheduler(#[from] rivet_runner::SchedulerError),
+    #[error(transparent)]
+    Scm(#[from] rivet_scm::ScmError),
 }
 
 impl IntoResponse for ApiError {
@@ -71,6 +74,13 @@ impl IntoResponse for ApiError {
             Self::InvalidRepository(_) | Self::InvalidPipeline(_) | Self::BadRequest(_) => {
                 StatusCode::BAD_REQUEST
             }
+            Self::Scm(error) => match error {
+                rivet_scm::ScmError::InvalidRepository(_)
+                | rivet_scm::ScmError::NotGitRepository(_) => StatusCode::BAD_REQUEST,
+                rivet_scm::ScmError::Command { .. }
+                | rivet_scm::ScmError::InvalidOutput { .. }
+                | rivet_scm::ScmError::Filesystem(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            },
             Self::Storage(_) | Self::Pipeline(_) | Self::Model(_) | Self::Scheduler(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -120,6 +130,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/projects/{name}/builds/{number}/cancel",
             post(cancel_build),
         )
+        .route(
+            "/api/v1/projects/{name}/scm",
+            get(get_scm).post(prepare_scm),
+        )
         // The default server binds only to loopback and is consumed by the
         // local Tauri webview. Remote deployments should put an explicit
         // authenticated reverse proxy in front of this transport before
@@ -131,6 +145,52 @@ pub fn router(state: AppState) -> Router {
                 .allow_headers(Any),
         )
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct PrepareScmRequest {
+    #[serde(default = "default_remote")]
+    pub remote: String,
+    #[serde(default)]
+    pub fetch: bool,
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub clean: bool,
+    #[serde(default)]
+    pub clean_ignored: bool,
+}
+
+fn default_remote() -> String {
+    "origin".to_owned()
+}
+
+async fn get_scm(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<GitSnapshot>, ApiError> {
+    let project = project_by_name(&state.storage, &name)?;
+    let repository = GitRepository::open(project.repository_path).await?;
+    Ok(Json(repository.inspect().await?))
+}
+
+async fn prepare_scm(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(request): Json<PrepareScmRequest>,
+) -> Result<Json<GitSnapshot>, ApiError> {
+    let project = project_by_name(&state.storage, &name)?;
+    let repository = GitRepository::open(project.repository_path).await?;
+    Ok(Json(
+        repository
+            .prepare(&GitPrepareOptions {
+                remote: request.remote,
+                fetch: request.fetch,
+                revision: request.revision,
+                clean: request.clean,
+                clean_ignored: request.clean_ignored,
+            })
+            .await?,
+    ))
 }
 
 pub async fn serve(storage_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(), ServerError> {

@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use rivet_core::{BuildEvent, BuildStatus, ExecutionPlan, LogStream, Pipeline, Project};
 use rivet_runner::{QueueHandle, Scheduler};
+use rivet_scm::{GitPrepareOptions, GitRepository};
 use rivet_storage::Storage;
 use std::fs;
 use std::net::SocketAddr;
@@ -58,6 +59,11 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:7878")]
         bind: SocketAddr,
     },
+    /// Inspect or explicitly prepare a local Git repository.
+    Scm {
+        #[command(subcommand)]
+        command: ScmCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -73,6 +79,26 @@ struct CreateProject {
     repository: PathBuf,
     #[arg(long)]
     pipeline: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ScmCommand {
+    /// Print the current Git revision, branch, remote, and worktree state.
+    Inspect { repository: PathBuf },
+    /// Optionally fetch, checkout, and clean before printing the final state.
+    Prepare {
+        repository: PathBuf,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        #[arg(long)]
+        fetch: bool,
+        #[arg(long)]
+        revision: Option<String>,
+        #[arg(long)]
+        clean: bool,
+        #[arg(long)]
+        clean_ignored: bool,
+    },
 }
 
 #[tokio::main]
@@ -93,7 +119,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Server { bind } => {
             rivet_server::serve(cli.data_dir.join("rivet.db"), bind).await?
         }
+        Command::Scm { command } => inspect_scm(command).await?,
     }
+    Ok(())
+}
+
+async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Error>> {
+    let (repository_path, options) = match command {
+        ScmCommand::Inspect { repository } => (repository, None),
+        ScmCommand::Prepare {
+            repository,
+            remote,
+            fetch,
+            revision,
+            clean,
+            clean_ignored,
+        } => (
+            repository,
+            Some(GitPrepareOptions {
+                remote,
+                fetch,
+                revision,
+                clean,
+                clean_ignored,
+            }),
+        ),
+    };
+    let repository = GitRepository::open(&repository_path).await?;
+    let snapshot = match options {
+        Some(options) => repository.prepare(&options).await?,
+        None => repository.inspect().await?,
+    };
+    println!("{}", serde_json::to_string_pretty(&snapshot)?);
     Ok(())
 }
 
