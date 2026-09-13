@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **85% verified** · `█████████████████░░░`<br>
-Weighted evidence score: **85.18 / 100** · displayed conservatively as the
+Weighted evidence score: **85.63 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -437,6 +437,14 @@ with a SHA-256 checksum, and are available through the build artifacts API or
 `rivet artifacts`. Remote agents package only declared artifact matches and
 return them through bounded checksum-verified archive chunks before the build
 is marked passed.
+
+Old local cache archives can be removed with an explicit byte budget; only
+regular `.tar` entries are eligible, while symlinks and temporary files are
+left untouched:
+
+```sh
+cargo run -p rivet -- cache prune --max-bytes 5368709120
+```
 
 A step can opt into explicit Docker execution with `[stages.steps.container]`.
 Rivet assembles a direct `docker run` invocation with a private workspace mount,
