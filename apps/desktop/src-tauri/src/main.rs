@@ -46,6 +46,7 @@ fn main() {
                         credentials_file: None,
                         credentials_passphrase: None,
                         credentials_keychain_account: None,
+                        ssh_known_hosts_file: None,
                         extension_manifest_dir: None,
                         allowed_origins: Vec::new(),
                     },

@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.31 / 100** · displayed conservatively as the
+Weighted evidence score: **92.35 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -378,6 +378,11 @@ cargo run -p rivet -- scm prepare . --fetch --credential-id github \
   --project release \
   --credentials-file /secure/path/rivet.credentials.vault \
   --credentials-passphrase-file /secure/path/rivet.credentials.passphrase
+cargo run -p rivet -- scm prepare . --fetch --credential-id deploy-key \
+  --project release \
+  --ssh-known-hosts-file /secure/path/known_hosts \
+  --credentials-file /secure/path/rivet.credentials.vault \
+  --credentials-passphrase-file /secure/path/rivet.credentials.passphrase
 ```
 
 Start the server with the same vault and a private passphrase file:
@@ -385,7 +390,8 @@ Start the server with the same vault and a private passphrase file:
 ```sh
 cargo run -p rivet -- --data-dir .rivet server \
   --credentials-file /secure/path/rivet.credentials.vault \
-  --credentials-passphrase-file /secure/path/rivet.credentials.passphrase
+  --credentials-passphrase-file /secure/path/rivet.credentials.passphrase \
+  --ssh-known-hosts-file /secure/path/known_hosts
 ```
 
 Build admission and explicit SCM preparation accept only the non-secret
@@ -395,9 +401,13 @@ validated `fetch_ref`. Rivet resolves the ID locally, passes HTTP Basic auth
 through ephemeral Git configuration or writes an SSH private key to a private
 temporary file for the lifetime of the Git process, and redacts credential
 material from command errors. SSH uses `BatchMode` and `IdentitiesOnly`; its
-`accept-new` host-key behavior is a first-use convenience that still needs
-deployment-specific host-key policy. The vault stores authenticated ciphertext
-only. When the server is configured with the vault,
+`StrictHostKeyChecking=yes` policy now fails closed against unknown keys. By
+default OpenSSH's normal system/user known-hosts files are used. Operators can
+provide `--ssh-known-hosts-file` to `rivet run`, `scm prepare`, or `server`; the
+file must be a canonical regular non-symlink file that is not world-writable,
+and the server applies that deployment trust root to API, build, and webhook
+fetches. Rivet passes the file only to OpenSSH and never returns its contents.
+The vault stores authenticated ciphertext only. When the server is configured with the vault,
 administrators can manage its lifecycle through `GET /api/v1/credentials`,
 `PUT /api/v1/credentials/<id>`, and `DELETE /api/v1/credentials/<id>`.
 Responses contain only IDs, credential kinds, usernames, and non-secret project scopes;

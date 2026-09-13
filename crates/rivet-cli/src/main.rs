@@ -148,6 +148,9 @@ enum Command {
         /// Read the credential vault passphrase from the OS keychain account.
         #[arg(long, conflicts_with = "credentials_passphrase_file")]
         credentials_keychain_account: Option<String>,
+        /// Use this deployment-controlled OpenSSH known-hosts file for SSH SCM fetches.
+        #[arg(long)]
+        ssh_known_hosts_file: Option<PathBuf>,
         /// Load regular JSON extension manifests from this local directory.
         #[arg(long)]
         extension_manifest_dir: Option<PathBuf>,
@@ -398,6 +401,9 @@ struct RunArgs {
     /// Private passphrase file used with --credential-id.
     #[arg(long, requires = "credential_id")]
     credentials_passphrase_file: Option<PathBuf>,
+    /// Use this OpenSSH known-hosts file for strict SSH host-key verification.
+    #[arg(long, requires = "fetch")]
+    ssh_known_hosts_file: Option<PathBuf>,
     #[arg(long = "param", value_name = "NAME=VALUE")]
     parameters: Vec<String>,
     /// Queue priority from -100 to 100; higher values run first.
@@ -468,6 +474,9 @@ enum ScmCommand {
         /// Private passphrase file used with --credential-id.
         #[arg(long, requires = "credential_id")]
         credentials_passphrase_file: Option<PathBuf>,
+        /// Use this OpenSSH known-hosts file for strict SSH host-key verification.
+        #[arg(long, requires = "fetch")]
+        ssh_known_hosts_file: Option<PathBuf>,
     },
 }
 
@@ -506,6 +515,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             credentials_file,
             credentials_passphrase_file,
             credentials_keychain_account,
+            ssh_known_hosts_file,
             extension_manifest_dir,
             allowed_origins,
         } => {
@@ -540,6 +550,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     credentials_file,
                     credentials_passphrase,
                     credentials_keychain_account,
+                    ssh_known_hosts_file,
                     extension_manifest_dir,
                     allowed_origins,
                 },
@@ -1446,6 +1457,7 @@ async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Erro
             credential_id,
             credentials_file,
             credentials_passphrase_file,
+            ssh_known_hosts_file,
         } => (
             repository,
             Some({
@@ -1460,6 +1472,7 @@ async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Erro
                     clean,
                     clean_ignored,
                     credential_id: credential_id.clone(),
+                    known_hosts_file: ssh_known_hosts_file.clone(),
                 }
             }),
             load_git_credential(
@@ -2006,6 +2019,7 @@ async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::
         || args.clean_ignored
         || args.remote != "origin"
         || args.credential_id.is_some()
+        || args.ssh_known_hosts_file.is_some()
     {
         Some(GitPrepareOptions {
             remote: args.remote,
@@ -2015,6 +2029,7 @@ async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::
             clean: args.clean,
             clean_ignored: args.clean_ignored,
             credential_id: args.credential_id.clone(),
+            known_hosts_file: args.ssh_known_hosts_file.clone(),
         })
     } else {
         None

@@ -35,7 +35,7 @@ use rivet_extension_protocol::{
 use rivet_runner::{MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHandle, QueueStats, Scheduler};
 use rivet_scm::{
     GitCredential, GitHttpCredential, GitPrepareOptions, GitRepository, GitSnapshot,
-    GitSshCredential, ScmError,
+    GitSshCredential, ScmError, validate_known_hosts_file,
 };
 use rivet_storage::{
     ArtifactRecord, AuditEventRecord, BuildDetails, BuildRecord, LogRecord, RemoteAttemptRecord,
@@ -88,6 +88,7 @@ pub struct AppState {
     github_webhook_credential_id: Option<String>,
     gitlab_webhook_credential_id: Option<String>,
     credentials: Option<Arc<Mutex<CredentialVault>>>,
+    ssh_known_hosts_file: Option<PathBuf>,
     extensions: Arc<ExtensionCatalog>,
     extension_manager: Option<Arc<ExtensionManager>>,
     agents: AgentRegistry,
@@ -114,6 +115,9 @@ pub struct ServerConfig {
     pub credentials_file: Option<PathBuf>,
     pub credentials_passphrase: Option<String>,
     pub credentials_keychain_account: Option<String>,
+    /// Optional deployment-controlled OpenSSH trust root for SSH SCM fetches.
+    /// When absent, OpenSSH's normal system/user known-hosts files apply.
+    pub ssh_known_hosts_file: Option<PathBuf>,
     pub extension_manifest_dir: Option<PathBuf>,
     pub allowed_origins: Vec<String>,
 }
@@ -140,6 +144,8 @@ pub enum ServerError {
     EmptyProviderWebhookCredential { provider: &'static str },
     #[error("credential vault configuration requires both a file and a passphrase")]
     IncompleteCredentialVaultConfig,
+    #[error("invalid SSH known-hosts file: {0}")]
+    InvalidSshKnownHostsFile(String),
     #[error("could not open credential vault: {0}")]
     Credentials(#[from] CredentialError),
     #[error("could not load extension catalog: {0}")]
@@ -259,7 +265,8 @@ impl IntoResponse for ApiError {
             Self::Scm(error) => match error {
                 rivet_scm::ScmError::InvalidRepository(_)
                 | rivet_scm::ScmError::NotGitRepository(_)
-                | rivet_scm::ScmError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+                | rivet_scm::ScmError::InvalidCredential(_)
+                | rivet_scm::ScmError::InvalidHostKeyPolicy(_) => StatusCode::BAD_REQUEST,
                 rivet_scm::ScmError::Command { .. }
                 | rivet_scm::ScmError::InvalidOutput { .. }
                 | rivet_scm::ScmError::Filesystem(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -637,6 +644,7 @@ async fn prepare_scm(
                     clean: request.clean,
                     clean_ignored: request.clean_ignored,
                     credential_id: request.credential_id,
+                    known_hosts_file: state.ssh_known_hosts_file.clone(),
                 },
                 credential.as_ref(),
             )
@@ -659,6 +667,7 @@ pub async fn serve(storage_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(
             credentials_file: None,
             credentials_passphrase: None,
             credentials_keychain_account: None,
+            ssh_known_hosts_file: None,
             extension_manifest_dir: None,
             allowed_origins: default_allowed_origins(),
         },
@@ -767,6 +776,7 @@ pub async fn serve_with_listener(
         .map(ToOwned::to_owned);
     state.github_webhook_credential_id = config.github_webhook_credential_id;
     state.gitlab_webhook_credential_id = config.gitlab_webhook_credential_id;
+    state.ssh_known_hosts_file = config.ssh_known_hosts_file;
     let allowed_origins = if config.allowed_origins.is_empty() {
         default_allowed_origins()
     } else {
@@ -855,6 +865,11 @@ fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
     {
         return Err(ServerError::IncompleteCredentialVaultConfig);
     }
+    if let Some(path) = config.ssh_known_hosts_file.as_deref() {
+        validate_known_hosts_file(path)
+            .map(|_| ())
+            .map_err(|error| ServerError::InvalidSshKnownHostsFile(error.to_string()))?;
+    }
     Ok(())
 }
 
@@ -910,6 +925,7 @@ impl AppState {
             github_webhook_credential_id: None,
             gitlab_webhook_credential_id: None,
             credentials: None,
+            ssh_known_hosts_file: None,
             extensions: Arc::new(ExtensionCatalog::empty()),
             extension_manager: None,
             agents: AgentRegistry::default(),
@@ -2832,6 +2848,7 @@ async fn enqueue_project_build(
         &project.name,
         request.scm.as_ref(),
         state.credentials.as_ref(),
+        state.ssh_known_hosts_file.as_deref(),
     )
     .await?;
     let pipeline = Pipeline::load(&project.pipeline_path)?;
@@ -3973,6 +3990,7 @@ async fn capture_source_snapshot(
     project_name: &str,
     prepare: Option<&PrepareScmRequest>,
     credentials: Option<&Arc<Mutex<CredentialVault>>>,
+    ssh_known_hosts_file: Option<&Path>,
 ) -> Result<Option<SourceSnapshot>, ApiError> {
     match GitRepository::open(path).await {
         Ok(repository) => {
@@ -4004,6 +4022,7 @@ async fn capture_source_snapshot(
                                 clean: request.clean,
                                 clean_ignored: request.clean_ignored,
                                 credential_id: request.credential_id.clone(),
+                                known_hosts_file: ssh_known_hosts_file.map(Path::to_path_buf),
                             },
                             credential.as_ref(),
                         )

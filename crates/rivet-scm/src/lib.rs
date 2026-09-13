@@ -39,6 +39,9 @@ pub struct GitPrepareOptions {
     /// Reference resolved by the hosting layer; the secret never enters this
     /// serializable request object.
     pub credential_id: Option<String>,
+    /// Optional operator-provided OpenSSH known-hosts file used for strict SSH
+    /// host-key verification. `None` uses OpenSSH's normal system/user files.
+    pub known_hosts_file: Option<PathBuf>,
 }
 
 impl Default for GitPrepareOptions {
@@ -51,6 +54,7 @@ impl Default for GitPrepareOptions {
             clean: false,
             clean_ignored: false,
             credential_id: None,
+            known_hosts_file: None,
         }
     }
 }
@@ -180,6 +184,8 @@ pub enum ScmError {
     InvalidOutput { operation: &'static str },
     #[error("invalid Git credential: {0}")]
     InvalidCredential(String),
+    #[error("invalid SSH host-key policy: {0}")]
+    InvalidHostKeyPolicy(String),
     #[error("filesystem error: {0}")]
     Filesystem(#[from] std::io::Error),
 }
@@ -284,10 +290,25 @@ impl GitRepository {
         remote: &str,
         credential: Option<&GitCredential>,
     ) -> Result<(), ScmError> {
-        validate_argument(remote, "remote")?;
-        self.run(["fetch", "--prune", remote], "fetch", credential)
+        self.fetch_with_auth_and_known_hosts(remote, credential, None)
             .await
-            .map(|_| ())
+    }
+
+    pub async fn fetch_with_auth_and_known_hosts(
+        &self,
+        remote: &str,
+        credential: Option<&GitCredential>,
+        known_hosts_file: Option<&Path>,
+    ) -> Result<(), ScmError> {
+        validate_argument(remote, "remote")?;
+        self.run_with_known_hosts(
+            ["fetch", "--prune", remote],
+            "fetch",
+            credential,
+            known_hosts_file,
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn fetch_ref_with_credential(
@@ -307,12 +328,24 @@ impl GitRepository {
         refspec: &str,
         credential: Option<&GitCredential>,
     ) -> Result<(), ScmError> {
+        self.fetch_ref_with_auth_and_known_hosts(remote, refspec, credential, None)
+            .await
+    }
+
+    pub async fn fetch_ref_with_auth_and_known_hosts(
+        &self,
+        remote: &str,
+        refspec: &str,
+        credential: Option<&GitCredential>,
+        known_hosts_file: Option<&Path>,
+    ) -> Result<(), ScmError> {
         validate_argument(remote, "remote")?;
         validate_refspec(refspec)?;
-        self.run(
+        self.run_with_known_hosts(
             ["fetch", "--prune", remote, refspec],
             "fetch refspec",
             credential,
+            known_hosts_file,
         )
         .await
         .map(|_| ())
@@ -354,10 +387,20 @@ impl GitRepository {
     ) -> Result<GitSnapshot, ScmError> {
         if options.fetch {
             if let Some(refspec) = options.fetch_ref.as_deref() {
-                self.fetch_ref_with_auth(&options.remote, refspec, credential)
-                    .await?;
+                self.fetch_ref_with_auth_and_known_hosts(
+                    &options.remote,
+                    refspec,
+                    credential,
+                    options.known_hosts_file.as_deref(),
+                )
+                .await?;
             } else {
-                self.fetch_with_auth(&options.remote, credential).await?;
+                self.fetch_with_auth_and_known_hosts(
+                    &options.remote,
+                    credential,
+                    options.known_hosts_file.as_deref(),
+                )
+                .await?;
             }
         }
         if let Some(revision) = options.revision.as_deref() {
@@ -375,7 +418,18 @@ impl GitRepository {
         operation: &'static str,
         credential: Option<&GitCredential>,
     ) -> Result<GitCommandOutput, ScmError> {
-        let authentication = git_auth_environment(credential)?;
+        self.run_with_known_hosts(args, operation, credential, None)
+            .await
+    }
+
+    async fn run_with_known_hosts<const N: usize>(
+        &self,
+        args: [&str; N],
+        operation: &'static str,
+        credential: Option<&GitCredential>,
+        known_hosts_file: Option<&Path>,
+    ) -> Result<GitCommandOutput, ScmError> {
+        let authentication = git_auth_environment_with_known_hosts(credential, known_hosts_file)?;
         let output = Command::new("git")
             .args(args)
             .current_dir(&self.root)
@@ -430,12 +484,23 @@ struct GitAuthEnvironment {
     _ssh_key: Option<NamedTempFile>,
 }
 
-fn git_auth_environment(
+fn git_auth_environment_with_known_hosts(
     credential: Option<&GitCredential>,
+    known_hosts_file: Option<&Path>,
 ) -> Result<GitAuthEnvironment, ScmError> {
     let mut environment = BTreeMap::new();
     let mut ssh_key = None;
     let Some(credential) = credential else {
+        if known_hosts_file.is_some() {
+            environment.insert(
+                "GIT_SSH_COMMAND".into(),
+                format!(
+                    "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes{}",
+                    ssh_known_hosts_options(known_hosts_file)?
+                ),
+            );
+            environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+        }
         return Ok(GitAuthEnvironment {
             values: environment,
             _ssh_key: ssh_key,
@@ -483,8 +548,9 @@ fn git_auth_environment(
             environment.insert(
                 "GIT_SSH_COMMAND".into(),
                 format!(
-                    "ssh -i {} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
-                    key_path
+                    "ssh -i {} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes{}",
+                    key_path,
+                    ssh_known_hosts_options(known_hosts_file)?
                 ),
             );
             ssh_key = Some(temporary);
@@ -495,6 +561,45 @@ fn git_auth_environment(
         values: environment,
         _ssh_key: ssh_key,
     })
+}
+
+fn ssh_known_hosts_options(known_hosts_file: Option<&Path>) -> Result<String, ScmError> {
+    let Some(path) = known_hosts_file else {
+        return Ok(String::new());
+    };
+    let path = validate_known_hosts_file(path)?;
+    Ok(format!(
+        " -o UserKnownHostsFile={} -o GlobalKnownHostsFile=/dev/null",
+        shell_quote(&path.to_string_lossy())
+    ))
+}
+
+/// Validate and canonicalize an operator-provided OpenSSH known-hosts file.
+///
+/// A symlink or world-writable file is rejected so a deployment cannot silently
+/// replace the trust root behind the server's back. The file contents remain
+/// private to OpenSSH and are never returned by Rivet.
+pub fn validate_known_hosts_file(path: &Path) -> Result<PathBuf, ScmError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| ScmError::InvalidHostKeyPolicy(format!("{}: {error}", path.display())))?;
+    if !metadata.file_type().is_file() {
+        return Err(ScmError::InvalidHostKeyPolicy(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o002 != 0 {
+            return Err(ScmError::InvalidHostKeyPolicy(format!(
+                "{} must not be world-writable",
+                path.display()
+            )));
+        }
+    }
+    std::fs::canonicalize(path)
+        .map_err(|error| ScmError::InvalidHostKeyPolicy(format!("{}: {error}", path.display())))
 }
 
 fn shell_quote(value: &str) -> String {
@@ -696,7 +801,8 @@ mod tests {
         let credential =
             GitHttpCredential::new("oauth2", "fixture-token-value").expect("credential");
         let credential = GitCredential::HttpBasic(credential);
-        let environment = git_auth_environment(Some(&credential)).expect("environment");
+        let environment =
+            git_auth_environment_with_known_hosts(Some(&credential), None).expect("environment");
         let encoded = STANDARD.encode("oauth2:fixture-token-value");
 
         assert_eq!(
@@ -751,7 +857,8 @@ mod tests {
             "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-key\n-----END OPENSSH PRIVATE KEY-----";
         let credential =
             GitCredential::SshKey(GitSshCredential::new("git", private_key).expect("credential"));
-        let environment = git_auth_environment(Some(&credential)).expect("environment");
+        let environment =
+            git_auth_environment_with_known_hosts(Some(&credential), None).expect("environment");
         let key_path = environment
             ._ssh_key
             .as_ref()
@@ -765,7 +872,8 @@ mod tests {
         assert!(ssh_command.contains(key_path.to_str().expect("key path")));
         assert!(ssh_command.contains("IdentitiesOnly=yes"));
         assert!(ssh_command.contains("BatchMode=yes"));
-        assert!(ssh_command.contains("StrictHostKeyChecking=accept-new"));
+        assert!(ssh_command.contains("StrictHostKeyChecking=yes"));
+        assert!(!ssh_command.contains("accept-new"));
         assert!(!ssh_command.contains(private_key));
         assert_eq!(
             environment
@@ -798,6 +906,98 @@ mod tests {
         assert!(!format!("{credential:?}").contains(private_key));
         drop(environment);
         assert!(!key_path.exists());
+    }
+
+    #[test]
+    fn applies_an_explicit_strict_known_hosts_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let known_hosts = tempdir.path().join("known_hosts");
+        fs::write(&known_hosts, "github.com ssh-ed25519 AAAAfixture\n").expect("known hosts");
+        let credential = GitCredential::SshKey(
+            GitSshCredential::new(
+                "git",
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n-----END OPENSSH PRIVATE KEY-----",
+            )
+            .expect("credential"),
+        );
+
+        let environment =
+            git_auth_environment_with_known_hosts(Some(&credential), Some(&known_hosts))
+                .expect("environment");
+        let command = environment
+            .values
+            .get("GIT_SSH_COMMAND")
+            .expect("ssh command");
+        let canonical = fs::canonicalize(&known_hosts).expect("canonical known hosts");
+        assert!(command.contains("StrictHostKeyChecking=yes"));
+        assert!(command.contains("GlobalKnownHostsFile=/dev/null"));
+        assert!(command.contains(&format!(
+            "UserKnownHostsFile={}",
+            shell_quote(&canonical.to_string_lossy())
+        )));
+    }
+
+    #[test]
+    fn applies_known_hosts_policy_when_ssh_uses_the_system_agent() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let known_hosts = tempdir.path().join("known_hosts");
+        fs::write(&known_hosts, "github.com ssh-ed25519 AAAAfixture\n").expect("known hosts");
+
+        let environment =
+            git_auth_environment_with_known_hosts(None, Some(&known_hosts)).expect("environment");
+        let command = environment
+            .values
+            .get("GIT_SSH_COMMAND")
+            .expect("ssh command");
+        assert!(command.contains("BatchMode=yes"));
+        assert!(command.contains("StrictHostKeyChecking=yes"));
+        assert_eq!(
+            environment
+                .values
+                .get("GIT_TERMINAL_PROMPT")
+                .map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn rejects_missing_directories_symlinks_and_world_writable_known_hosts() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let missing = tempdir.path().join("missing");
+        assert!(matches!(
+            validate_known_hosts_file(&missing),
+            Err(ScmError::InvalidHostKeyPolicy(_))
+        ));
+        assert!(matches!(
+            validate_known_hosts_file(tempdir.path()),
+            Err(ScmError::InvalidHostKeyPolicy(_))
+        ));
+
+        let known_hosts = tempdir.path().join("known_hosts");
+        fs::write(&known_hosts, "fixture\n").expect("known hosts");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&known_hosts).expect("metadata").permissions();
+            permissions.set_mode(0o666);
+            fs::set_permissions(&known_hosts, permissions).expect("permissions");
+            assert!(matches!(
+                validate_known_hosts_file(&known_hosts),
+                Err(ScmError::InvalidHostKeyPolicy(_))
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            let target = tempdir.path().join("target");
+            fs::write(&target, "fixture\n").expect("target");
+            let link = tempdir.path().join("known_hosts.link");
+            std::os::unix::fs::symlink(&target, &link).expect("symlink");
+            assert!(matches!(
+                validate_known_hosts_file(&link),
+                Err(ScmError::InvalidHostKeyPolicy(_))
+            ));
+        }
     }
 
     #[test]
