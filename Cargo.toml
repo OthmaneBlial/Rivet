@@ -2,6 +2,7 @@
 members = [
     "crates/rivet-core",
     "crates/rivet-agent-protocol",
+    "crates/rivet-auth",
     "crates/rivet-credentials",
     "crates/rivet-migration",
     "crates/rivet-runner",

@@ -1149,6 +1149,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rivet-auth"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror",
+]
+
+[[package]]
 name = "rivet-core"
 version = "0.1.0"
 dependencies = [
