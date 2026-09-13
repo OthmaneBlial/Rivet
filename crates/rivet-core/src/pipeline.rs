@@ -6,6 +6,9 @@ use thiserror::Error;
 
 const MAX_AGENT_REQUIREMENT_VALUE_BYTES: usize = 64;
 const MAX_AGENT_REQUIREMENT_LABELS: usize = 64;
+const MAX_ENVIRONMENT_VARIABLES: usize = 128;
+const MAX_ENVIRONMENT_NAME_BYTES: usize = 256;
+const MAX_ENVIRONMENT_VALUE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Pipeline {
@@ -13,6 +16,10 @@ pub struct Pipeline {
     pub name: String,
     #[serde(default)]
     pub workspace: Option<PathBuf>,
+    /// Non-secret defaults inherited by every process in the pipeline.
+    /// Secret values belong in secret parameters or the credential vault.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
     #[serde(default)]
     pub parameters: Vec<ParameterSpec>,
     #[serde(default)]
@@ -166,6 +173,12 @@ pub enum PipelineError {
     MissingParameter(String),
     #[error("secret parameter {0:?} cannot define a default value")]
     SecretParameterDefault(String),
+    #[error("pipeline environment declares too many variables")]
+    TooManyEnvironmentVariables,
+    #[error("pipeline environment variable name {0:?} is invalid")]
+    InvalidEnvironmentVariableName(String),
+    #[error("pipeline environment variable {name:?} has an invalid value")]
+    InvalidEnvironmentVariableValue { name: String },
     #[error("artifact name cannot be empty")]
     EmptyArtifactName,
     #[error("artifact name {0:?} contains a path separator")]
@@ -231,6 +244,27 @@ impl Pipeline {
         }
         if self.stages.is_empty() {
             return Err(PipelineError::EmptyStages);
+        }
+
+        if self.environment.len() > MAX_ENVIRONMENT_VARIABLES {
+            return Err(PipelineError::TooManyEnvironmentVariables);
+        }
+        for (name, value) in &self.environment {
+            if name.len() > MAX_ENVIRONMENT_NAME_BYTES
+                || !valid_parameter_name(name)
+                || name == "CI"
+                || name == "RIVET_BUILD_ID"
+                || name == "RIVET_PROJECT_ID"
+                || name.starts_with("RIVET_")
+            {
+                return Err(PipelineError::InvalidEnvironmentVariableName(name.clone()));
+            }
+            if value.len() > MAX_ENVIRONMENT_VALUE_BYTES
+                || value.contains('\0')
+                || value.chars().any(char::is_control)
+            {
+                return Err(PipelineError::InvalidEnvironmentVariableValue { name: name.clone() });
+            }
         }
 
         let mut parameter_names = HashSet::new();
@@ -620,6 +654,47 @@ timeout_seconds = 60
         assert_eq!(pipeline.stages[0].steps[0].program, "cargo");
         assert_eq!(pipeline.stages[0].steps[0].args, ["test"]);
         assert_eq!(pipeline.workspace, None);
+        assert!(pipeline.environment.is_empty());
+    }
+
+    #[test]
+    fn validates_pipeline_environment_defaults_and_reserved_names() {
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "environment"
+[environment]
+RUST_BACKTRACE = "1"
+BUILD_CHANNEL = "stable"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline environment is valid");
+        assert_eq!(pipeline.environment["RUST_BACKTRACE"], "1");
+        assert_eq!(pipeline.environment["BUILD_CHANNEL"], "stable");
+
+        let invalid = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "reserved-environment"
+[environment]
+RIVET_BUILD_ID = "override"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect_err("engine environment must be reserved");
+        assert!(matches!(
+            invalid,
+            PipelineError::InvalidEnvironmentVariableName(name) if name == "RIVET_BUILD_ID"
+        ));
     }
 
     #[test]

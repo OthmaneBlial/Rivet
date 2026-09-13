@@ -487,6 +487,9 @@ args = ["test"]
 timeout_seconds = 300
 [stages.steps.container]
 image = "rust:1.85"
+
+[environment]
+RUST_BACKTRACE = "1"
 ```
 
 Build parameters and local artifacts are also explicit:
@@ -511,8 +514,12 @@ name = "bundle"
 paths = ["dist/**"]
 ```
 
-Parameters are resolved per build and exposed to direct processes as
-environment variables. Non-secret values are persisted for history; secret
+Pipeline `environment` entries are non-secret defaults inherited by every
+step; step-level `env` entries override them, and resolved build parameters
+override pipeline defaults. Reserved `CI`/`RIVET_*` names are controlled by
+the runner. Keep secrets in secret parameters or the encrypted credential
+vault, never in the versioned pipeline file. Parameters are resolved per
+build and exposed to direct processes as environment variables. Non-secret values are persisted for history; secret
 parameters cannot define defaults, are represented as `[redacted]` in stored
 build data and API responses, and are replaced with `***` in emitted logs.
 Cache paths use exact project-scoped primary and fallback keys, restore before

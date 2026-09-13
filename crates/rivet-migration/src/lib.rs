@@ -554,6 +554,7 @@ pub fn generate_rivetfile_draft(source: &str) -> Result<RivetfileDraft, Migratio
             version: 1,
             name: "migrated-jenkinsfile".to_owned(),
             workspace: None,
+            environment: BTreeMap::new(),
             parameters: Vec::new(),
             artifacts: Vec::new(),
             caches: Vec::new(),

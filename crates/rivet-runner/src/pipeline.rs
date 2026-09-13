@@ -133,6 +133,7 @@ pub async fn execute_pipeline_with_parameters_and_cache(
                 plan,
                 stage,
                 step,
+                pipeline,
                 &workspace,
                 &parameters,
                 &secret_values,
@@ -186,6 +187,7 @@ async fn execute_step(
     plan: &ExecutionPlan,
     stage: &ExecutionStage,
     step: &ExecutionStep,
+    pipeline: &Pipeline,
     workspace: &Path,
     parameters: &BTreeMap<String, String>,
     secret_values: &[String],
@@ -210,7 +212,8 @@ async fn execute_step(
     )
     .await?;
 
-    let mut env = parameters.clone();
+    let mut env = pipeline.environment.clone();
+    env.extend(parameters.clone());
     env.extend(step.definition.env.clone());
     env.insert("CI".into(), "true".into());
     env.insert("RIVET_BUILD_ID".into(), plan.build_id.to_string());
@@ -498,6 +501,9 @@ args = ["-c", "printf second; test \"$(cat order.txt)\" = first"]
 version = 1
 name = "parameters"
 
+[environment]
+BUILD_CHANNEL = "project"
+
 [[parameters]]
 name = "TARGET"
 default = "debug"
@@ -507,7 +513,8 @@ name = "Test"
 [[stages.steps]]
 name = "parameter-check"
 program = "sh"
-args = ["-c", "test \"$TARGET\" = release && test \"$CI\" = true"]
+args = ["-c", "test \"$TARGET\" = release && test \"$BUILD_CHANNEL\" = step && test \"$CI\" = true"]
+env = { BUILD_CHANNEL = "step" }
 "#,
         )
         .expect("pipeline");
