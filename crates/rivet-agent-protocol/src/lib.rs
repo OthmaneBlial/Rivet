@@ -20,6 +20,7 @@ const MAX_AGENT_NAME_BYTES: usize = 128;
 const MAX_LABELS: usize = 64;
 const MAX_LABEL_BYTES: usize = 64;
 const MAX_RUNNING_BUILDS: usize = 256;
+const MAX_REQUIREMENT_VALUE_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentCapabilities {
@@ -84,6 +85,36 @@ pub struct AgentRequirements {
     pub labels: Vec<String>,
     #[serde(default)]
     pub executors: Option<u16>,
+}
+
+impl AgentRequirements {
+    /// Validate scheduler input before it reaches a matcher or a future
+    /// remote assignment path. An omitted executor requirement means one
+    /// available slot, which keeps an unconstrained build from matching a
+    /// saturated agent.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        validate_requirement_value(self.os.as_deref(), "os")?;
+        validate_requirement_value(self.arch.as_deref(), "arch")?;
+        if self.labels.len() > MAX_LABELS {
+            return Err(ProtocolError::TooManyRequirementLabels);
+        }
+        for label in &self.labels {
+            if label.trim().is_empty()
+                || label.len() > MAX_LABEL_BYTES
+                || label.chars().any(char::is_control)
+            {
+                return Err(ProtocolError::InvalidRequirementLabel);
+            }
+        }
+        if self.executors == Some(0) {
+            return Err(ProtocolError::ZeroRequiredExecutors);
+        }
+        Ok(())
+    }
+
+    pub fn requested_executors(&self) -> u16 {
+        self.executors.unwrap_or(1)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -245,6 +276,16 @@ pub enum ProtocolError {
     InvalidLabel,
     #[error("agent heartbeat advertises too many running builds")]
     TooManyRunningBuilds,
+    #[error("agent requirement {0} cannot be empty")]
+    EmptyRequirement(&'static str),
+    #[error("agent requirement {0} is too long")]
+    RequirementTooLong(&'static str),
+    #[error("agent requirement label is empty, too long, or contains control characters")]
+    InvalidRequirementLabel,
+    #[error("agent requires at least one executor")]
+    ZeroRequiredExecutors,
+    #[error("agent requires too many labels")]
+    TooManyRequirementLabels,
 }
 
 fn validate_version(version: u16) -> Result<(), ProtocolError> {
@@ -264,6 +305,22 @@ fn validate_name(name: &str) -> Result<(), ProtocolError> {
     }
     if name.len() > MAX_AGENT_NAME_BYTES || name.chars().any(char::is_control) {
         return Err(ProtocolError::AgentNameTooLong);
+    }
+    Ok(())
+}
+
+fn validate_requirement_value(
+    value: Option<&str>,
+    field: &'static str,
+) -> Result<(), ProtocolError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.trim().is_empty() {
+        return Err(ProtocolError::EmptyRequirement(field));
+    }
+    if value.len() > MAX_REQUIREMENT_VALUE_BYTES || value.chars().any(char::is_control) {
+        return Err(ProtocolError::RequirementTooLong(field));
     }
     Ok(())
 }
@@ -317,13 +374,15 @@ mod tests {
     #[test]
     fn requirements_match_capabilities_without_fuzzy_labels() {
         let capabilities = capabilities();
-        assert!(capabilities.supports(&AgentRequirements {
+        let requirements = AgentRequirements {
             os: Some("linux".into()),
             arch: Some("x86_64".into()),
             docker: true,
             labels: vec!["production".into()],
             executors: Some(2),
-        }));
+        };
+        requirements.validate().expect("valid requirements");
+        assert!(capabilities.supports(&requirements));
         assert!(!capabilities.supports(&AgentRequirements {
             labels: vec!["prod".into()],
             ..AgentRequirements::default()
@@ -332,6 +391,27 @@ mod tests {
             os: Some("darwin".into()),
             ..AgentRequirements::default()
         }));
+    }
+
+    #[test]
+    fn requirements_reject_empty_values_and_zero_capacity() {
+        assert_eq!(
+            AgentRequirements {
+                os: Some("   ".into()),
+                ..AgentRequirements::default()
+            }
+            .validate(),
+            Err(ProtocolError::EmptyRequirement("os"))
+        );
+        assert_eq!(
+            AgentRequirements {
+                executors: Some(0),
+                ..AgentRequirements::default()
+            }
+            .validate(),
+            Err(ProtocolError::ZeroRequiredExecutors)
+        );
+        assert_eq!(AgentRequirements::default().requested_executors(), 1);
     }
 
     #[test]

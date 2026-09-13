@@ -14,7 +14,7 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
-use rivet_agent_protocol::{AgentMessage, PROTOCOL_VERSION};
+use rivet_agent_protocol::{AgentMessage, AgentRequirements, PROTOCOL_VERSION};
 use rivet_core::{
     BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, Pipeline, Project, ScheduleId,
     SourceSnapshot,
@@ -224,6 +224,12 @@ pub struct JenkinsfileAnalysisRequest {
     pub draft: bool,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct AgentMatchRequest {
+    #[serde(flatten)]
+    pub requirements: AgentRequirements,
+}
+
 #[derive(Debug, Serialize)]
 struct JenkinsfileAnalysisResponse {
     analysis: rivet_migration::JenkinsfileAnalysis,
@@ -265,6 +271,7 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
     Ok(Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/agents", get(list_agents))
+        .route("/api/v1/agents/match", post(match_agents))
         .route("/api/v1/agents/connect", get(connect_agent))
         .route("/api/v1/migration/jenkinsfile", post(analyze_jenkinsfile))
         .route("/api/v1/webhooks/generic", post(webhook_build))
@@ -614,6 +621,18 @@ async fn list_projects(State(state): State<AppState>) -> Result<Json<Vec<Project
 
 async fn list_agents(State(state): State<AppState>) -> Json<Vec<AgentSummary>> {
     Json(state.agents.list(Utc::now()).await)
+}
+
+async fn match_agents(
+    State(state): State<AppState>,
+    Json(request): Json<AgentMatchRequest>,
+) -> Result<Json<Vec<AgentSummary>>, ApiError> {
+    state
+        .agents
+        .matching(&request.requirements, Utc::now())
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))
 }
 
 async fn connect_agent(
@@ -1453,7 +1472,7 @@ mod tests {
     use chrono::TimeZone;
     use futures_util::{SinkExt, StreamExt};
     use rivet_agent_protocol::{
-        AgentCapabilities, AgentHeartbeat, AgentRegistration, PROTOCOL_VERSION,
+        AgentCapabilities, AgentHeartbeat, AgentRegistration, AgentRequirements, PROTOCOL_VERSION,
     };
     use std::fs;
     use tempfile::tempdir;
@@ -1542,6 +1561,70 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 4096).await.expect("body");
         assert_eq!(&body[..], b"[]");
+    }
+
+    #[tokio::test]
+    async fn agent_match_route_is_capacity_aware() {
+        let state = AppState::new(Storage::open_in_memory().expect("storage"));
+        let agent_id = uuid::Uuid::new_v4();
+        state
+            .agents
+            .register(
+                AgentRegistration {
+                    protocol_version: PROTOCOL_VERSION,
+                    agent_id,
+                    name: "linux-builder".into(),
+                    capabilities: AgentCapabilities {
+                        os: "linux".into(),
+                        arch: "x86_64".into(),
+                        docker: true,
+                        labels: vec!["build".into()],
+                        executors: 2,
+                    },
+                },
+                Utc::now(),
+            )
+            .await
+            .expect("register agent");
+        let body = serde_json::to_vec(&AgentRequirements {
+            os: Some("linux".into()),
+            docker: true,
+            labels: vec!["build".into()],
+            executors: Some(1),
+            ..AgentRequirements::default()
+        })
+        .expect("request body");
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/agents/match")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("body");
+        let matches: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(matches[0]["agent_id"], agent_id.to_string());
+        assert_eq!(matches[0]["available_executors"], 2);
+
+        let invalid = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/agents/match")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"executors":0}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

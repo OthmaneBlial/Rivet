@@ -1,9 +1,9 @@
 use chrono::{DateTime, Duration, Utc};
 use rivet_agent_protocol::{
-    AgentCapabilities, AgentHeartbeat, AgentId, AgentRegistration, ProtocolError,
+    AgentCapabilities, AgentHeartbeat, AgentId, AgentRegistration, AgentRequirements, ProtocolError,
 };
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -34,6 +34,7 @@ pub struct AgentSummary {
     pub last_heartbeat: DateTime<Utc>,
     pub last_sequence: u64,
     pub running: Vec<rivet_core::BuildId>,
+    pub available_executors: u16,
     pub status: AgentStatus,
 }
 
@@ -163,6 +164,24 @@ impl AgentRegistry {
         summaries
     }
 
+    pub async fn matching(
+        &self,
+        requirements: &AgentRequirements,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<AgentSummary>, AgentRegistryError> {
+        requirements.validate()?;
+        let agents = self.agents.read().await;
+        let mut summaries: Vec<_> = agents
+            .values()
+            .filter(|entry| self.status(entry, now) == AgentStatus::Online)
+            .filter(|entry| entry.capabilities.supports(requirements))
+            .filter(|entry| available_executors(entry) >= requirements.requested_executors())
+            .map(|entry| summary(entry, AgentStatus::Online))
+            .collect();
+        summaries.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(summaries)
+    }
+
     fn status(&self, entry: &AgentEntry, now: DateTime<Utc>) -> AgentStatus {
         if now - entry.last_heartbeat <= self.stale_after {
             AgentStatus::Online
@@ -182,8 +201,17 @@ fn summary(entry: &AgentEntry, status: AgentStatus) -> AgentSummary {
         last_heartbeat: entry.last_heartbeat,
         last_sequence: entry.last_sequence,
         running: entry.running.clone(),
+        available_executors: available_executors(entry),
         status,
     }
+}
+
+fn available_executors(entry: &AgentEntry) -> u16 {
+    let distinct_running = entry.running.iter().collect::<HashSet<_>>().len() as u16;
+    entry
+        .capabilities
+        .executors
+        .saturating_sub(distinct_running)
 }
 
 #[cfg(test)]
@@ -301,5 +329,97 @@ mod tests {
         assert_eq!(registry.list(Utc::now()).await.len(), 1);
         registry.unregister(agent_id, second.session_id).await;
         assert!(registry.list(Utc::now()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn matching_is_capacity_aware_and_excludes_stale_or_incompatible_agents() {
+        let registry = AgentRegistry::new(Duration::seconds(10));
+        let now = Utc::now();
+        let available_id = Uuid::new_v4();
+        let busy_id = Uuid::new_v4();
+        let stale_id = Uuid::new_v4();
+        registry
+            .register(registration(available_id), now)
+            .await
+            .expect("available agent");
+        let busy = registry
+            .register(registration(busy_id), now)
+            .await
+            .expect("busy agent");
+        registry
+            .register(registration(stale_id), now - Duration::seconds(20))
+            .await
+            .expect("stale agent");
+        registry
+            .heartbeat(
+                AgentHeartbeat {
+                    protocol_version: PROTOCOL_VERSION,
+                    agent_id: busy_id,
+                    session_id: busy.session_id,
+                    sequence: 1,
+                    running: vec![Uuid::new_v4(), Uuid::new_v4()],
+                    sent_at: now,
+                },
+                now,
+            )
+            .await
+            .expect("busy heartbeat");
+
+        let matches = registry
+            .matching(
+                &AgentRequirements {
+                    os: Some("linux".into()),
+                    arch: Some("x86_64".into()),
+                    docker: true,
+                    labels: vec!["build".into()],
+                    executors: Some(2),
+                },
+                now,
+            )
+            .await
+            .expect("matches");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].agent_id, available_id);
+        assert_eq!(matches[0].available_executors, 2);
+
+        let one_slot = registry
+            .matching(
+                &AgentRequirements {
+                    os: Some("linux".into()),
+                    executors: Some(1),
+                    ..AgentRequirements::default()
+                },
+                now,
+            )
+            .await
+            .expect("one-slot matches");
+        assert_eq!(one_slot.len(), 1);
+        assert_eq!(one_slot[0].agent_id, available_id);
+        assert!(
+            registry
+                .matching(&AgentRequirements::default(), now + Duration::seconds(11))
+                .await
+                .expect("stale matches")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_requirements_are_rejected_before_matching() {
+        let registry = AgentRegistry::default();
+        let error = registry
+            .matching(
+                &AgentRequirements {
+                    labels: vec!["".into()],
+                    ..AgentRequirements::default()
+                },
+                Utc::now(),
+            )
+            .await
+            .expect_err("invalid requirement");
+        assert!(matches!(
+            error,
+            AgentRegistryError::Protocol(ProtocolError::InvalidRequirementLabel)
+        ));
     }
 }
