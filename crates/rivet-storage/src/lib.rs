@@ -5,22 +5,27 @@
 //! server, and embedded desktop engine.
 
 use chrono::{DateTime, Utc};
+use globset::{Glob, GlobSetBuilder};
 use rivet_core::{
     BuildEvent, BuildId, BuildStatus, ExecutionPlan, LogStream, Pipeline, Project, ProjectId,
     SourceSnapshot, StageId, StageStatus, StepId, StepStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
+use walkdir::WalkDir;
 
 #[derive(Clone)]
 pub struct Storage {
     connection: Arc<Mutex<Connection>>,
+    artifact_root: Arc<std::path::PathBuf>,
 }
 
 fn apply_migration(
@@ -73,6 +78,22 @@ pub enum StorageError {
     InvalidBuildTransition { from: BuildStatus, to: BuildStatus },
     #[error("invalid source snapshot in database: {0}")]
     InvalidSource(String),
+    #[error("artifact walk failed: {0}")]
+    ArtifactWalk(String),
+    #[error("artifact pattern {path:?} for {artifact:?} is invalid: {message}")]
+    ArtifactPattern {
+        artifact: String,
+        path: String,
+        message: String,
+    },
+    #[error("artifact {artifact:?} matched no files for pattern {path:?}")]
+    ArtifactPatternNoMatch { artifact: String, path: String },
+    #[error("artifact path escapes the workspace: {0}")]
+    ArtifactPathOutsideWorkspace(std::path::PathBuf),
+    #[error("artifact file is too large to persist: {0} bytes")]
+    ArtifactTooLarge(u64),
+    #[error("invalid artifact size in database: {0}")]
+    InvalidArtifactSize(i64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -132,6 +153,17 @@ pub struct LogRecord {
     pub line: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactRecord {
+    pub id: Uuid,
+    pub build_id: BuildId,
+    pub name: String,
+    pub relative_path: String,
+    pub size_bytes: u64,
+    pub checksum: String,
+    pub created_at: DateTime<Utc>,
+}
+
 impl Storage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
@@ -145,6 +177,14 @@ impl Storage {
         }
         let connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        let artifact_root = if path == Path::new(":memory:") {
+            std::env::temp_dir().join(format!("rivet-artifacts-{}", Uuid::new_v4()))
+        } else {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .join("artifacts")
+        };
         connection.execute_batch(include_str!("../migrations/001_initial.sql"))?;
         apply_migration(&connection, 1, None)?;
         apply_migration(
@@ -162,8 +202,14 @@ impl Storage {
             4,
             Some(include_str!("../migrations/004_build_parameters.sql")),
         )?;
+        apply_migration(
+            &connection,
+            5,
+            Some(include_str!("../migrations/005_artifacts.sql")),
+        )?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            artifact_root: Arc::new(artifact_root),
         })
     }
 
@@ -541,6 +587,168 @@ impl Storage {
         })
         .collect()
     }
+
+    pub fn collect_artifacts(
+        &self,
+        build_id: BuildId,
+        pipeline: &Pipeline,
+        workspace: &Path,
+    ) -> Result<Vec<ArtifactRecord>, StorageError> {
+        let workspace = fs::canonicalize(workspace)?;
+        if !workspace.is_dir() {
+            return Err(StorageError::ArtifactPathOutsideWorkspace(workspace));
+        }
+        let existing = self.artifacts(build_id)?;
+        let existing_keys = existing
+            .iter()
+            .map(|artifact| (artifact.name.clone(), artifact.relative_path.clone()))
+            .collect::<BTreeSet<_>>();
+        let mut collected = Vec::new();
+
+        for specification in &pipeline.artifacts {
+            let mut builder = GlobSetBuilder::new();
+            for path in &specification.paths {
+                let glob = Glob::new(path).map_err(|error| StorageError::ArtifactPattern {
+                    artifact: specification.name.clone(),
+                    path: path.clone(),
+                    message: error.to_string(),
+                })?;
+                builder.add(glob);
+            }
+            let matcher = builder
+                .build()
+                .map_err(|error| StorageError::ArtifactPattern {
+                    artifact: specification.name.clone(),
+                    path: specification.paths.join(", "),
+                    message: error.to_string(),
+                })?;
+            let mut matches = BTreeMap::new();
+            for entry in WalkDir::new(&workspace).follow_links(false) {
+                let entry = entry.map_err(|error| StorageError::ArtifactWalk(error.to_string()))?;
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let relative = entry.path().strip_prefix(&workspace).map_err(|_| {
+                    StorageError::ArtifactPathOutsideWorkspace(entry.path().to_path_buf())
+                })?;
+                let relative = relative
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                if matcher.is_match(&relative) {
+                    matches.insert(relative, entry.path().to_path_buf());
+                }
+            }
+            if matches.is_empty() && !specification.allow_empty {
+                return Err(StorageError::ArtifactPatternNoMatch {
+                    artifact: specification.name.clone(),
+                    path: specification.paths.join(", "),
+                });
+            }
+
+            for (relative_path, source_path) in matches {
+                if existing_keys.contains(&(specification.name.clone(), relative_path.clone())) {
+                    continue;
+                }
+                let artifact_id = Uuid::new_v4();
+                let size_bytes = fs::metadata(&source_path)?.len();
+                let checksum = sha256_file(&source_path)?;
+                let destination_dir = self.artifact_root.join(build_id.to_string());
+                fs::create_dir_all(&destination_dir)?;
+                fs::copy(&source_path, destination_dir.join(artifact_id.to_string()))?;
+                collected.push(ArtifactRecord {
+                    id: artifact_id,
+                    build_id,
+                    name: specification.name.clone(),
+                    relative_path,
+                    size_bytes,
+                    checksum,
+                    created_at: Utc::now(),
+                });
+            }
+        }
+
+        if !collected.is_empty() {
+            let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+            let transaction = connection.transaction()?;
+            for artifact in &collected {
+                let size_bytes = i64::try_from(artifact.size_bytes)
+                    .map_err(|_| StorageError::ArtifactTooLarge(artifact.size_bytes))?;
+                transaction.execute(
+                    "INSERT INTO build_artifacts(
+                        id, build_id, name, relative_path, size_bytes, checksum, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        artifact.id.to_string(),
+                        artifact.build_id.to_string(),
+                        artifact.name,
+                        artifact.relative_path,
+                        size_bytes,
+                        artifact.checksum,
+                        artifact.created_at.to_rfc3339(),
+                    ],
+                )?;
+            }
+            transaction.commit()?;
+        }
+
+        self.artifacts(build_id)
+    }
+
+    pub fn artifacts(&self, build_id: BuildId) -> Result<Vec<ArtifactRecord>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT id, build_id, name, relative_path, size_bytes, checksum, created_at
+             FROM build_artifacts
+             WHERE build_id = ?1 ORDER BY name ASC, relative_path ASC",
+        )?;
+        let rows = statement.query_map(params![build_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        rows.map(|row| row.map_err(StorageError::from).and_then(parse_artifact))
+            .collect()
+    }
+
+    pub fn artifact_file(
+        &self,
+        artifact_id: Uuid,
+    ) -> Result<Option<(ArtifactRecord, std::path::PathBuf)>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let row = connection
+            .query_row(
+                "SELECT id, build_id, name, relative_path, size_bytes, checksum, created_at
+                 FROM build_artifacts WHERE id = ?1",
+                params![artifact_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(parse_artifact).transpose().map(|artifact| {
+            artifact.map(|record| {
+                let path = self
+                    .artifact_root
+                    .join(record.build_id.to_string())
+                    .join(record.id.to_string());
+                (record, path)
+            })
+        })
+    }
 }
 
 type RawProject = (String, String, String, String, String);
@@ -578,6 +786,7 @@ type RawStep = (
     Option<String>,
     Option<String>,
 );
+type RawArtifact = (String, String, String, String, i64, String, String);
 
 fn parse_project(raw: RawProject) -> Result<Project, StorageError> {
     Ok(Project {
@@ -716,6 +925,32 @@ fn parse_log(raw: (i64, String, String, String, String)) -> Result<LogRecord, St
         stream: parse_status(&raw.3, "log stream")?,
         line: raw.4,
     })
+}
+
+fn parse_artifact(raw: RawArtifact) -> Result<ArtifactRecord, StorageError> {
+    Ok(ArtifactRecord {
+        id: parse_uuid(&raw.0)?,
+        build_id: parse_uuid(&raw.1)?,
+        name: raw.2,
+        relative_path: raw.3,
+        size_bytes: u64::try_from(raw.4).map_err(|_| StorageError::InvalidArtifactSize(raw.4))?,
+        checksum: raw.5,
+        created_at: parse_timestamp(&raw.6)?,
+    })
+}
+
+fn sha256_file(path: &Path) -> Result<String, StorageError> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn parse_uuid(value: &str) -> Result<Uuid, StorageError> {
@@ -918,5 +1153,76 @@ program = "true"
         assert_eq!(events.len(), 8);
         assert!(matches!(events[0], BuildEvent::BuildQueued { .. }));
         assert!(matches!(events[7], BuildEvent::BuildFinished { .. }));
+    }
+
+    #[test]
+    fn collects_workspace_artifacts_with_checksum_and_reopenable_storage() {
+        let directory = tempdir().expect("tempdir");
+        let workspace = directory.path().join("workspace");
+        fs::create_dir_all(workspace.join("dist")).expect("dist");
+        fs::write(workspace.join("dist/app.js"), "console.log('rivet');\n").expect("artifact");
+        fs::write(workspace.join("notes.txt"), "not selected\n").expect("other file");
+        let database = directory.path().join("rivet.db");
+        let project = Project::new(
+            "artifacts",
+            workspace.to_string_lossy().into_owned(),
+            workspace
+                .join("Rivetfile.toml")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .expect("project");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "artifacts"
+
+[[artifacts]]
+name = "bundle"
+paths = ["dist/**"]
+
+[[stages]]
+name = "Build"
+[[stages.steps]]
+name = "compile"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+        let plan = ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), project.id);
+        let storage = Storage::open(&database).expect("open");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let build = storage
+            .create_build(&project, &plan, &pipeline, None)
+            .expect("build");
+
+        let collected = storage
+            .collect_artifacts(build.id, &pipeline, &workspace)
+            .expect("collect");
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].relative_path, "dist/app.js");
+        assert_eq!(collected[0].name, "bundle");
+        assert!(collected[0].checksum.starts_with("sha256:"));
+
+        let again = storage
+            .collect_artifacts(build.id, &pipeline, &workspace)
+            .expect("idempotent collect");
+        assert_eq!(again, collected);
+
+        let (record, stored_path) = storage
+            .artifact_file(collected[0].id)
+            .expect("artifact lookup")
+            .expect("artifact exists");
+        assert_eq!(record, collected[0]);
+        assert_eq!(
+            fs::read_to_string(stored_path).expect("stored file"),
+            "console.log('rivet');\n"
+        );
+
+        drop(storage);
+        let reopened = Storage::open(&database).expect("reopen");
+        assert_eq!(reopened.artifacts(build.id).expect("artifacts"), collected);
     }
 }
