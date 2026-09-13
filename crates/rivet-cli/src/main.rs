@@ -63,6 +63,12 @@ enum Command {
         #[arg(long)]
         build: i64,
     },
+    /// Queue a new build using a completed build's parameters.
+    Retry {
+        project: String,
+        #[arg(long)]
+        build: i64,
+    },
     /// Run the headless HTTP/WebSocket service.
     Server {
         #[arg(long, default_value = "127.0.0.1:7878")]
@@ -146,6 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Builds { project } => list_builds(&cli.data_dir, &project)?,
         Command::Logs { project, build } => show_logs(&cli.data_dir, &project, build)?,
         Command::Artifacts { project, build } => list_artifacts(&cli.data_dir, &project, build)?,
+        Command::Retry { project, build } => retry_project(&cli.data_dir, &project, build).await?,
         Command::Server { bind, token_file } => {
             let auth_token = token_file.as_deref().map(read_auth_token).transpose()?;
             rivet_server::serve_with_config(
@@ -257,10 +264,6 @@ fn list_projects(storage: &Storage) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let storage = open_storage(data_dir)?;
-    let project = storage
-        .get_project_by_name(&args.project)?
-        .ok_or_else(|| format!("project not found: {}", args.project))?;
     let scm = if args.fetch
         || args.revision.is_some()
         || args.clean
@@ -277,9 +280,42 @@ async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::
     } else {
         None
     };
+    let supplied_parameters = parse_parameters(&args.parameters)?;
+    run_project_with_options(data_dir, &args.project, scm, supplied_parameters).await
+}
+
+async fn retry_project(
+    data_dir: &Path,
+    name: &str,
+    number: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = open_storage(data_dir)?;
+    let project = storage
+        .get_project_by_name(name)?
+        .ok_or_else(|| format!("project not found: {name}"))?;
+    let original = storage
+        .list_builds(project.id)?
+        .into_iter()
+        .find(|build| build.number == number)
+        .ok_or_else(|| format!("build not found: {name} #{number}"))?;
+    if !original.status.is_terminal() {
+        return Err(format!("build {name} #{number} is not finished and cannot be retried").into());
+    }
+    run_project_with_options(data_dir, name, None, original.parameters).await
+}
+
+async fn run_project_with_options(
+    data_dir: &Path,
+    name: &str,
+    scm: Option<GitPrepareOptions>,
+    supplied_parameters: BTreeMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = open_storage(data_dir)?;
+    let project = storage
+        .get_project_by_name(name)?
+        .ok_or_else(|| format!("project not found: {name}"))?;
     let source = capture_source_snapshot(&project.repository_path, scm.as_ref()).await?;
     let pipeline = Pipeline::load(&project.pipeline_path)?;
-    let supplied_parameters = parse_parameters(&args.parameters)?;
     let parameters = pipeline.resolve_parameters(&supplied_parameters)?;
     let build_id = uuid::Uuid::new_v4();
     let plan = ExecutionPlan::from_pipeline(&pipeline, build_id, project.id);
