@@ -56,6 +56,7 @@ pub async fn execute_pipeline_with_parameters(
 ) -> Result<BuildStatus, RunnerError> {
     pipeline.validate()?;
     let parameters = pipeline.resolve_parameters(parameters)?;
+    let secret_values = pipeline.secret_values(&parameters);
     let workspace = pipeline.resolve_workspace(repository_root)?;
     if cancellation.is_cancelled() {
         return finish_cancelled(plan, &events).await;
@@ -95,6 +96,7 @@ pub async fn execute_pipeline_with_parameters(
                 step,
                 &workspace,
                 &parameters,
+                &secret_values,
                 &cancellation,
                 &events,
             )
@@ -131,6 +133,7 @@ async fn execute_step(
     step: &ExecutionStep,
     workspace: &Path,
     parameters: &BTreeMap<String, String>,
+    secret_values: &[String],
     cancellation: &CancellationToken,
     events: &mpsc::Sender<BuildEvent>,
 ) -> Result<StepStatus, RunnerError> {
@@ -172,7 +175,7 @@ async fn execute_step(
                         stage_id: stage.id,
                         step_id: step.id,
                         stream: line.stream,
-                        line: line.line,
+                        line: mask_line(&line.line, secret_values),
                         timestamp: line.timestamp,
                     }).await?;
                 }
@@ -190,7 +193,7 @@ async fn execute_step(
                 stage_id: stage.id,
                 step_id: step.id,
                 stream: line.stream,
-                line: line.line,
+                line: mask_line(&line.line, secret_values),
                 timestamp: line.timestamp,
             },
         )
@@ -231,6 +234,13 @@ async fn execute_step(
     )
     .await?;
     Ok(status)
+}
+
+fn mask_line(line: &str, secret_values: &[String]) -> String {
+    secret_values
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(line.to_owned(), |line, secret| line.replace(secret, "***"))
 }
 
 fn resolve_working_dir(workspace: &Path, requested: Option<&Path>) -> Result<PathBuf, RunnerError> {
@@ -416,5 +426,48 @@ args = ["-c", "test \"$TARGET\" = release && test \"$CI\" = true"]
 
         assert_eq!(status, BuildStatus::Passed);
         while rx.recv().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn masks_secret_parameter_values_before_emitting_output() {
+        let dir = tempdir().expect("tempdir");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "masked-output"
+[[parameters]]
+name = "TOKEN"
+secret = true
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "print-secret"
+program = "sh"
+args = ["-c", "printf 'token=%s\\n' \"$TOKEN\""]
+"#,
+        )
+        .expect("pipeline");
+        let plan =
+            ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let (tx, mut rx) = mpsc::channel(64);
+        let status = execute_pipeline_with_parameters(
+            &plan,
+            &pipeline,
+            dir.path(),
+            &BTreeMap::from([(String::from("TOKEN"), String::from("runtime-secret"))]),
+            CancellationToken::new(),
+            tx,
+        )
+        .await
+        .expect("runner");
+        assert_eq!(status, BuildStatus::Passed);
+        let mut output = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let BuildEvent::StepOutput { line, .. } = event {
+                output.push(line);
+            }
+        }
+        assert!(output.iter().any(|line| line == "token=***"));
+        assert!(output.iter().all(|line| !line.contains("runtime-secret")));
     }
 }

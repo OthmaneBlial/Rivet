@@ -571,6 +571,7 @@ impl Storage {
         )?;
         let id = plan.build_id;
         let queued_at = Utc::now();
+        let persisted_parameters = pipeline.redact_parameters(parameters);
         transaction.execute(
             "INSERT INTO builds(
                 id, project_id, number, status, queued_at,
@@ -588,7 +589,7 @@ impl Storage {
                 source.and_then(|snapshot| snapshot.reference.as_deref()),
                 source.and_then(|snapshot| snapshot.remote.as_deref()),
                 source.map(|snapshot| i64::from(snapshot.dirty)),
-                serde_json::to_string(parameters)?,
+                serde_json::to_string(&persisted_parameters)?,
             ],
         )?;
         for stage in &plan.stages {
@@ -631,7 +632,7 @@ impl Storage {
             started_at: None,
             finished_at: None,
             source: source.cloned(),
-            parameters: parameters.clone(),
+            parameters: persisted_parameters,
         })
     }
 
@@ -1483,6 +1484,61 @@ program = "true"
         assert_eq!(events.len(), 8);
         assert!(matches!(events[0], BuildEvent::BuildQueued { .. }));
         assert!(matches!(events[7], BuildEvent::BuildFinished { .. }));
+    }
+
+    #[test]
+    fn secret_parameters_are_redacted_in_build_history() {
+        let directory = tempdir().expect("tempdir");
+        let database = directory.path().join("rivet.db");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "secret-history"
+[[parameters]]
+name = "TOKEN"
+secret = true
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+        let project = Project::new("secret-history", ".", "Rivetfile.toml").expect("project");
+        let plan = ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), project.id);
+        let storage = Storage::open(&database).expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let build = storage
+            .create_build_with_parameters(
+                &project,
+                &plan,
+                &pipeline,
+                None,
+                &BTreeMap::from([(String::from("TOKEN"), String::from("runtime-secret"))]),
+            )
+            .expect("build");
+        assert_eq!(
+            build.parameters["TOKEN"],
+            rivet_core::REDACTED_PARAMETER_VALUE
+        );
+        assert!(
+            !serde_json::to_string(&build)
+                .expect("build JSON")
+                .contains("runtime-secret")
+        );
+        drop(storage);
+        let reopened = Storage::open(&database).expect("reopen");
+        let persisted = reopened
+            .get_build_details(build.id)
+            .expect("details")
+            .expect("build");
+        assert_eq!(
+            persisted.build.parameters["TOKEN"],
+            rivet_core::REDACTED_PARAMETER_VALUE
+        );
     }
 
     #[test]

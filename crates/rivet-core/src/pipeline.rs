@@ -22,7 +22,11 @@ pub struct ParameterSpec {
     pub name: String,
     #[serde(default)]
     pub default: Option<String>,
+    #[serde(default)]
+    pub secret: bool,
 }
+
+pub const REDACTED_PARAMETER_VALUE: &str = "[redacted]";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactSpec {
@@ -99,6 +103,8 @@ pub enum PipelineError {
     UnknownParameter(String),
     #[error("required parameter {0:?} was not provided")]
     MissingParameter(String),
+    #[error("secret parameter {0:?} cannot define a default value")]
+    SecretParameterDefault(String),
     #[error("artifact name cannot be empty")]
     EmptyArtifactName,
     #[error("artifact name {0:?} contains a path separator")]
@@ -152,6 +158,11 @@ impl Pipeline {
             }
             if !parameter_names.insert(parameter.name.as_str()) {
                 return Err(PipelineError::DuplicateParameter(parameter.name.clone()));
+            }
+            if parameter.secret && parameter.default.is_some() {
+                return Err(PipelineError::SecretParameterDefault(
+                    parameter.name.clone(),
+                ));
             }
         }
 
@@ -246,13 +257,50 @@ impl Pipeline {
         self.parameters
             .iter()
             .map(|parameter| {
-                supplied
-                    .get(&parameter.name)
+                let supplied_value = supplied.get(&parameter.name).filter(|value| {
+                    !(parameter.secret && value.as_str() == REDACTED_PARAMETER_VALUE)
+                });
+                supplied_value
                     .or(parameter.default.as_ref())
                     .cloned()
                     .map(|value| (parameter.name.clone(), value))
                     .ok_or_else(|| PipelineError::MissingParameter(parameter.name.clone()))
             })
+            .collect()
+    }
+
+    pub fn has_secret_parameters(&self) -> bool {
+        self.parameters.iter().any(|parameter| parameter.secret)
+    }
+
+    pub fn redact_parameters(
+        &self,
+        parameters: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, String> {
+        parameters
+            .iter()
+            .map(|(name, value)| {
+                let value = if self
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.secret && parameter.name == *name)
+                {
+                    REDACTED_PARAMETER_VALUE.to_owned()
+                } else {
+                    value.clone()
+                };
+                (name.clone(), value)
+            })
+            .collect()
+    }
+
+    pub fn secret_values(&self, parameters: &BTreeMap<String, String>) -> Vec<String> {
+        self.parameters
+            .iter()
+            .filter(|parameter| parameter.secret)
+            .filter_map(|parameter| parameters.get(&parameter.name))
+            .filter(|value| !value.is_empty())
+            .cloned()
             .collect()
     }
 
@@ -396,6 +444,67 @@ program = "true"
         assert!(matches!(
             result,
             Err(PipelineError::ReservedParameterName(name)) if name == "RIVET_BUILD_ID"
+        ));
+    }
+
+    #[test]
+    fn secret_parameters_require_runtime_values_and_redact_persisted_values() {
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "secrets"
+[[parameters]]
+name = "TOKEN"
+secret = true
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+        let parameters = pipeline
+            .resolve_parameters(&BTreeMap::from([(
+                "TOKEN".to_owned(),
+                "runtime-secret".to_owned(),
+            )]))
+            .expect("secret value");
+        assert_eq!(
+            pipeline.redact_parameters(&parameters)["TOKEN"],
+            REDACTED_PARAMETER_VALUE
+        );
+        assert_eq!(pipeline.secret_values(&parameters), ["runtime-secret"]);
+        assert!(matches!(
+            pipeline.resolve_parameters(&BTreeMap::new()),
+            Err(PipelineError::MissingParameter(name)) if name == "TOKEN"
+        ));
+        assert!(matches!(
+            pipeline.resolve_parameters(&BTreeMap::from([(
+                "TOKEN".to_owned(),
+                REDACTED_PARAMETER_VALUE.to_owned(),
+            )])),
+            Err(PipelineError::MissingParameter(name)) if name == "TOKEN"
+        ));
+
+        let invalid = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "invalid-secret"
+[[parameters]]
+name = "TOKEN"
+secret = true
+default = "do-not-commit"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        );
+        assert!(matches!(
+            invalid,
+            Err(PipelineError::SecretParameterDefault(name)) if name == "TOKEN"
         ));
     }
 
