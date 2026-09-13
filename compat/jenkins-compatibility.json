@@ -92,9 +92,10 @@
     },
     {
       "category": "Agents",
-      "feature": "Remote authenticated agents",
-      "status": "planned",
-      "evidence": []
+      "feature": "Versioned agent registration and heartbeat",
+      "status": "partial",
+      "evidence": ["crates/rivet-agent-protocol/src/lib.rs", "crates/rivet-server/src/agent_registry.rs", "crates/rivet-server/src/lib.rs"],
+      "notes": "Agents can negotiate protocol version, advertise capabilities, reconnect with session fencing, and appear online or stale through the server registry; remote assignment, execution, transfer, and lost-job handling remain planned."
     },
     {
       "category": "Security",

@@ -5,7 +5,7 @@ from Jenkins.
 
 ## Delivery progress
 
-**58% verified** · `███████████▋░░░░░░░░`<br>
+**60% verified** · `████████████░░░░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -20,6 +20,9 @@ transport, build retry, pre-execution queue cancellation, build artifact
 downloads, and a light-default desktop theme with an accessible dark-mode
 toggle, persistent UTC cron schedules, server dispatch, desktop schedule
 controls, and signed generic webhook delivery with idempotent redelivery.
+The server also exposes a versioned agent handshake/heartbeat registry with
+online and stale state, while remote build assignment remains intentionally
+unimplemented until its transport and failure semantics are complete.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -126,6 +129,14 @@ cargo run -p rivet -- --data-dir .rivet server \
 The same `event_id` can be retried safely: the first request queues one build,
 and later deliveries return a deduplicated response without creating another
 build. A non-loopback server still requires the separate Bearer token.
+
+Remote agents use a versioned WebSocket contract at
+`GET /api/v1/agents/connect`. Agents register capabilities such as operating
+system, architecture, Docker availability, labels, and executor capacity,
+then send monotone heartbeats. `GET /api/v1/agents` reports the current
+ephemeral registry; silent agents become `stale` after the heartbeat window.
+Build assignment, remote logs, artifacts, and lost-job recovery remain future
+gates.
 
 The CLI exposes the same explicit SCM boundary, for example:
 
