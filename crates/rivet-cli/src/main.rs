@@ -15,7 +15,7 @@ use rivet_credentials::CredentialVault;
 use rivet_migration::{analyze_jenkinsfile_file, generate_rivetfile_draft_file};
 use rivet_runner::execute_pipeline_with_parameters;
 use rivet_runner::{QueueHandle, Scheduler};
-use rivet_scm::{GitPrepareOptions, GitRepository, ScmError};
+use rivet_scm::{GitHttpCredential, GitPrepareOptions, GitRepository, ScmError};
 use rivet_storage::Storage;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -233,6 +233,15 @@ struct RunArgs {
     clean: bool,
     #[arg(long)]
     clean_ignored: bool,
+    /// Resolve this non-secret ID from an encrypted vault before fetching.
+    #[arg(long)]
+    credential_id: Option<String>,
+    /// Encrypted SCM credential vault used with --credential-id.
+    #[arg(long, requires = "credential_id")]
+    credentials_file: Option<PathBuf>,
+    /// Private passphrase file used with --credential-id.
+    #[arg(long, requires = "credential_id")]
+    credentials_passphrase_file: Option<PathBuf>,
     #[arg(long = "param", value_name = "NAME=VALUE")]
     parameters: Vec<String>,
 }
@@ -288,6 +297,15 @@ enum ScmCommand {
         clean: bool,
         #[arg(long)]
         clean_ignored: bool,
+        /// Resolve this non-secret ID from an encrypted vault before fetching.
+        #[arg(long)]
+        credential_id: Option<String>,
+        /// Encrypted SCM credential vault used with --credential-id.
+        #[arg(long, requires = "credential_id")]
+        credentials_file: Option<PathBuf>,
+        /// Private passphrase file used with --credential-id.
+        #[arg(long, requires = "credential_id")]
+        credentials_passphrase_file: Option<PathBuf>,
     },
 }
 
@@ -1212,8 +1230,8 @@ fn default_agent_workspace_root() -> PathBuf {
 }
 
 async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Error>> {
-    let (repository_path, options) = match command {
-        ScmCommand::Inspect { repository } => (repository, None),
+    let (repository_path, options, credential) = match command {
+        ScmCommand::Inspect { repository } => (repository, None, None),
         ScmCommand::Prepare {
             repository,
             remote,
@@ -1221,21 +1239,38 @@ async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Erro
             revision,
             clean,
             clean_ignored,
+            credential_id,
+            credentials_file,
+            credentials_passphrase_file,
         } => (
             repository,
-            Some(GitPrepareOptions {
-                remote,
-                fetch,
-                revision,
-                clean,
-                clean_ignored,
-                credential_id: None,
+            Some({
+                if credential_id.is_some() && !fetch {
+                    return Err("an SCM credential requires --fetch".into());
+                }
+                GitPrepareOptions {
+                    remote,
+                    fetch,
+                    revision,
+                    clean,
+                    clean_ignored,
+                    credential_id: credential_id.clone(),
+                }
             }),
+            load_git_credential(
+                credential_id.as_deref(),
+                credentials_file.as_deref(),
+                credentials_passphrase_file.as_deref(),
+            )?,
         ),
     };
     let repository = GitRepository::open(&repository_path).await?;
     let snapshot = match options {
-        Some(options) => repository.prepare(&options).await?,
+        Some(options) => {
+            repository
+                .prepare_with_credential(&options, credential.as_ref())
+                .await?
+        }
         None => repository.inspect().await?,
     };
     println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -1483,6 +1518,7 @@ async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::
         || args.clean
         || args.clean_ignored
         || args.remote != "origin"
+        || args.credential_id.is_some()
     {
         Some(GitPrepareOptions {
             remote: args.remote,
@@ -1490,13 +1526,28 @@ async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::
             revision: args.revision,
             clean: args.clean,
             clean_ignored: args.clean_ignored,
-            credential_id: None,
+            credential_id: args.credential_id.clone(),
         })
     } else {
         None
     };
+    if args.credential_id.is_some() && !args.fetch {
+        return Err("an SCM credential requires --fetch".into());
+    }
+    let credential = load_git_credential(
+        args.credential_id.as_deref(),
+        args.credentials_file.as_deref(),
+        args.credentials_passphrase_file.as_deref(),
+    )?;
     let supplied_parameters = parse_parameters(&args.parameters)?;
-    run_project_with_options(data_dir, &args.project, scm, supplied_parameters).await
+    run_project_with_options(
+        data_dir,
+        &args.project,
+        scm,
+        supplied_parameters,
+        credential,
+    )
+    .await
 }
 
 async fn retry_project(
@@ -1537,7 +1588,7 @@ async fn retry_project(
         parameters.extend(replacements);
         parameters
     };
-    run_project_with_options(data_dir, name, None, supplied_parameters).await
+    run_project_with_options(data_dir, name, None, supplied_parameters, None).await
 }
 
 async fn run_project_with_options(
@@ -1545,12 +1596,15 @@ async fn run_project_with_options(
     name: &str,
     scm: Option<GitPrepareOptions>,
     supplied_parameters: BTreeMap<String, String>,
+    credential: Option<GitHttpCredential>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage = open_storage(data_dir)?;
     let project = storage
         .get_project_by_name(name)?
         .ok_or_else(|| format!("project not found: {name}"))?;
-    let source = capture_source_snapshot(&project.repository_path, scm.as_ref()).await?;
+    let source =
+        capture_source_snapshot(&project.repository_path, scm.as_ref(), credential.as_ref())
+            .await?;
     let pipeline = Pipeline::load(&project.pipeline_path)?;
     let parameters = pipeline.resolve_parameters(&supplied_parameters)?;
     let build_id = uuid::Uuid::new_v4();
@@ -1658,11 +1712,16 @@ fn parse_parameters(values: &[String]) -> Result<BTreeMap<String, String>, Strin
 async fn capture_source_snapshot(
     path: &str,
     prepare: Option<&GitPrepareOptions>,
+    credential: Option<&GitHttpCredential>,
 ) -> Result<Option<SourceSnapshot>, ScmError> {
     match GitRepository::open(path).await {
         Ok(repository) => {
             let snapshot = match prepare {
-                Some(options) => repository.prepare(options).await?,
+                Some(options) => {
+                    repository
+                        .prepare_with_credential(options, credential)
+                        .await?
+                }
                 None => repository.inspect().await?,
             };
             Ok(Some(snapshot.source_snapshot()))
@@ -1675,6 +1734,31 @@ async fn capture_source_snapshot(
                 eprintln!("warning: source snapshot unavailable: {error}");
                 Ok(None)
             }
+        }
+    }
+}
+
+fn load_git_credential(
+    credential_id: Option<&str>,
+    credentials_file: Option<&Path>,
+    credentials_passphrase_file: Option<&Path>,
+) -> Result<Option<GitHttpCredential>, Box<dyn std::error::Error>> {
+    match (credential_id, credentials_file, credentials_passphrase_file) {
+        (None, None, None) => Ok(None),
+        (None, Some(_), _) | (None, _, Some(_)) => Err(
+            "--credentials-file and --credentials-passphrase-file require --credential-id".into(),
+        ),
+        (Some(_), None, _) | (Some(_), _, None) => Err(
+            "--credential-id requires --credentials-file and --credentials-passphrase-file".into(),
+        ),
+        (Some(id), Some(vault_path), Some(passphrase_path)) => {
+            let passphrase = read_private_value(passphrase_path, "credential vault passphrase")?;
+            let vault = CredentialVault::open(vault_path, passphrase)?;
+            let credential = vault.get(id)?;
+            Ok(Some(GitHttpCredential::new(
+                credential.username(),
+                credential.secret(),
+            )?))
         }
     }
 }
