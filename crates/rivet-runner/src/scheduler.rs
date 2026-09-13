@@ -99,7 +99,7 @@ struct RunningBuildGuard {
 impl Drop for RunningBuildGuard {
     fn drop(&mut self) {
         self.metrics.running.fetch_sub(1, Ordering::Relaxed);
-        self.wake.notify_waiters();
+        self.wake.notify_one();
     }
 }
 
