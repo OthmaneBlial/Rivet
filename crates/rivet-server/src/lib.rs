@@ -1440,52 +1440,35 @@ async fn enqueue_project_build(
             })
             .await
             .map_err(|_| ApiError::BadRequest("remote build event channel closed".into()))?;
-        let (messages, received_messages) = mpsc::channel(1024);
-        state.remote_messages.lock().await.insert(
-            plan.build_id,
-            RemoteBuildRoute {
-                agent_id: reservation.agent_id,
-                messages,
-            },
-        );
+        let requirements =
+            remote_requirements.expect("a reservation exists only for remote requirements");
+        let remote_build_id = plan.build_id;
         let remote_state = state.clone();
         tokio::spawn(async move {
-            let result = run_remote_build(
+            let result = run_remote_build_with_recovery(
                 remote_state.clone(),
-                reservation.clone(),
+                reservation,
+                requirements,
                 plan,
                 pipeline.clone(),
                 remote_workspace.expect("remote workspace was resolved"),
                 parameters,
                 cancellation,
                 events.clone(),
-                received_messages,
             )
             .await;
             if let Err(error) = result {
-                tracing::error!(?error, "remote Rivet build failed before completion");
-                let _ = events
-                    .send(BuildEvent::BuildFinished {
-                        build_id: reservation.build_id,
-                        status: BuildStatus::Failed,
-                        timestamp: Utc::now(),
-                    })
-                    .await;
+                tracing::error!(
+                    ?error,
+                    build_id = %remote_build_id,
+                    "remote Rivet build failed before completion"
+                );
             }
-            if let Err(error) = cleanup_remote_artifact_root(reservation.build_id) {
-                tracing::warn!(?error, build_id = %reservation.build_id, "could not clean remote artifact staging");
-            }
-            remote_state
-                .remote_messages
-                .lock()
-                .await
-                .remove(&reservation.build_id);
-            remote_state.agents.release(&reservation).await;
             remote_state
                 .active_builds
                 .lock()
                 .await
-                .remove(&reservation.build_id);
+                .remove(&remote_build_id);
         });
     } else {
         let handle = state
@@ -1567,6 +1550,116 @@ struct RemoteArtifactReceiver {
     expected_sequence: u32,
 }
 
+const MAX_REMOTE_RECOVERY_ATTEMPTS: usize = 1;
+
+async fn run_remote_build_with_recovery(
+    state: AppState,
+    initial_reservation: AgentReservation,
+    requirements: AgentRequirements,
+    plan: ExecutionPlan,
+    pipeline: Pipeline,
+    workspace: PathBuf,
+    parameters: BTreeMap<String, String>,
+    cancellation: CancellationToken,
+    events: mpsc::Sender<BuildEvent>,
+) -> Result<(), RemoteBuildError> {
+    let mut reservation = initial_reservation;
+    let mut suppress_build_started = false;
+    let mut active_stages = HashSet::new();
+    let mut active_steps = HashSet::new();
+    let mut build_started = false;
+    for attempt in 0..=MAX_REMOTE_RECOVERY_ATTEMPTS {
+        let (route_sender, received_messages) = mpsc::channel(1024);
+        state.remote_messages.lock().await.insert(
+            plan.build_id,
+            RemoteBuildRoute {
+                agent_id: reservation.agent_id,
+                messages: route_sender,
+            },
+        );
+        let result = run_remote_build(
+            state.clone(),
+            reservation.clone(),
+            plan.clone(),
+            pipeline.clone(),
+            workspace.clone(),
+            parameters.clone(),
+            cancellation.clone(),
+            events.clone(),
+            received_messages,
+            suppress_build_started,
+            &mut active_stages,
+            &mut active_steps,
+            &mut build_started,
+        )
+        .await;
+        state.remote_messages.lock().await.remove(&plan.build_id);
+        if let Err(error) = cleanup_remote_artifact_root(plan.build_id) {
+            tracing::warn!(?error, build_id = %plan.build_id, "could not clean remote artifact staging");
+        }
+
+        match result {
+            Ok(()) => {
+                state.agents.release(&reservation).await;
+                return Ok(());
+            }
+            Err(error)
+                if attempt < MAX_REMOTE_RECOVERY_ATTEMPTS
+                    && !cancellation.is_cancelled()
+                    && remote_error_is_recoverable(&error) =>
+            {
+                tracing::warn!(
+                    build_id = %plan.build_id,
+                    failed_agent = %reservation.agent_id,
+                    attempt = attempt + 1,
+                    error = %error,
+                    "remote agent lost; trying one replacement agent"
+                );
+                state.agents.release(&reservation).await;
+                let replacement = state
+                    .agents
+                    .reserve(&requirements, plan.build_id, Utc::now())
+                    .await;
+                reservation = match replacement {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        finish_remote_failed(
+                            &plan,
+                            &events,
+                            &active_stages,
+                            &active_steps,
+                            build_started,
+                        )
+                        .await?;
+                        return Err(RemoteBuildError::Agent(error));
+                    }
+                };
+                suppress_build_started = build_started;
+            }
+            Err(error) => {
+                state.agents.release(&reservation).await;
+                finish_remote_failed(&plan, &events, &active_stages, &active_steps, build_started)
+                    .await?;
+                return Err(error);
+            }
+        }
+    }
+    unreachable!("remote recovery loop always returns after its bounded attempts")
+}
+
+fn remote_error_is_recoverable(error: &RemoteBuildError) -> bool {
+    match error {
+        RemoteBuildError::AgentDisconnected(_) => true,
+        RemoteBuildError::Agent(
+            AgentRegistryError::AgentNotConnected(_)
+            | AgentRegistryError::AgentChannelClosed(_)
+            | AgentRegistryError::StaleReservation { .. },
+        ) => true,
+        RemoteBuildError::AgentRejected { code, .. } => code == "agent_disconnected",
+        _ => false,
+    }
+}
+
 async fn run_remote_build(
     state: AppState,
     reservation: AgentReservation,
@@ -1576,12 +1669,47 @@ async fn run_remote_build(
     parameters: BTreeMap<String, String>,
     cancellation: CancellationToken,
     events: mpsc::Sender<BuildEvent>,
+    messages: mpsc::Receiver<AgentMessage>,
+    suppress_build_started: bool,
+    active_stages: &mut HashSet<rivet_core::StageId>,
+    active_steps: &mut HashSet<rivet_core::StepId>,
+    build_started: &mut bool,
+) -> Result<(), RemoteBuildError> {
+    run_remote_build_inner(
+        state,
+        reservation,
+        plan,
+        pipeline,
+        workspace,
+        parameters,
+        cancellation,
+        events,
+        messages,
+        suppress_build_started,
+        active_stages,
+        active_steps,
+        build_started,
+    )
+    .await
+}
+
+async fn run_remote_build_inner(
+    state: AppState,
+    reservation: AgentReservation,
+    plan: ExecutionPlan,
+    pipeline: Pipeline,
+    workspace: PathBuf,
+    parameters: BTreeMap<String, String>,
+    cancellation: CancellationToken,
+    events: mpsc::Sender<BuildEvent>,
     mut messages: mpsc::Receiver<AgentMessage>,
+    suppress_build_started: bool,
+    active_stages: &mut HashSet<rivet_core::StageId>,
+    active_steps: &mut HashSet<rivet_core::StepId>,
+    build_started: &mut bool,
 ) -> Result<(), RemoteBuildError> {
     let mut accepted = false;
     let mut ready = false;
-    let mut active_stages = HashSet::new();
-    let mut active_steps = HashSet::new();
     let artifact_pipeline = pipeline.clone();
     let mut artifact_receiver = None;
     let mut artifacts_complete = artifact_pipeline.artifacts.is_empty();
@@ -1601,8 +1729,8 @@ async fn run_remote_build(
                 &mut messages,
                 &mut accepted,
                 &mut ready,
-                &mut active_stages,
-                &mut active_steps,
+                    active_stages,
+                    active_steps,
             )
             .await;
         }
@@ -1628,8 +1756,8 @@ async fn run_remote_build(
                 &mut messages,
                 &mut accepted,
                 &mut ready,
-                &mut active_stages,
-                &mut active_steps,
+                active_stages,
+                active_steps,
             )
             .await;
         }
@@ -1665,8 +1793,8 @@ async fn run_remote_build(
                     &mut messages,
                     &mut accepted,
                     &mut ready,
-                    &mut active_stages,
-                    &mut active_steps,
+                    active_stages,
+                    active_steps,
                 )
                 .await;
             }
@@ -1687,8 +1815,8 @@ async fn run_remote_build(
                     &mut messages,
                     &mut accepted,
                     &mut ready,
-                    &mut active_stages,
-                    &mut active_steps,
+                    active_stages,
+                    active_steps,
                 )
                 .await;
             }
@@ -1802,7 +1930,15 @@ async fn run_remote_build(
                     }
                     AgentMessage::Event { event, .. } => {
                         validate_remote_event(&event, &plan, accepted, ready)?;
-                        track_remote_activity(&event, &mut active_stages, &mut active_steps);
+                        if matches!(event, BuildEvent::BuildStarted { .. }) {
+                            *build_started = true;
+                        }
+                        if suppress_build_started
+                            && matches!(event, BuildEvent::BuildStarted { .. })
+                        {
+                            continue;
+                        }
+                        track_remote_activity(&event, active_stages, active_steps);
                         let terminal = matches!(event, BuildEvent::BuildFinished { .. });
                         if matches!(
                             &event,
@@ -2093,6 +2229,63 @@ async fn finish_remote_cancelled(
         .send(BuildEvent::BuildFinished {
             build_id: plan.build_id,
             status: BuildStatus::Cancelled,
+            timestamp: Utc::now(),
+        })
+        .await
+        .map_err(|_| RemoteBuildError::EventChannelClosed)?;
+    Ok(())
+}
+
+async fn finish_remote_failed(
+    plan: &ExecutionPlan,
+    events: &mpsc::Sender<BuildEvent>,
+    active_stages: &HashSet<rivet_core::StageId>,
+    active_steps: &HashSet<rivet_core::StepId>,
+    build_started: bool,
+) -> Result<(), RemoteBuildError> {
+    if !build_started {
+        events
+            .send(BuildEvent::BuildStarted {
+                build_id: plan.build_id,
+                timestamp: Utc::now(),
+            })
+            .await
+            .map_err(|_| RemoteBuildError::EventChannelClosed)?;
+    }
+    for stage in &plan.stages {
+        for step in &stage.steps {
+            if active_steps.contains(&step.id) {
+                events
+                    .send(BuildEvent::StepFinished {
+                        build_id: plan.build_id,
+                        stage_id: stage.id,
+                        step_id: step.id,
+                        step_name: step.definition.name.clone(),
+                        status: rivet_core::StepStatus::Failed,
+                        exit_code: None,
+                        timestamp: Utc::now(),
+                    })
+                    .await
+                    .map_err(|_| RemoteBuildError::EventChannelClosed)?;
+            }
+        }
+        if active_stages.contains(&stage.id) {
+            events
+                .send(BuildEvent::StageFinished {
+                    build_id: plan.build_id,
+                    stage_id: stage.id,
+                    stage_name: stage.name.clone(),
+                    status: rivet_core::StageStatus::Failed,
+                    timestamp: Utc::now(),
+                })
+                .await
+                .map_err(|_| RemoteBuildError::EventChannelClosed)?;
+        }
+    }
+    events
+        .send(BuildEvent::BuildFinished {
+            build_id: plan.build_id,
+            status: BuildStatus::Failed,
             timestamp: Utc::now(),
         })
         .await

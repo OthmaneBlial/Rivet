@@ -89,6 +89,7 @@ pub async fn run_process(
         program: spec.program.clone(),
         source,
     })?;
+    let mut process_group_guard = ProcessGroupGuard::new(child.id());
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -113,12 +114,43 @@ pub async fn run_process(
     for reader in readers {
         reader.await??;
     }
+    process_group_guard.disarm();
 
     Ok(ProcessResult {
         outcome,
         exit_code,
         duration: started.elapsed(),
     })
+}
+
+/// Ensure an aborted runner future cannot leave a descendant process behind.
+///
+/// `tokio::process::Child::kill_on_drop` only targets the direct child. Rivet
+/// launches each command in its own process group, so an aborted future must
+/// also terminate that group before the agent/server task disappears.
+struct ProcessGroupGuard {
+    pid: Option<u32>,
+    armed: bool,
+}
+
+impl ProcessGroupGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(pid) = self.pid {
+                force_group_termination(pid);
+            }
+        }
+    }
 }
 
 async fn forward_lines<R>(

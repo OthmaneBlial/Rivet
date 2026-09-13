@@ -19,9 +19,11 @@ use rivet_storage::Storage;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
+use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use tar::Archive;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -332,6 +334,57 @@ enum AgentAssignmentResult {
     Stopped,
 }
 
+struct AgentShutdownSignal {
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl AgentShutdownSignal {
+    fn new() -> Result<Self, std::io::Error> {
+        Ok(Self {
+            #[cfg(unix)]
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.terminate.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+async fn stop_agent_execution<F>(
+    mut execution: Pin<&mut F>,
+    event_receiver: &mut mpsc::Receiver<BuildEvent>,
+    cancellation: &CancellationToken,
+) where
+    F: Future<Output = Result<BuildStatus, rivet_runner::RunnerError>>,
+{
+    cancellation.cancel();
+    loop {
+        tokio::select! {
+            result = execution.as_mut() => {
+                let _ = result;
+                break;
+            }
+            event = event_receiver.recv() => {
+                if event.is_none() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
     let agent_id = args.id.unwrap_or_else(uuid::Uuid::new_v4);
     let registration = AgentRegistration {
@@ -420,11 +473,12 @@ async fn run_agent_session(
     );
     let mut sequence = 0;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    let mut shutdown = AgentShutdownSignal::new()?;
     let mut running = Vec::new();
     let mut session_result = AgentSessionResult::Disconnected;
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown.recv() => {
                 eprintln!("Stopping agent...");
                 session_result = AgentSessionResult::Stopped;
                 break;
@@ -570,6 +624,7 @@ async fn run_agent_assignment(
     clear_remote_requirements(&mut execution_plan, &mut execution_pipeline);
     let cancellation = CancellationToken::new();
     let (event_sender, mut event_receiver) = mpsc::channel(512);
+    let mut shutdown = AgentShutdownSignal::new()?;
     let execution = execute_pipeline_with_parameters(
         &execution_plan,
         &execution_pipeline,
@@ -583,8 +638,12 @@ async fn run_agent_assignment(
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     loop {
         tokio::select! {
-            stop = tokio::signal::ctrl_c() => {
-                stop?;
+            _ = shutdown.recv() => {
+                stop_agent_execution(
+                    execution.as_mut(),
+                    &mut event_receiver,
+                    &cancellation,
+                ).await;
                 let _ = remove_exact_agent_path(&build_workspace);
                 return Ok(AgentAssignmentResult::Stopped);
             }
@@ -614,8 +673,26 @@ async fn run_agent_assignment(
                 }
             }
             message = next_agent_message(socket) => {
-                let Some(message) = message? else {
-                    return Err("Rivet server closed the agent connection during a build".into());
+                let message = match message {
+                    Ok(Some(message)) => message,
+                    Ok(None) => {
+                        stop_agent_execution(
+                            execution.as_mut(),
+                            &mut event_receiver,
+                            &cancellation,
+                        ).await;
+                        let _ = remove_exact_agent_path(&build_workspace);
+                        return Err("Rivet server closed the agent connection during a build".into());
+                    }
+                    Err(error) => {
+                        stop_agent_execution(
+                            execution.as_mut(),
+                            &mut event_receiver,
+                            &cancellation,
+                        ).await;
+                        let _ = remove_exact_agent_path(&build_workspace);
+                        return Err(error);
+                    }
                 };
                 match message {
                     AgentMessage::Cancel { build_id: cancelled, .. } if cancelled == build_id => {
@@ -623,9 +700,21 @@ async fn run_agent_assignment(
                     }
                     AgentMessage::HeartbeatAck { .. } => {}
                     AgentMessage::Error { code, message, .. } => {
+                        stop_agent_execution(
+                            execution.as_mut(),
+                            &mut event_receiver,
+                            &cancellation,
+                        ).await;
+                        let _ = remove_exact_agent_path(&build_workspace);
                         return Err(format!("Rivet server rejected build {build_id} ({code}): {message}").into());
                     }
                     _ => {
+                        stop_agent_execution(
+                            execution.as_mut(),
+                            &mut event_receiver,
+                            &cancellation,
+                        ).await;
+                        let _ = remove_exact_agent_path(&build_workspace);
                         return Err(format!("unexpected server message while running build {build_id}").into());
                     }
                 }
