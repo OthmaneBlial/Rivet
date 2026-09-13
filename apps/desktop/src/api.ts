@@ -19,6 +19,14 @@ export interface HealthResponse {
   timestamp: string;
 }
 
+export interface ScmPrepareOptions {
+  remote?: string;
+  fetch?: boolean;
+  revision?: string;
+  clean?: boolean;
+  clean_ignored?: boolean;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
@@ -81,10 +89,13 @@ export function logs(project: string, number: number): Promise<LogRecord[]> {
   );
 }
 
-export function queueBuild(project: string): Promise<QueueResponse> {
+export function queueBuild(
+  project: string,
+  options: { scm?: ScmPrepareOptions } = {},
+): Promise<QueueResponse> {
   return request<QueueResponse>(
     `/api/v1/projects/${encodeURIComponent(project)}/builds`,
-    { method: "POST", body: "{}" },
+    { method: "POST", body: JSON.stringify(options) },
   );
 }
 

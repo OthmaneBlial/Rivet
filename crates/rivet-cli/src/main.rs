@@ -47,7 +47,7 @@ enum Command {
         command: ProjectCommand,
     },
     /// Queue and execute a project's pipeline.
-    Run { project: String },
+    Run(RunArgs),
     /// Show persisted build history.
     Builds { project: String },
     /// Show persisted output for a build number.
@@ -83,6 +83,21 @@ struct CreateProject {
     pipeline: Option<PathBuf>,
 }
 
+#[derive(Debug, Args)]
+struct RunArgs {
+    project: String,
+    #[arg(long, default_value = "origin")]
+    remote: String,
+    #[arg(long)]
+    fetch: bool,
+    #[arg(long)]
+    revision: Option<String>,
+    #[arg(long)]
+    clean: bool,
+    #[arg(long)]
+    clean_ignored: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum ScmCommand {
     /// Print the current Git revision, branch, remote, and worktree state.
@@ -115,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ProjectCommand::List => list_projects(&storage)?,
             }
         }
-        Command::Run { project } => run_project(&cli.data_dir, &project).await?,
+        Command::Run(args) => run_project(&cli.data_dir, args).await?,
         Command::Builds { project } => list_builds(&cli.data_dir, &project)?,
         Command::Logs { project, build } => show_logs(&cli.data_dir, &project, build)?,
         Command::Server { bind } => {
@@ -203,15 +218,31 @@ fn list_projects(storage: &Storage) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_project(data_dir: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let storage = open_storage(data_dir)?;
     let project = storage
-        .get_project_by_name(name)?
-        .ok_or_else(|| format!("project not found: {name}"))?;
+        .get_project_by_name(&args.project)?
+        .ok_or_else(|| format!("project not found: {}", args.project))?;
+    let scm = if args.fetch
+        || args.revision.is_some()
+        || args.clean
+        || args.clean_ignored
+        || args.remote != "origin"
+    {
+        Some(GitPrepareOptions {
+            remote: args.remote,
+            fetch: args.fetch,
+            revision: args.revision,
+            clean: args.clean,
+            clean_ignored: args.clean_ignored,
+        })
+    } else {
+        None
+    };
+    let source = capture_source_snapshot(&project.repository_path, scm.as_ref()).await?;
     let pipeline = Pipeline::load(&project.pipeline_path)?;
     let build_id = uuid::Uuid::new_v4();
     let plan = ExecutionPlan::from_pipeline(&pipeline, build_id, project.id);
-    let source = capture_source_snapshot(&project.repository_path).await;
     let build = storage.create_build(&project, &plan, &pipeline, source.as_ref())?;
     println!("Queued {} #{} ({})", project.name, build.number, build.id);
 
@@ -247,19 +278,26 @@ async fn run_project(data_dir: &Path, name: &str) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-async fn capture_source_snapshot(path: &str) -> Option<SourceSnapshot> {
+async fn capture_source_snapshot(
+    path: &str,
+    prepare: Option<&GitPrepareOptions>,
+) -> Result<Option<SourceSnapshot>, ScmError> {
     match GitRepository::open(path).await {
-        Ok(repository) => match repository.inspect().await {
-            Ok(snapshot) => Some(snapshot.source_snapshot()),
-            Err(error) => {
-                eprintln!("warning: source snapshot unavailable: {error}");
-                None
-            }
-        },
-        Err(ScmError::NotGitRepository(_)) => None,
+        Ok(repository) => {
+            let snapshot = match prepare {
+                Some(options) => repository.prepare(options).await?,
+                None => repository.inspect().await?,
+            };
+            Ok(Some(snapshot.source_snapshot()))
+        }
+        Err(ScmError::NotGitRepository(_)) if prepare.is_none() => Ok(None),
         Err(error) => {
-            eprintln!("warning: source snapshot unavailable: {error}");
-            None
+            if prepare.is_some() {
+                Err(error)
+            } else {
+                eprintln!("warning: source snapshot unavailable: {error}");
+                Ok(None)
+            }
         }
     }
 }

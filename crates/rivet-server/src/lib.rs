@@ -105,6 +105,12 @@ pub struct CreateProjectRequest {
     pub pipeline_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct QueueBuildRequest {
+    #[serde(default)]
+    pub scm: Option<PrepareScmRequest>,
+}
+
 #[derive(Debug, Serialize)]
 struct QueueBuildResponse {
     build: BuildRecord,
@@ -157,7 +163,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct PrepareScmRequest {
     #[serde(default = "default_remote")]
     pub remote: String,
@@ -307,12 +313,14 @@ async fn get_logs(
 async fn queue_build(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
+    request: Option<Json<QueueBuildRequest>>,
 ) -> Result<(StatusCode, Json<QueueBuildResponse>), ApiError> {
+    let request = request.map(|Json(request)| request).unwrap_or_default();
     let project = project_by_name(&state.storage, &name)?;
     let repository_root = PathBuf::from(&project.repository_path);
+    let source = capture_source_snapshot(&repository_root, request.scm.as_ref()).await?;
     let pipeline = Pipeline::load(&project.pipeline_path)?;
     let plan = ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), project.id);
-    let source = capture_source_snapshot(&repository_root).await;
     let build = state
         .storage
         .create_build(&project, &plan, &pipeline, source.as_ref())?;
@@ -358,19 +366,36 @@ async fn queue_build(
     ))
 }
 
-async fn capture_source_snapshot(path: &Path) -> Option<SourceSnapshot> {
+async fn capture_source_snapshot(
+    path: &Path,
+    prepare: Option<&PrepareScmRequest>,
+) -> Result<Option<SourceSnapshot>, ApiError> {
     match GitRepository::open(path).await {
-        Ok(repository) => match repository.inspect().await {
-            Ok(snapshot) => Some(snapshot.source_snapshot()),
-            Err(error) => {
-                tracing::warn!(?error, "source snapshot unavailable");
-                None
-            }
-        },
-        Err(ScmError::NotGitRepository(_)) => None,
+        Ok(repository) => {
+            let snapshot = match prepare {
+                Some(request) => {
+                    repository
+                        .prepare(&GitPrepareOptions {
+                            remote: request.remote.clone(),
+                            fetch: request.fetch,
+                            revision: request.revision.clone(),
+                            clean: request.clean,
+                            clean_ignored: request.clean_ignored,
+                        })
+                        .await?
+                }
+                None => repository.inspect().await?,
+            };
+            Ok(Some(snapshot.source_snapshot()))
+        }
+        Err(ScmError::NotGitRepository(_)) if prepare.is_none() => Ok(None),
         Err(error) => {
-            tracing::warn!(?error, "source snapshot unavailable");
-            None
+            if prepare.is_some() {
+                Err(error.into())
+            } else {
+                tracing::warn!(?error, "source snapshot unavailable");
+                Ok(None)
+            }
         }
     }
 }
