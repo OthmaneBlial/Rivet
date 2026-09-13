@@ -218,6 +218,9 @@ enum CredentialCommand {
         id: String,
         #[arg(long)]
         username: String,
+        /// Restrict use to one or more project names; repeat the flag.
+        #[arg(long = "project")]
+        projects: Vec<String>,
         #[arg(long)]
         secret_file: PathBuf,
         #[arg(long)]
@@ -414,6 +417,9 @@ enum ScmCommand {
     /// Optionally fetch, checkout, and clean before printing the final state.
     Prepare {
         repository: PathBuf,
+        /// Project context used to authorize a scoped credential.
+        #[arg(long)]
+        project: Option<String>,
         #[arg(long, default_value = "origin")]
         remote: String,
         #[arg(long)]
@@ -1399,6 +1405,7 @@ async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Erro
         ScmCommand::Inspect { repository } => (repository, None, None),
         ScmCommand::Prepare {
             repository,
+            project,
             remote,
             fetch,
             revision,
@@ -1427,6 +1434,7 @@ async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Erro
                 credential_id.as_deref(),
                 credentials_file.as_deref(),
                 credentials_passphrase_file.as_deref(),
+                project.as_deref(),
             )?,
         ),
     };
@@ -1805,6 +1813,7 @@ fn manage_credentials(
         CredentialCommand::Set {
             id,
             username,
+            projects,
             secret_file,
             passphrase_file,
             vault_file,
@@ -1813,7 +1822,7 @@ fn manage_credentials(
             let passphrase = read_private_value(&passphrase_file, "credential vault passphrase")?;
             let secret = read_private_value(&secret_file, "credential secret")?;
             let mut vault = CredentialVault::open_or_create(&vault_path, passphrase)?;
-            vault.set_http_basic(id.clone(), username, secret)?;
+            vault.set_http_basic_for_projects(id.clone(), username, secret, projects)?;
             println!("Stored credential {id} in {}", vault.path().display());
         }
         CredentialCommand::List {
@@ -1824,7 +1833,12 @@ fn manage_credentials(
             let passphrase = read_private_value(&passphrase_file, "credential vault passphrase")?;
             let vault = CredentialVault::open(&vault_path, passphrase)?;
             for credential in vault.list() {
-                println!("{}\t{}", credential.id, credential.username);
+                let scope = if credential.projects.is_empty() {
+                    "*".to_owned()
+                } else {
+                    credential.projects.join(",")
+                };
+                println!("{}\t{}\t{}", credential.id, credential.username, scope);
             }
         }
         CredentialCommand::Remove {
@@ -1951,6 +1965,7 @@ async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::
         args.credential_id.as_deref(),
         args.credentials_file.as_deref(),
         args.credentials_passphrase_file.as_deref(),
+        Some(&args.project),
     )?;
     let supplied_parameters = parse_parameters(&args.parameters)?;
     if !(MIN_QUEUE_PRIORITY..=MAX_QUEUE_PRIORITY).contains(&args.priority) {
@@ -2164,6 +2179,7 @@ fn load_git_credential(
     credential_id: Option<&str>,
     credentials_file: Option<&Path>,
     credentials_passphrase_file: Option<&Path>,
+    project: Option<&str>,
 ) -> Result<Option<GitHttpCredential>, Box<dyn std::error::Error>> {
     match (credential_id, credentials_file, credentials_passphrase_file) {
         (None, None, None) => Ok(None),
@@ -2176,7 +2192,18 @@ fn load_git_credential(
         (Some(id), Some(vault_path), Some(passphrase_path)) => {
             let passphrase = read_private_value(passphrase_path, "credential vault passphrase")?;
             let vault = CredentialVault::open(vault_path, passphrase)?;
-            let credential = vault.get(id)?;
+            let credential = match project {
+                Some(project) => vault.get_for_project(id, project)?,
+                None => {
+                    let credential = vault.get(id)?;
+                    if credential.projects().next().is_some() {
+                        return Err(
+                            "--project is required when the credential has project scope".into(),
+                        );
+                    }
+                    credential
+                }
+            };
             Ok(Some(GitHttpCredential::new(
                 credential.username(),
                 credential.secret(),

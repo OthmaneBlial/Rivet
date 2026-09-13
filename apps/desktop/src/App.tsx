@@ -165,6 +165,7 @@ function App() {
   const [credentialId, setCredentialId] = useState("");
   const [credentialUsername, setCredentialUsername] = useState("");
   const [credentialSecret, setCredentialSecret] = useState("");
+  const [credentialProjects, setCredentialProjects] = useState("");
   const [selectedBuild, setSelectedBuild] = useState<number | null>(null);
   const [details, setDetails] = useState<BuildDetails | null>(null);
   const [logLines, setLogLines] = useState<LogRecord[]>([]);
@@ -639,6 +640,7 @@ function App() {
     setCredentialId(credential.id);
     setCredentialUsername(credential.username);
     setCredentialSecret("");
+    setCredentialProjects(credential.projects.join(", "));
     setCredentialError(null);
   }
 
@@ -646,6 +648,7 @@ function App() {
     setCredentialId("");
     setCredentialUsername("");
     setCredentialSecret("");
+    setCredentialProjects("");
   }
 
   async function submitCredential(event: React.FormEvent<HTMLFormElement>) {
@@ -657,6 +660,7 @@ function App() {
       await setCredential(credentialId.trim(), {
         username: credentialUsername.trim(),
         secret: credentialSecret,
+        projects: [...new Set(credentialProjects.split(",").map((project) => project.trim()).filter(Boolean))],
       });
       setCredentialSecret("");
       resetCredentialForm();
@@ -816,9 +820,11 @@ function App() {
             id={credentialId}
             username={credentialUsername}
             secret={credentialSecret}
+            projects={credentialProjects}
             onIdChange={setCredentialId}
             onUsernameChange={setCredentialUsername}
             onSecretChange={setCredentialSecret}
+            onProjectsChange={setCredentialProjects}
             onSubmit={submitCredential}
             onEdit={editCredential}
             onRemove={removeCredential}
@@ -1247,9 +1253,11 @@ function CredentialsPanel({
   id,
   username,
   secret,
+  projects,
   onIdChange,
   onUsernameChange,
   onSecretChange,
+  onProjectsChange,
   onSubmit,
   onEdit,
   onRemove,
@@ -1263,9 +1271,11 @@ function CredentialsPanel({
   id: string;
   username: string;
   secret: string;
+  projects: string;
   onIdChange: (value: string) => void;
   onUsernameChange: (value: string) => void;
   onSecretChange: (value: string) => void;
+  onProjectsChange: (value: string) => void;
   onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
   onEdit: (credential: CredentialSummary) => void;
   onRemove: (credential: CredentialSummary) => void;
@@ -1322,6 +1332,7 @@ function CredentialsPanel({
                 <label htmlFor="credential-id">Credential ID<input id="credential-id" value={id} onChange={(event) => onIdChange(event.target.value)} placeholder="github-ci" autoComplete="off" required /></label>
                 <label htmlFor="credential-username">Username<input id="credential-username" value={username} onChange={(event) => onUsernameChange(event.target.value)} placeholder="automation-user" autoComplete="username" required /></label>
                 <label htmlFor="credential-secret">Secret<input id="credential-secret" type="password" value={secret} onChange={(event) => onSecretChange(event.target.value)} placeholder={id ? "enter a new secret" : "paste a provider token"} autoComplete="new-password" required /><small>Required for every save; the field is cleared after success.</small></label>
+                <label htmlFor="credential-projects">Allowed projects <span className="optional">(empty = all)</span><input id="credential-projects" value={projects} onChange={(event) => onProjectsChange(event.target.value)} placeholder="web-app, release" autoComplete="off" /><small>Comma-separated project names. Scope credentials to the repositories that need them.</small></label>
                 <div className="credential-form-actions">
                   {id && <button className="button button-quiet" type="button" disabled={busy} onClick={onReset}>Clear</button>}
                   <button className="button button-primary" type="submit" disabled={busy || !id.trim() || !username.trim() || !secret}>{busy ? "Saving…" : id ? "Rotate securely" : "Store credential"}</button>
@@ -1341,7 +1352,7 @@ function CredentialsPanel({
                   {credentials.map((credential) => (
                     <div className="credential-row" key={credential.id}>
                       <span className="credential-row-mark">◈</span>
-                      <div className="credential-copy"><strong>{credential.id}</strong><small>{credential.username} · secret sealed</small></div>
+                      <div className="credential-copy"><strong>{credential.id}</strong><small>{credential.username} · {credential.projects.length ? `scoped to ${credential.projects.join(", ")}` : "all projects"} · secret sealed</small></div>
                       <button className="button button-quiet credential-action" type="button" disabled={busy} onClick={() => onEdit(credential)}>Rotate</button>
                       <button className="credential-delete" type="button" disabled={busy} aria-label={`Remove credential ${credential.id}`} onClick={() => void onRemove(credential)}>×</button>
                     </div>

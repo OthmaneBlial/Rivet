@@ -214,7 +214,7 @@ export function credentials(): Promise<CredentialSummary[]> {
 
 export function setCredential(
   id: string,
-  input: { username: string; secret: string },
+  input: { username: string; secret: string; projects?: string[] },
 ): Promise<CredentialSummary> {
   return request<CredentialSummary>(
     `/api/v1/credentials/${encodeURIComponent(id)}`,

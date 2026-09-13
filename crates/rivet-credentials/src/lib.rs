@@ -8,7 +8,7 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::Argon2;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -26,6 +26,7 @@ const KEY_BYTES: usize = 32;
 const MIN_PASSPHRASE_BYTES: usize = 12;
 const MAX_ID_BYTES: usize = 64;
 const MAX_USERNAME_BYTES: usize = 256;
+const MAX_PROJECT_BYTES: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum CredentialError {
@@ -62,6 +63,7 @@ pub struct Credential {
     id: String,
     username: String,
     secret: String,
+    projects: BTreeSet<String>,
 }
 
 impl Credential {
@@ -75,6 +77,16 @@ impl Credential {
 
     pub fn secret(&self) -> &str {
         &self.secret
+    }
+
+    /// Return the project allow-list. An empty set means the credential is
+    /// available to every project, preserving the original vault behavior.
+    pub fn projects(&self) -> impl Iterator<Item = &str> {
+        self.projects.iter().map(String::as_str)
+    }
+
+    pub fn is_allowed_for_project(&self, project: &str) -> bool {
+        self.projects.is_empty() || self.projects.contains(project)
     }
 }
 
@@ -98,6 +110,9 @@ impl Drop for Credential {
 pub struct CredentialSummary {
     pub id: String,
     pub username: String,
+    /// Empty means global access; otherwise this is the explicit project
+    /// allow-list. Secrets are intentionally never part of this summary.
+    pub projects: Vec<String>,
 }
 
 pub struct CredentialVault {
@@ -127,6 +142,8 @@ struct VaultPayload {
 struct VaultCredential {
     username: String,
     secret: String,
+    #[serde(default)]
+    projects: BTreeSet<String>,
 }
 
 impl Drop for VaultCredential {
@@ -188,12 +205,14 @@ impl CredentialVault {
                 if credential.secret.is_empty() {
                     return Err(CredentialError::EmptySecret);
                 }
+                validate_projects(&credential.projects)?;
                 Ok((
                     id.clone(),
                     Credential {
                         id,
                         username: credential.username.clone(),
                         secret: credential.secret.clone(),
+                        projects: credential.projects.clone(),
                     },
                 ))
             })
@@ -241,6 +260,7 @@ impl CredentialVault {
             .map(|credential| CredentialSummary {
                 id: credential.id.clone(),
                 username: credential.username.clone(),
+                projects: credential.projects.iter().cloned().collect(),
             })
             .collect()
     }
@@ -253,6 +273,17 @@ impl CredentialVault {
             .ok_or_else(|| CredentialError::CredentialNotFound(id.to_owned()))
     }
 
+    /// Resolve a credential for one project. Global credentials remain
+    /// compatible, while scoped credentials are denied outside their list.
+    pub fn get_for_project(&self, id: &str, project: &str) -> Result<Credential, CredentialError> {
+        validate_project(project)?;
+        let credential = self.get(id)?;
+        if !credential.is_allowed_for_project(project) {
+            return Err(CredentialError::CredentialNotFound(id.to_owned()));
+        }
+        Ok(credential)
+    }
+
     /// Store or replace an HTTP basic credential and immediately persist it.
     pub fn set_http_basic(
         &mut self,
@@ -260,20 +291,42 @@ impl CredentialVault {
         username: impl Into<String>,
         secret: impl Into<String>,
     ) -> Result<(), CredentialError> {
+        self.set_http_basic_for_projects(id, username, secret, std::iter::empty::<String>())
+    }
+
+    /// Store or replace an HTTP basic credential with an optional project
+    /// allow-list. An empty iterator gives the credential global scope.
+    pub fn set_http_basic_for_projects<I, S>(
+        &mut self,
+        id: impl Into<String>,
+        username: impl Into<String>,
+        secret: impl Into<String>,
+        projects: I,
+    ) -> Result<(), CredentialError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let id = id.into();
         let username = username.into();
         let secret = secret.into();
+        let projects = projects
+            .into_iter()
+            .map(Into::into)
+            .collect::<BTreeSet<_>>();
         validate_id(&id)?;
         validate_username(&username)?;
         if secret.is_empty() {
             return Err(CredentialError::EmptySecret);
         }
+        validate_projects(&projects)?;
         let previous = self.credentials.insert(
             id.clone(),
             Credential {
                 id: id.clone(),
                 username,
                 secret,
+                projects,
             },
         );
         if let Err(error) = self.save() {
@@ -311,6 +364,7 @@ impl CredentialVault {
                         VaultCredential {
                             username: credential.username.clone(),
                             secret: credential.secret.clone(),
+                            projects: credential.projects.clone(),
                         },
                     )
                 })
@@ -349,6 +403,27 @@ fn validate_username(username: &str) -> Result<(), CredentialError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_projects(projects: &BTreeSet<String>) -> Result<(), CredentialError> {
+    for project in projects {
+        validate_project(project)?;
+    }
+    Ok(())
+}
+
+fn validate_project(project: &str) -> Result<(), CredentialError> {
+    if project.trim().is_empty()
+        || project.len() > MAX_PROJECT_BYTES
+        || project.contains('/')
+        || project.contains('\\')
+        || project.contains('\0')
+    {
+        return Err(CredentialError::InvalidFormat(format!(
+            "credential project scope is invalid: {project:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; KEY_BYTES], CredentialError> {
@@ -511,12 +586,37 @@ mod tests {
             [CredentialSummary {
                 id: "github".into(),
                 username: "oauth2".into(),
+                projects: vec![],
             }]
         );
         assert!(matches!(
             CredentialVault::open(&path, "wrong-passphrase"),
             Err(CredentialError::Cryptography)
         ));
+    }
+
+    #[test]
+    fn project_scoped_credentials_round_trip_and_deny_other_projects() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("credentials.vault");
+        let mut vault = CredentialVault::open_or_create(&path, PASSPHRASE).expect("create");
+        vault
+            .set_http_basic_for_projects("github", "oauth2", "scoped-secret", ["rivet", "release"])
+            .expect("set scoped credential");
+        assert_eq!(
+            vault.get_for_project("github", "rivet").unwrap().secret(),
+            "scoped-secret"
+        );
+        assert!(matches!(
+            vault.get_for_project("github", "other"),
+            Err(CredentialError::CredentialNotFound(id)) if id == "github"
+        ));
+        assert_eq!(vault.list()[0].projects, vec!["release", "rivet"]);
+        drop(vault);
+
+        let vault = CredentialVault::open(&path, PASSPHRASE).expect("reopen");
+        assert!(vault.get_for_project("github", "release").is_ok());
+        assert!(vault.get_for_project("github", "other").is_err());
     }
 
     #[test]

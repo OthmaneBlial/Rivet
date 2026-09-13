@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**88% verified** · `███████████████████░`<br>
-Weighted evidence score: **88.55 / 100** · displayed conservatively as the
+**90% verified** · `██████████████████░░`<br>
+Weighted evidence score: **90.28 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -28,7 +28,7 @@ toggle, persistent UTC cron schedules, server dispatch, desktop schedule
 controls, signed generic webhook delivery with idempotent redelivery,
 policy-backed API identities with role/project authorization,
 secret-parameter redaction/masking, a passphrase-encrypted SCM credential vault
-with non-secret credential references, and a packaged desktop launch with an
+with non-secret credential references and project allow-lists, and a packaged desktop launch with an
 ephemeral loopback engine origin, project-scoped local CI cache restore and
 save, explicit Docker container command assembly with bounded workspace mounts,
 and a bounded Jenkinsfile migration analyzer with line-level support findings
@@ -340,6 +340,7 @@ chmod 600 /secure/path/rivet.credentials.passphrase
 chmod 600 /secure/path/github.token
 cargo run -p rivet -- credential set github \
   --username oauth2 \
+  --project release \
   --secret-file /secure/path/github.token \
   --passphrase-file /secure/path/rivet.credentials.passphrase \
   --vault-file /secure/path/rivet.credentials.vault
@@ -347,6 +348,7 @@ cargo run -p rivet -- credential list \
   --passphrase-file /secure/path/rivet.credentials.passphrase \
   --vault-file /secure/path/rivet.credentials.vault
 cargo run -p rivet -- scm prepare . --fetch --credential-id github \
+  --project release \
   --credentials-file /secure/path/rivet.credentials.vault \
   --credentials-passphrase-file /secure/path/rivet.credentials.passphrase
 ```
@@ -368,15 +370,19 @@ redacts the secret and encoded header from command errors. The vault stores
 authenticated ciphertext only. When the server is configured with the vault,
 administrators can manage its lifecycle through `GET /api/v1/credentials`,
 `PUT /api/v1/credentials/<id>`, and `DELETE /api/v1/credentials/<id>`.
-Responses contain only IDs and usernames; replacement and removal require the
-administrator permission and append a bounded audit event without recording
-the secret. Keychain integration and project-level access control remain
-future gates.
+Responses contain only IDs, usernames, and non-secret project scopes;
+replacement and removal require the administrator permission and append a
+bounded audit event without recording the secret. A credential with no project
+scope is global for backwards compatibility; `--project` (repeatable) or the
+API `projects` array restricts it to named projects. Build admission, webhooks,
+`rivet run`, and `scm prepare --project` enforce that allow-list. Keychain
+integration remains a future gate.
 
 The desktop control room exposes the same admin-only lifecycle when the server
-has a vault configured: it shows credential IDs and usernames, supports secure
-replacement/removal, and clears the entered secret after each save. The API
-response still contains no secret material.
+has a vault configured: it shows credential IDs, usernames, and non-secret
+scopes, supports secure replacement/removal and project allow-lists, and clears
+the entered secret after each save. The API response still contains no secret
+material.
 
 The Pipelines view can pass the same non-secret SCM preparation options to a
 manual run or retry: explicit remote fetch, revision checkout, controlled

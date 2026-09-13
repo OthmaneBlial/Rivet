@@ -306,6 +306,10 @@ pub struct UpdateScheduleRequest {
 struct CredentialWriteRequest {
     username: String,
     secret: String,
+    /// Empty keeps the credential globally usable for backwards-compatible
+    /// vaults. Non-empty values restrict SCM resolution to these projects.
+    #[serde(default)]
+    projects: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -581,9 +585,12 @@ async fn prepare_scm(
             "an SCM fetch_ref requires fetch=true".into(),
         ));
     }
-    let credential =
-        resolve_git_credential(state.credentials.as_ref(), request.credential_id.as_deref())
-            .await?;
+    let credential = resolve_git_credential(
+        state.credentials.as_ref(),
+        request.credential_id.as_deref(),
+        &name,
+    )
+    .await?;
     Ok(Json(
         repository
             .prepare_with_credential(
@@ -893,7 +900,12 @@ async fn set_credential(
     require_global(&principal, Permission::Administer)?;
     let vault = configured_credentials(&state)?;
     let mut vault = vault.lock().await;
-    vault.set_http_basic(id.clone(), request.username, request.secret)?;
+    vault.set_http_basic_for_projects(
+        id.clone(),
+        request.username,
+        request.secret,
+        request.projects,
+    )?;
     let summary = vault
         .list()
         .into_iter()
@@ -2464,6 +2476,7 @@ async fn enqueue_project_build(
     let repository_root = PathBuf::from(&project.repository_path);
     let source = capture_source_snapshot(
         &repository_root,
+        &project.name,
         request.scm.as_ref(),
         state.credentials.as_ref(),
     )
@@ -3521,6 +3534,7 @@ fn finalize_artifacts(
 
 async fn capture_source_snapshot(
     path: &Path,
+    project_name: &str,
     prepare: Option<&PrepareScmRequest>,
     credentials: Option<&Arc<Mutex<CredentialVault>>>,
 ) -> Result<Option<SourceSnapshot>, ApiError> {
@@ -3538,9 +3552,12 @@ async fn capture_source_snapshot(
                             "an SCM fetch_ref requires fetch=true".into(),
                         ));
                     }
-                    let credential =
-                        resolve_git_credential(credentials, request.credential_id.as_deref())
-                            .await?;
+                    let credential = resolve_git_credential(
+                        credentials,
+                        request.credential_id.as_deref(),
+                        project_name,
+                    )
+                    .await?;
                     repository
                         .prepare_with_credential(
                             &GitPrepareOptions {
@@ -3575,6 +3592,7 @@ async fn capture_source_snapshot(
 async fn resolve_git_credential(
     credentials: Option<&Arc<Mutex<CredentialVault>>>,
     credential_id: Option<&str>,
+    project_name: &str,
 ) -> Result<Option<GitHttpCredential>, ApiError> {
     let Some(credential_id) = credential_id else {
         return Ok(None);
@@ -3588,9 +3606,11 @@ async fn resolve_git_credential(
         ApiError::BadRequest("this server has no configured SCM credential vault".into())
     })?;
     let vault = vault.lock().await;
-    let credential = vault.get(credential_id).map_err(|error| {
-        ApiError::BadRequest(format!("could not resolve SCM credential: {error}"))
-    })?;
+    let credential = vault
+        .get_for_project(credential_id, project_name)
+        .map_err(|error| {
+            ApiError::BadRequest(format!("could not resolve SCM credential: {error}"))
+        })?;
     GitHttpCredential::new(credential.username(), credential.secret())
         .map(Some)
         .map_err(|error| ApiError::BadRequest(error.to_string()))
@@ -4679,6 +4699,57 @@ mod tests {
                 && event.resource == "github"
                 && event.outcome == "remove"
         }));
+    }
+
+    #[tokio::test]
+    async fn scoped_credential_api_limits_scm_resolution_to_declared_projects() {
+        let directory = tempdir().expect("tempdir");
+        let vault_path = directory.path().join("credentials.vault");
+        let vault = CredentialVault::open_or_create(&vault_path, "credential-scope-passphrase")
+            .expect("vault");
+        let mut state = AppState::new(Storage::open_in_memory().expect("storage"));
+        state.credentials = Some(Arc::new(Mutex::new(vault)));
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/credentials/release-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"oauth2","secret":"scope-secret","projects":["release","web"]}"#,
+                    ))
+                    .expect("credential request"),
+            )
+            .await
+            .expect("credential response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("credential body");
+        let summary: serde_json::Value = serde_json::from_slice(&body).expect("summary JSON");
+        assert_eq!(summary["projects"], serde_json::json!(["release", "web"]));
+        assert!(
+            !body
+                .windows(b"scope-secret".len())
+                .any(|window| { window == b"scope-secret" })
+        );
+
+        assert!(
+            resolve_git_credential(state.credentials.as_ref(), Some("release-token"), "release")
+                .await
+                .expect("allowed resolution")
+                .is_some()
+        );
+        let denied = resolve_git_credential(
+            state.credentials.as_ref(),
+            Some("release-token"),
+            "unrelated",
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(ApiError::BadRequest(message)) if message.contains("not found"))
+        );
     }
 
     #[tokio::test]
