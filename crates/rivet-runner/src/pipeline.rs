@@ -4,7 +4,7 @@ use rivet_core::{
     BuildEvent, BuildStatus, ExecutionPlan, ExecutionStage, ExecutionStep, Pipeline, StageStatus,
     StepStatus,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -23,13 +23,14 @@ pub enum RunnerError {
     WorkingDirectoryOutsideWorkspace(PathBuf),
     #[error("step {step:?} requires a remote agent; local execution was refused")]
     RemoteAgentRequired { step: String },
+    #[error("validated execution graph could not make progress")]
+    GraphBlocked,
+    #[error("stage execution task failed: {0}")]
+    StageTaskJoin(String),
 }
 
-/// Execute all stages in a validated plan in declaration order.
-///
-/// The stage/step loop is intentionally sequential in this first vertical
-/// slice. The execution plan already has stable graph identities, so parallel
-/// branches can be added later without changing persistence or event identity.
+/// Execute all stages in a validated plan, running ready independent stages
+/// concurrently while honoring the stable dependency graph.
 pub async fn execute_pipeline(
     plan: &ExecutionPlan,
     pipeline: &Pipeline,
@@ -109,59 +110,103 @@ pub async fn execute_pipeline_with_parameters_and_cache(
     )
     .await?;
 
-    for stage in &plan.stages {
-        if cancellation.is_cancelled() {
-            return finish_cancelled(plan, &events).await;
-        }
-        send(
-            &events,
-            BuildEvent::StageStarted {
-                build_id: plan.build_id,
-                stage_id: stage.id,
-                stage_name: stage.name.clone(),
-                timestamp: Utc::now(),
-            },
-        )
-        .await?;
+    let execution_cancellation = cancellation.child_token();
+    let mut completed = HashMap::new();
+    let mut running = HashSet::new();
+    let mut stage_tasks = tokio::task::JoinSet::new();
+    let mut failed = false;
+    let mut first_error = None;
 
-        for step in &stage.steps {
-            if cancellation.is_cancelled() {
-                send_stage_finished(plan, stage, StageStatus::Cancelled, &events).await?;
-                return finish_cancelled(plan, &events).await;
-            }
-            let result = execute_step(
-                plan,
-                stage,
-                step,
-                pipeline,
-                &workspace,
-                &parameters,
-                &secret_values,
-                &cancellation,
-                &events,
-            )
-            .await;
-            match result {
-                Ok(StepStatus::Passed) => {}
-                Ok(StepStatus::Cancelled) => {
-                    send_stage_finished(plan, stage, StageStatus::Cancelled, &events).await?;
-                    return finish_cancelled(plan, &events).await;
+    while completed.len() < plan.stages.len() && !failed {
+        if cancellation.is_cancelled() {
+            execution_cancellation.cancel();
+        }
+        if !cancellation.is_cancelled() {
+            for stage in &plan.stages {
+                if completed.contains_key(&stage.id) || running.contains(&stage.id) {
+                    continue;
                 }
-                Ok(StepStatus::Failed)
-                | Ok(StepStatus::Skipped)
-                | Ok(StepStatus::Pending)
-                | Ok(StepStatus::Running) => {
-                    send_stage_finished(plan, stage, StageStatus::Failed, &events).await?;
-                    return finish_build(plan, BuildStatus::Failed, &events).await;
+                let dependencies_passed = stage.depends_on.iter().all(|dependency| {
+                    matches!(completed.get(dependency), Some(StageStatus::Passed))
+                });
+                if !dependencies_passed {
+                    continue;
+                }
+                let stage_id = stage.id;
+                running.insert(stage_id);
+                let plan = plan.clone();
+                let pipeline = pipeline.clone();
+                let stage = stage.clone();
+                let workspace = workspace.clone();
+                let parameters = parameters.clone();
+                let secret_values = secret_values.clone();
+                let stage_cancellation = execution_cancellation.clone();
+                let events = events.clone();
+                stage_tasks.spawn(async move {
+                    let result = execute_stage(
+                        &plan,
+                        &stage,
+                        &pipeline,
+                        &workspace,
+                        &parameters,
+                        &secret_values,
+                        &stage_cancellation,
+                        &events,
+                    )
+                    .await;
+                    (stage_id, result)
+                });
+            }
+        }
+
+        if stage_tasks.is_empty() {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            first_error = Some(RunnerError::GraphBlocked);
+            failed = true;
+            break;
+        }
+
+        while let Some(result) = stage_tasks.join_next().await {
+            match result {
+                Ok((stage_id, Ok(status))) => {
+                    running.remove(&stage_id);
+                    if status == StageStatus::Failed {
+                        failed = true;
+                        execution_cancellation.cancel();
+                    }
+                    completed.insert(stage_id, status);
+                }
+                Ok((stage_id, Err(error))) => {
+                    running.remove(&stage_id);
+                    completed.insert(stage_id, StageStatus::Failed);
+                    first_error.get_or_insert(error);
+                    failed = true;
+                    execution_cancellation.cancel();
                 }
                 Err(error) => {
-                    send_stage_finished(plan, stage, StageStatus::Failed, &events).await?;
-                    let _ = finish_build(plan, BuildStatus::Failed, &events).await;
-                    return Err(error);
+                    first_error.get_or_insert(RunnerError::StageTaskJoin(error.to_string()));
+                    failed = true;
+                    execution_cancellation.cancel();
                 }
             }
         }
-        send_stage_finished(plan, stage, StageStatus::Passed, &events).await?;
+    }
+
+    if cancellation.is_cancelled() {
+        return finish_cancelled(plan, &events).await;
+    }
+    if let Some(error) = first_error {
+        let _ = finish_build(plan, BuildStatus::Failed, &events).await;
+        return Err(error);
+    }
+    if failed {
+        return finish_build(plan, BuildStatus::Failed, &events).await;
+    }
+    if completed.len() != plan.stages.len() {
+        let _ = finish_build(plan, BuildStatus::Failed, &events).await;
+        return Err(RunnerError::GraphBlocked);
     }
 
     if let Some(cache_root) = cache_root {
@@ -181,6 +226,67 @@ pub async fn execute_pipeline_with_parameters_and_cache(
         }
     }
     finish_build(plan, BuildStatus::Passed, &events).await
+}
+
+async fn execute_stage(
+    plan: &ExecutionPlan,
+    stage: &ExecutionStage,
+    pipeline: &Pipeline,
+    workspace: &Path,
+    parameters: &BTreeMap<String, String>,
+    secret_values: &[String],
+    cancellation: &CancellationToken,
+    events: &mpsc::Sender<BuildEvent>,
+) -> Result<StageStatus, RunnerError> {
+    send(
+        events,
+        BuildEvent::StageStarted {
+            build_id: plan.build_id,
+            stage_id: stage.id,
+            stage_name: stage.name.clone(),
+            timestamp: Utc::now(),
+        },
+    )
+    .await?;
+
+    for step in &stage.steps {
+        if cancellation.is_cancelled() {
+            send_stage_finished(plan, stage, StageStatus::Cancelled, events).await?;
+            return Ok(StageStatus::Cancelled);
+        }
+        let result = execute_step(
+            plan,
+            stage,
+            step,
+            pipeline,
+            workspace,
+            parameters,
+            secret_values,
+            cancellation,
+            events,
+        )
+        .await;
+        match result {
+            Ok(StepStatus::Passed) => {}
+            Ok(StepStatus::Cancelled) => {
+                send_stage_finished(plan, stage, StageStatus::Cancelled, events).await?;
+                return Ok(StageStatus::Cancelled);
+            }
+            Ok(StepStatus::Failed)
+            | Ok(StepStatus::Skipped)
+            | Ok(StepStatus::Pending)
+            | Ok(StepStatus::Running) => {
+                send_stage_finished(plan, stage, StageStatus::Failed, events).await?;
+                return Ok(StageStatus::Failed);
+            }
+            Err(error) => {
+                send_stage_finished(plan, stage, StageStatus::Failed, events).await?;
+                return Err(error);
+            }
+        }
+    }
+    send_stage_finished(plan, stage, StageStatus::Passed, events).await?;
+    Ok(StageStatus::Passed)
 }
 
 async fn execute_step(
@@ -513,6 +619,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::fs;
+    use std::time::Instant;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -530,6 +637,7 @@ program = "sh"
 args = ["-c", "printf first > order.txt"]
 [[stages]]
 name = "second"
+depends_on = ["first"]
 [[stages.steps]]
 name = "read"
 program = "sh"
@@ -609,6 +717,49 @@ args = ["test.marker"]
         assert_eq!(status, BuildStatus::Passed);
         while rx.recv().await.is_some() {}
         assert!(dir.path().join("build.marker").is_file());
+    }
+
+    #[tokio::test]
+    async fn executes_independent_stages_in_parallel() {
+        let dir = tempdir().expect("tempdir");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "parallel"
+[[stages]]
+name = "left"
+[[stages.steps]]
+name = "left-step"
+program = "sh"
+args = ["-c", "sleep 0.2; printf left > left.done"]
+[[stages]]
+name = "right"
+[[stages.steps]]
+name = "right-step"
+program = "sh"
+args = ["-c", "sleep 0.2; printf right > right.done"]
+"#,
+        )
+        .expect("pipeline");
+        let plan =
+            ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let (tx, mut rx) = mpsc::channel(64);
+        let started_at = Instant::now();
+        let status = execute_pipeline(&plan, &pipeline, dir.path(), CancellationToken::new(), tx)
+            .await
+            .expect("runner");
+
+        assert_eq!(status, BuildStatus::Passed);
+        assert!(started_at.elapsed() < Duration::from_millis(360));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("left.done")).expect("left"),
+            "left"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("right.done")).expect("right"),
+            "right"
+        );
+        while rx.recv().await.is_some() {}
     }
 
     #[tokio::test]
