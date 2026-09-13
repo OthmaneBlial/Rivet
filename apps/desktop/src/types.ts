@@ -134,6 +134,7 @@ export interface AgentSummary {
   last_heartbeat: string;
   last_sequence: number;
   running: string[];
+  reserved?: string[];
   available_executors: number;
   status: AgentStatus;
 }

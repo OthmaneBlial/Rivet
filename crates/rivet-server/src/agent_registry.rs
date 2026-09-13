@@ -315,6 +315,19 @@ impl AgentRegistry {
             .map_err(|_| AgentRegistryError::AgentChannelClosed(reservation.agent_id))
     }
 
+    pub async fn reservation_online(
+        &self,
+        reservation: &AgentReservation,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let agents = self.agents.read().await;
+        agents.get(&reservation.agent_id).is_some_and(|entry| {
+            entry.session_id == reservation.session_id
+                && entry.reserved.contains_key(&reservation.build_id)
+                && self.status(entry, now) == AgentStatus::Online
+        })
+    }
+
     fn status(&self, entry: &AgentEntry, now: DateTime<Utc>) -> AgentStatus {
         if now - entry.last_heartbeat <= self.stale_after {
             AgentStatus::Online

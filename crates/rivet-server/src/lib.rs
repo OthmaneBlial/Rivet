@@ -14,7 +14,9 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
-use rivet_agent_protocol::{AgentMessage, AgentRequirements, PROTOCOL_VERSION};
+use rivet_agent_protocol::{
+    AgentMessage, AgentRequirements, MAX_WORKSPACE_CHUNK_BYTES, PROTOCOL_VERSION,
+};
 use rivet_core::{
     BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, Pipeline, Project, ScheduleId,
     SourceSnapshot,
@@ -42,7 +44,9 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 mod agent_registry;
 mod workspace_archive;
 
-use agent_registry::{AgentLease, AgentRegistry, AgentSummary};
+use agent_registry::{
+    AgentLease, AgentRegistry, AgentRegistryError, AgentReservation, AgentSummary,
+};
 use workspace_archive::archive_workspace;
 
 const DEFAULT_ALLOWED_ORIGINS: [&str; 4] = [
@@ -61,7 +65,13 @@ pub struct AppState {
     auth_digest: Option<[u8; 32]>,
     webhook_secret: Option<Vec<u8>>,
     agents: AgentRegistry,
-    remote_messages: Arc<Mutex<HashMap<BuildId, mpsc::Sender<AgentMessage>>>>,
+    remote_messages: Arc<Mutex<HashMap<BuildId, RemoteBuildRoute>>>,
+}
+
+#[derive(Clone)]
+struct RemoteBuildRoute {
+    agent_id: rivet_agent_protocol::AgentId,
+    messages: mpsc::Sender<AgentMessage>,
 }
 
 #[derive(Debug, Clone)]
@@ -747,10 +757,32 @@ async fn handle_agent_socket(mut socket: WebSocket, state: AppState) {
             }
         }
     }
+    notify_agent_disconnect(&state, lease.agent_id).await;
     state
         .agents
         .unregister(lease.agent_id, lease.session_id)
         .await;
+}
+
+async fn notify_agent_disconnect(state: &AppState, agent_id: rivet_agent_protocol::AgentId) {
+    let routes = state
+        .remote_messages
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, route)| route.agent_id == agent_id)
+        .map(|(build_id, route)| (*build_id, route.messages.clone()))
+        .collect::<Vec<_>>();
+    for (build_id, messages) in routes {
+        let _ = messages
+            .send(AgentMessage::Error {
+                protocol_version: PROTOCOL_VERSION,
+                build_id: Some(build_id),
+                code: "agent_disconnected".into(),
+                message: "the assigned agent websocket disconnected".into(),
+            })
+            .await;
+    }
 }
 
 async fn dispatch_agent_message(
@@ -785,6 +817,7 @@ async fn dispatch_agent_message(
         AgentMessage::Event { event, .. } => {
             route_agent_build_message(
                 state,
+                lease.agent_id,
                 build_id_from_event(&event),
                 AgentMessage::Event {
                     protocol_version: PROTOCOL_VERSION,
@@ -798,7 +831,27 @@ async fn dispatch_agent_message(
         | AgentMessage::WorkspaceReady { build_id, .. }
         | AgentMessage::Log { build_id, .. }
         | AgentMessage::Finished { build_id, .. } => {
-            route_agent_build_message(state, build_id, message).await?;
+            route_agent_build_message(state, lease.agent_id, build_id, message).await?;
+            Ok(None)
+        }
+        AgentMessage::Error {
+            build_id: Some(build_id),
+            code,
+            message,
+            ..
+        } => {
+            route_agent_build_message(
+                state,
+                lease.agent_id,
+                build_id,
+                AgentMessage::Error {
+                    protocol_version: PROTOCOL_VERSION,
+                    build_id: Some(build_id),
+                    code,
+                    message,
+                },
+            )
+            .await?;
             Ok(None)
         }
         AgentMessage::Error { code, message, .. } => Err((format!("agent_{code}"), message)),
@@ -817,10 +870,11 @@ async fn dispatch_agent_message(
 
 async fn route_agent_build_message(
     state: &AppState,
+    agent_id: rivet_agent_protocol::AgentId,
     build_id: BuildId,
     message: AgentMessage,
 ) -> Result<(), (String, String)> {
-    let sender = state
+    let route = state
         .remote_messages
         .lock()
         .await
@@ -832,7 +886,13 @@ async fn route_agent_build_message(
                 format!("agent message refers to unassigned build {build_id}"),
             )
         })?;
-    sender.send(message).await.map_err(|_| {
+    if route.agent_id != agent_id {
+        return Err((
+            "agent_identity_mismatch".into(),
+            format!("agent is not assigned to build {build_id}"),
+        ));
+    }
+    route.messages.send(message).await.map_err(|_| {
         (
             "build_channel_closed".into(),
             format!("server is no longer listening for build {build_id}"),
@@ -884,6 +944,7 @@ async fn send_agent_error(socket: &mut WebSocket, code: &str, message: &str) -> 
         socket,
         AgentMessage::Error {
             protocol_version: PROTOCOL_VERSION,
+            build_id: None,
             code: code.to_owned(),
             message: message.to_owned(),
         },
@@ -1298,13 +1359,42 @@ async fn enqueue_project_build(
     let pipeline = Pipeline::load(&project.pipeline_path)?;
     let parameters = pipeline.resolve_parameters(&request.parameters)?;
     let plan = ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), project.id);
-    let build = state.storage.create_build_with_parameters(
+    let remote_requirements = remote_agent_requirements(&pipeline)?;
+    let remote_workspace = remote_requirements
+        .as_ref()
+        .map(|_| {
+            pipeline
+                .resolve_workspace(&repository_root)
+                .map(|_| repository_root.clone())
+        })
+        .transpose()?;
+    let reservation = match remote_requirements.as_ref() {
+        Some(requirements) => Some(
+            state
+                .agents
+                .reserve(requirements, plan.build_id, Utc::now())
+                .await
+                .map_err(|error| {
+                    ApiError::BadRequest(format!("remote agent unavailable: {error}"))
+                })?,
+        ),
+        None => None,
+    };
+    let build = match state.storage.create_build_with_parameters(
         &project,
         &plan,
         &pipeline,
         source.as_ref(),
         &parameters,
-    )?;
+    ) {
+        Ok(build) => build,
+        Err(error) => {
+            if let Some(reservation) = reservation.as_ref() {
+                state.agents.release(reservation).await;
+            }
+            return Err(error.into());
+        }
+    };
     let cancellation = CancellationToken::new();
     state
         .active_builds
@@ -1317,14 +1407,19 @@ async fn enqueue_project_build(
     let event_bus = state.events.clone();
     let artifact_pipeline = pipeline.clone();
     let artifact_workspace = repository_root.clone();
+    let collect_local_artifacts = reservation.is_none();
     tokio::spawn(async move {
         while let Some(event) = received_events.recv().await {
-            let event = finalize_artifacts(
-                &event_storage,
-                &artifact_pipeline,
-                &artifact_workspace,
-                event,
-            );
+            let event = if collect_local_artifacts {
+                finalize_artifacts(
+                    &event_storage,
+                    &artifact_pipeline,
+                    &artifact_workspace,
+                    event,
+                )
+            } else {
+                event
+            };
             if let Err(error) = event_storage.apply_event(&event) {
                 tracing::error!(?error, "could not project Rivet build event");
                 continue;
@@ -1333,24 +1428,545 @@ async fn enqueue_project_build(
         }
     });
 
-    let handle = state
-        .scheduler
-        .enqueue_with_parameters(
-            plan,
-            pipeline,
-            repository_root,
-            parameters,
-            cancellation.clone(),
-            events,
-        )
-        .await?;
-    spawn_build_reaper(state.active_builds.clone(), handle);
+    if let Some(reservation) = reservation {
+        events
+            .send(BuildEvent::BuildQueued {
+                build_id: plan.build_id,
+                project_id: plan.project_id,
+                timestamp: Utc::now(),
+            })
+            .await
+            .map_err(|_| ApiError::BadRequest("remote build event channel closed".into()))?;
+        let (messages, received_messages) = mpsc::channel(1024);
+        state.remote_messages.lock().await.insert(
+            plan.build_id,
+            RemoteBuildRoute {
+                agent_id: reservation.agent_id,
+                messages,
+            },
+        );
+        let remote_state = state.clone();
+        tokio::spawn(async move {
+            let result = run_remote_build(
+                remote_state.clone(),
+                reservation.clone(),
+                plan,
+                pipeline,
+                remote_workspace.expect("remote workspace was resolved"),
+                parameters,
+                cancellation,
+                events.clone(),
+                received_messages,
+            )
+            .await;
+            if let Err(error) = result {
+                tracing::error!(?error, "remote Rivet build failed before completion");
+                let _ = events
+                    .send(BuildEvent::BuildFinished {
+                        build_id: reservation.build_id,
+                        status: BuildStatus::Failed,
+                        timestamp: Utc::now(),
+                    })
+                    .await;
+            }
+            remote_state
+                .remote_messages
+                .lock()
+                .await
+                .remove(&reservation.build_id);
+            remote_state.agents.release(&reservation).await;
+            remote_state
+                .active_builds
+                .lock()
+                .await
+                .remove(&reservation.build_id);
+        });
+    } else {
+        let handle = state
+            .scheduler
+            .enqueue_with_parameters(
+                plan,
+                pipeline,
+                repository_root,
+                parameters,
+                cancellation.clone(),
+                events,
+            )
+            .await?;
+        spawn_build_reaper(state.active_builds.clone(), handle);
+    }
     let mut response_build = build;
     response_build.status = BuildStatus::Queued;
     Ok(QueueBuildResponse {
         build: response_build,
         status: BuildStatus::Queued,
     })
+}
+
+fn remote_agent_requirements(pipeline: &Pipeline) -> Result<Option<AgentRequirements>, ApiError> {
+    let mut requirements = None;
+    for stage in &pipeline.stages {
+        for step in &stage.steps {
+            let Some(agent) = step.agent.as_ref() else {
+                continue;
+            };
+            let candidate = AgentRequirements::from(agent);
+            if requirements
+                .as_ref()
+                .is_some_and(|current| current != &candidate)
+            {
+                return Err(ApiError::BadRequest(
+                    "all remote steps in one build must use identical agent requirements".into(),
+                ));
+            }
+            requirements = Some(candidate);
+        }
+    }
+    Ok(requirements)
+}
+
+#[derive(Debug, Error)]
+enum RemoteBuildError {
+    #[error("remote agent transport failed: {0}")]
+    Agent(#[from] AgentRegistryError),
+    #[error("workspace archive failed: {0}")]
+    WorkspaceArchive(String),
+    #[error("remote build event channel closed")]
+    EventChannelClosed,
+    #[error("remote agent disconnected while build {0} was running")]
+    AgentDisconnected(BuildId),
+    #[error("remote agent rejected build {build_id}: {code}: {message}")]
+    AgentRejected {
+        build_id: BuildId,
+        code: String,
+        message: String,
+    },
+    #[error("invalid event from remote agent for build {build_id}: {reason}")]
+    InvalidEvent { build_id: BuildId, reason: String },
+    #[error("remote agent sent an unsupported legacy message for build {0}")]
+    UnsupportedMessage(BuildId),
+    #[error("remote operation cancelled")]
+    Cancelled,
+}
+
+async fn run_remote_build(
+    state: AppState,
+    reservation: AgentReservation,
+    plan: ExecutionPlan,
+    pipeline: Pipeline,
+    workspace: PathBuf,
+    parameters: BTreeMap<String, String>,
+    cancellation: CancellationToken,
+    events: mpsc::Sender<BuildEvent>,
+    mut messages: mpsc::Receiver<AgentMessage>,
+) -> Result<(), RemoteBuildError> {
+    let mut accepted = false;
+    let mut ready = false;
+    let mut active_stages = HashSet::new();
+    let mut active_steps = HashSet::new();
+    let archive_task = tokio::task::spawn_blocking(move || archive_workspace(&workspace));
+    let archive = tokio::select! {
+        result = archive_task => match result {
+            Ok(Ok(archive)) => archive,
+            Ok(Err(error)) => return Err(RemoteBuildError::WorkspaceArchive(error.to_string())),
+            Err(error) => return Err(RemoteBuildError::WorkspaceArchive(format!("archive task failed: {error}"))),
+        },
+        _ = cancellation.cancelled() => {
+            return finish_remote_cancelled(
+                &state,
+                &reservation,
+                &plan,
+                &events,
+                &mut messages,
+                &mut accepted,
+                &mut ready,
+                &mut active_stages,
+                &mut active_steps,
+            )
+            .await;
+        }
+    };
+
+    let assignment = AgentMessage::Assign {
+        protocol_version: PROTOCOL_VERSION,
+        build_id: plan.build_id,
+        project_id: plan.project_id,
+        plan: plan.clone(),
+        pipeline,
+        parameters,
+        workspace: archive.transfer,
+    };
+    match send_remote_message(&state, &reservation, assignment, &cancellation).await {
+        Ok(()) => {}
+        Err(RemoteBuildError::Cancelled) => {
+            return finish_remote_cancelled(
+                &state,
+                &reservation,
+                &plan,
+                &events,
+                &mut messages,
+                &mut accepted,
+                &mut ready,
+                &mut active_stages,
+                &mut active_steps,
+            )
+            .await;
+        }
+        Err(error) => return Err(error),
+    }
+
+    for (sequence, data) in archive.bytes.chunks(MAX_WORKSPACE_CHUNK_BYTES).enumerate() {
+        let sequence = u32::try_from(sequence).map_err(|_| {
+            RemoteBuildError::WorkspaceArchive(
+                "workspace archive contains too many transfer chunks".into(),
+            )
+        })?;
+        match send_remote_message(
+            &state,
+            &reservation,
+            AgentMessage::WorkspaceChunk {
+                protocol_version: PROTOCOL_VERSION,
+                build_id: plan.build_id,
+                sequence,
+                data: data.to_vec(),
+            },
+            &cancellation,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(RemoteBuildError::Cancelled) => {
+                return finish_remote_cancelled(
+                    &state,
+                    &reservation,
+                    &plan,
+                    &events,
+                    &mut messages,
+                    &mut accepted,
+                    &mut ready,
+                    &mut active_stages,
+                    &mut active_steps,
+                )
+                .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let mut health_check = tokio::time::interval(Duration::from_secs(5));
+    health_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                return finish_remote_cancelled(
+                    &state,
+                    &reservation,
+                    &plan,
+                    &events,
+                    &mut messages,
+                    &mut accepted,
+                    &mut ready,
+                    &mut active_stages,
+                    &mut active_steps,
+                )
+                .await;
+            }
+            _ = health_check.tick() => {
+                if !state.agents.reservation_online(&reservation, Utc::now()).await {
+                    return Err(RemoteBuildError::AgentDisconnected(plan.build_id));
+                }
+            }
+            message = messages.recv() => {
+                let Some(message) = message else {
+                    return Err(RemoteBuildError::AgentDisconnected(plan.build_id));
+                };
+                match message {
+                    AgentMessage::AssignmentAccepted { build_id, .. } if build_id == plan.build_id => {
+                        accepted = true;
+                    }
+                    AgentMessage::WorkspaceReady { build_id, .. } if build_id == plan.build_id => {
+                        if !accepted {
+                            return Err(RemoteBuildError::InvalidEvent {
+                                build_id: plan.build_id,
+                                reason: "workspace ready arrived before assignment acceptance".into(),
+                            });
+                        }
+                        ready = true;
+                    }
+                    AgentMessage::Event { event, .. } => {
+                        validate_remote_event(&event, &plan, accepted, ready)?;
+                        track_remote_activity(&event, &mut active_stages, &mut active_steps);
+                        let terminal = matches!(event, BuildEvent::BuildFinished { .. });
+                        events.send(event).await.map_err(|_| RemoteBuildError::EventChannelClosed)?;
+                        if terminal {
+                            return Ok(());
+                        }
+                    }
+                    AgentMessage::Finished { build_id, status, timestamp, .. } if build_id == plan.build_id => {
+                        if !ready {
+                            return Err(RemoteBuildError::InvalidEvent {
+                                build_id: plan.build_id,
+                                reason: "legacy finished message arrived before workspace readiness".into(),
+                            });
+                        }
+                        events.send(BuildEvent::BuildFinished {
+                            build_id,
+                            status,
+                            timestamp,
+                        }).await.map_err(|_| RemoteBuildError::EventChannelClosed)?;
+                        return Ok(());
+                    }
+                    AgentMessage::Error { build_id: Some(build_id), code, message, .. } if build_id == plan.build_id => {
+                        return Err(RemoteBuildError::AgentRejected {
+                            build_id,
+                            code,
+                            message,
+                        });
+                    }
+                    AgentMessage::Log { build_id, .. } if build_id == plan.build_id => {
+                        return Err(RemoteBuildError::UnsupportedMessage(build_id));
+                    }
+                    AgentMessage::AssignmentAccepted { build_id, .. }
+                    | AgentMessage::WorkspaceReady { build_id, .. }
+                    | AgentMessage::Finished { build_id, .. }
+                    | AgentMessage::Error { build_id: Some(build_id), .. }
+                    | AgentMessage::Log { build_id, .. } => {
+                        return Err(RemoteBuildError::InvalidEvent {
+                            build_id: plan.build_id,
+                            reason: format!("message refers to unexpected build {build_id}"),
+                        });
+                    }
+                    AgentMessage::Error { build_id: None, code, message, .. } => {
+                        return Err(RemoteBuildError::AgentRejected {
+                            build_id: plan.build_id,
+                            code,
+                            message,
+                        });
+                    }
+                    _ => {
+                        return Err(RemoteBuildError::InvalidEvent {
+                            build_id: plan.build_id,
+                            reason: "agent sent a server-originated or unrelated message".into(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn send_remote_message(
+    state: &AppState,
+    reservation: &AgentReservation,
+    message: AgentMessage,
+    cancellation: &CancellationToken,
+) -> Result<(), RemoteBuildError> {
+    tokio::select! {
+        result = state.agents.send(reservation, message) => result.map_err(RemoteBuildError::Agent),
+        _ = cancellation.cancelled() => Err(RemoteBuildError::Cancelled),
+    }
+}
+
+async fn finish_remote_cancelled(
+    state: &AppState,
+    reservation: &AgentReservation,
+    plan: &ExecutionPlan,
+    events: &mpsc::Sender<BuildEvent>,
+    messages: &mut mpsc::Receiver<AgentMessage>,
+    accepted: &mut bool,
+    ready: &mut bool,
+    active_stages: &mut HashSet<rivet_core::StageId>,
+    active_steps: &mut HashSet<rivet_core::StepId>,
+) -> Result<(), RemoteBuildError> {
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        state.agents.send(
+            reservation,
+            AgentMessage::Cancel {
+                protocol_version: PROTOCOL_VERSION,
+                build_id: reservation.build_id,
+            },
+        ),
+    )
+    .await;
+
+    let grace = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(grace);
+    loop {
+        tokio::select! {
+            _ = &mut grace => break,
+            message = messages.recv() => {
+                let Some(message) = message else { break; };
+                match message {
+                    AgentMessage::AssignmentAccepted { build_id, .. } if build_id == plan.build_id => {
+                        *accepted = true;
+                    }
+                    AgentMessage::WorkspaceReady { build_id, .. } if build_id == plan.build_id => {
+                        *ready = *accepted;
+                    }
+                    AgentMessage::Event { event, .. } => {
+                        if validate_remote_event(&event, plan, *accepted, *ready).is_err() {
+                            continue;
+                        }
+                        track_remote_activity(&event, active_stages, active_steps);
+                        let terminal = matches!(event, BuildEvent::BuildFinished { .. });
+                        events.send(event).await.map_err(|_| RemoteBuildError::EventChannelClosed)?;
+                        if terminal {
+                            return Ok(());
+                        }
+                    }
+                    AgentMessage::Finished { build_id, status, timestamp, .. } if build_id == plan.build_id => {
+                        events.send(BuildEvent::BuildFinished {
+                            build_id,
+                            status,
+                            timestamp,
+                        }).await.map_err(|_| RemoteBuildError::EventChannelClosed)?;
+                        return Ok(());
+                    }
+                    AgentMessage::Error { .. } => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    for stage in &plan.stages {
+        for step in &stage.steps {
+            if active_steps.remove(&step.id) {
+                events
+                    .send(BuildEvent::StepFinished {
+                        build_id: plan.build_id,
+                        stage_id: stage.id,
+                        step_id: step.id,
+                        step_name: step.definition.name.clone(),
+                        status: rivet_core::StepStatus::Cancelled,
+                        exit_code: None,
+                        timestamp: Utc::now(),
+                    })
+                    .await
+                    .map_err(|_| RemoteBuildError::EventChannelClosed)?;
+            }
+        }
+        if active_stages.remove(&stage.id) {
+            events
+                .send(BuildEvent::StageFinished {
+                    build_id: plan.build_id,
+                    stage_id: stage.id,
+                    stage_name: stage.name.clone(),
+                    status: rivet_core::StageStatus::Cancelled,
+                    timestamp: Utc::now(),
+                })
+                .await
+                .map_err(|_| RemoteBuildError::EventChannelClosed)?;
+        }
+    }
+    events
+        .send(BuildEvent::BuildCancelled {
+            build_id: plan.build_id,
+            timestamp: Utc::now(),
+        })
+        .await
+        .map_err(|_| RemoteBuildError::EventChannelClosed)?;
+    events
+        .send(BuildEvent::BuildFinished {
+            build_id: plan.build_id,
+            status: BuildStatus::Cancelled,
+            timestamp: Utc::now(),
+        })
+        .await
+        .map_err(|_| RemoteBuildError::EventChannelClosed)?;
+    Ok(())
+}
+
+fn track_remote_activity(
+    event: &BuildEvent,
+    active_stages: &mut HashSet<rivet_core::StageId>,
+    active_steps: &mut HashSet<rivet_core::StepId>,
+) {
+    match event {
+        BuildEvent::StageStarted { stage_id, .. } => {
+            active_stages.insert(*stage_id);
+        }
+        BuildEvent::StageFinished { stage_id, .. } => {
+            active_stages.remove(stage_id);
+        }
+        BuildEvent::StepStarted { step_id, .. } => {
+            active_steps.insert(*step_id);
+        }
+        BuildEvent::StepFinished { step_id, .. } => {
+            active_steps.remove(step_id);
+        }
+        _ => {}
+    }
+}
+
+fn validate_remote_event(
+    event: &BuildEvent,
+    plan: &ExecutionPlan,
+    accepted: bool,
+    ready: bool,
+) -> Result<(), RemoteBuildError> {
+    let build_id = build_id_from_event(event);
+    if build_id != plan.build_id {
+        return Err(RemoteBuildError::InvalidEvent {
+            build_id: plan.build_id,
+            reason: format!("event refers to unexpected build {build_id}"),
+        });
+    }
+    if !accepted {
+        return Err(RemoteBuildError::InvalidEvent {
+            build_id: plan.build_id,
+            reason: "event arrived before assignment acceptance".into(),
+        });
+    }
+    if matches!(event, BuildEvent::BuildQueued { .. }) {
+        return Err(RemoteBuildError::InvalidEvent {
+            build_id: plan.build_id,
+            reason: "build queued is server-owned".into(),
+        });
+    }
+    if !ready {
+        return Err(RemoteBuildError::InvalidEvent {
+            build_id: plan.build_id,
+            reason: "event arrived before workspace readiness".into(),
+        });
+    }
+    match event {
+        BuildEvent::StageStarted { stage_id, .. } | BuildEvent::StageFinished { stage_id, .. } => {
+            if !plan.stages.iter().any(|stage| stage.id == *stage_id) {
+                return Err(RemoteBuildError::InvalidEvent {
+                    build_id: plan.build_id,
+                    reason: format!("unknown stage {stage_id}"),
+                });
+            }
+        }
+        BuildEvent::StepStarted {
+            stage_id, step_id, ..
+        }
+        | BuildEvent::StepOutput {
+            stage_id, step_id, ..
+        }
+        | BuildEvent::StepFinished {
+            stage_id, step_id, ..
+        } => {
+            let valid_step = plan
+                .stages
+                .iter()
+                .find(|stage| stage.id == *stage_id)
+                .is_some_and(|stage| stage.steps.iter().any(|step| step.id == *step_id));
+            if !valid_step {
+                return Err(RemoteBuildError::InvalidEvent {
+                    build_id: plan.build_id,
+                    reason: format!("unknown step {step_id} in stage {stage_id}"),
+                });
+            }
+        }
+        BuildEvent::BuildStarted { .. }
+        | BuildEvent::BuildFinished { .. }
+        | BuildEvent::BuildCancelled { .. } => {}
+        BuildEvent::BuildQueued { .. } => unreachable!("queued events are rejected above"),
+    }
+    Ok(())
 }
 
 fn finalize_artifacts(

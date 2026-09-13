@@ -2,20 +2,25 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use rivet_agent_protocol::{
-    AgentCapabilities, AgentHeartbeat, AgentId, AgentMessage, AgentRegistration, PROTOCOL_VERSION,
+    AgentCapabilities, AgentHeartbeat, AgentId, AgentMessage, AgentRegistration,
+    MAX_WORKSPACE_CHUNK_BYTES, PROTOCOL_VERSION,
 };
 use rivet_core::{
     BuildEvent, BuildStatus, CronExpression, ExecutionPlan, LogStream, Pipeline, Project,
     ScheduleId, SourceSnapshot,
 };
 use rivet_migration::{analyze_jenkinsfile_file, generate_rivetfile_draft_file};
+use rivet_runner::execute_pipeline_with_parameters;
 use rivet_runner::{QueueHandle, Scheduler};
 use rivet_scm::{GitPrepareOptions, GitRepository, ScmError};
 use rivet_storage::Storage;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use tar::Archive;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_tungstenite::connect_async;
@@ -23,6 +28,9 @@ use tokio_tungstenite::tungstenite::Message as AgentSocketMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_util::sync::CancellationToken;
+
+type AgentSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 const SAMPLE_PIPELINE: &str = r#"version = 1
 name = "sample"
@@ -112,7 +120,7 @@ enum Command {
         #[command(subcommand)]
         command: AnalyzeCommand,
     },
-    /// Connect this machine to a Rivet server as a heartbeat-only agent.
+    /// Connect this machine to a Rivet server as a build agent.
     Agent(AgentArgs),
 }
 
@@ -210,6 +218,9 @@ struct AgentArgs {
     /// Read a Bearer token from a private file without persisting it.
     #[arg(long)]
     token_file: Option<PathBuf>,
+    /// Exact local parent directory used for one build workspace at a time.
+    #[arg(long, default_value_os_t = default_agent_workspace_root())]
+    workspace_root: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -312,6 +323,12 @@ enum AgentSessionResult {
     Disconnected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentAssignmentResult {
+    Complete { sequence: u64 },
+    Stopped,
+}
+
 async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
     let agent_id = args.id.unwrap_or_else(uuid::Uuid::new_v4);
     let registration = AgentRegistration {
@@ -347,7 +364,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                eprintln!("Stopping agent heartbeat...");
+                eprintln!("Stopping agent...");
                 break;
             }
             _ = tokio::time::sleep(reconnect_delay) => {}
@@ -400,11 +417,12 @@ async fn run_agent_session(
     );
     let mut sequence = 0;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    let mut running = Vec::new();
     let mut session_result = AgentSessionResult::Disconnected;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                eprintln!("Stopping agent heartbeat...");
+                eprintln!("Stopping agent...");
                 session_result = AgentSessionResult::Stopped;
                 break;
             }
@@ -417,7 +435,7 @@ async fn run_agent_session(
                         agent_id: registration.agent_id,
                         session_id,
                         sequence,
-                        running: Vec::new(),
+                        running: running.clone(),
                         sent_at: Utc::now(),
                     }),
                 ).await?;
@@ -430,23 +448,49 @@ async fn run_agent_session(
                     }
                     AgentSocketMessage::Pong(_) => {}
                     AgentSocketMessage::Close(_) => break,
-                    message => match decode_agent_socket_message(message)? {
-                        AgentMessage::HeartbeatAck { .. } => {}
-                        AgentMessage::Error { code, message, .. } => {
-                            return Err(format!("agent connection error ({code}): {message}").into());
+                    message => {
+                        let decoded = decode_agent_socket_message(message)?;
+                        match &decoded {
+                            AgentMessage::HeartbeatAck { .. } => {}
+                            AgentMessage::Error { code, message, .. } => {
+                                return Err(format!("agent connection error ({code}): {message}").into());
+                            }
+                            AgentMessage::Assign { build_id, .. } => {
+                                let build_id = *build_id;
+                                running.push(build_id);
+                                let assignment = run_agent_assignment(
+                                    &mut socket,
+                                    registration,
+                                    session_id,
+                                    sequence,
+                                    decoded,
+                                    &args.workspace_root,
+                                ).await;
+                                match assignment {
+                                    Ok(AgentAssignmentResult::Complete { sequence: next }) => {
+                                        sequence = next;
+                                        running.retain(|running_build| *running_build != build_id);
+                                    }
+                                    Ok(AgentAssignmentResult::Stopped) => {
+                                        session_result = AgentSessionResult::Stopped;
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        running.retain(|running_build| *running_build != build_id);
+                                        send_agent_socket_message(
+                                            &mut socket,
+                                            AgentMessage::Error {
+                                                protocol_version: PROTOCOL_VERSION,
+                                                build_id: Some(build_id),
+                                                code: "assignment_failed".into(),
+                                                message: error.to_string(),
+                                            },
+                                        ).await?;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        AgentMessage::Assign { .. } => {
-                            send_agent_socket_message(
-                                &mut socket,
-                                AgentMessage::Error {
-                                    protocol_version: PROTOCOL_VERSION,
-                                    code: "assignment_not_supported".into(),
-                                    message: "this heartbeat-only client cannot execute remote assignments".into(),
-                                },
-                            ).await?;
-                            break;
-                        }
-                        _ => {}
                     },
                 }
             }
@@ -456,10 +500,361 @@ async fn run_agent_session(
     Ok(session_result)
 }
 
+async fn run_agent_assignment(
+    socket: &mut AgentSocket,
+    registration: &AgentRegistration,
+    session_id: uuid::Uuid,
+    mut sequence: u64,
+    assignment: AgentMessage,
+    workspace_root: &Path,
+) -> Result<AgentAssignmentResult, Box<dyn std::error::Error>> {
+    let AgentMessage::Assign {
+        build_id,
+        plan,
+        pipeline,
+        parameters,
+        workspace,
+        ..
+    } = assignment
+    else {
+        return Err("agent assignment handler received a non-assignment message".into());
+    };
+    workspace.validate()?;
+    fs::create_dir_all(workspace_root)?;
+    let build_workspace = workspace_root.join(build_id.to_string());
+    remove_exact_agent_path(&build_workspace)?;
+    fs::create_dir(&build_workspace)?;
+    let archive_path = workspace_root.join(format!("{build_id}.tar"));
+    remove_exact_agent_path(&archive_path)?;
+
+    send_agent_socket_message(
+        socket,
+        AgentMessage::AssignmentAccepted {
+            protocol_version: PROTOCOL_VERSION,
+            build_id,
+        },
+    )
+    .await?;
+
+    let transfer_result = receive_workspace_archive(
+        socket,
+        registration,
+        session_id,
+        &mut sequence,
+        build_id,
+        &workspace,
+        &archive_path,
+    )
+    .await;
+    if let Err(error) = transfer_result {
+        let _ = remove_exact_agent_path(&build_workspace);
+        let _ = remove_exact_agent_path(&archive_path);
+        return Err(error);
+    }
+    extract_workspace_archive(&archive_path, &build_workspace, workspace.file_count)?;
+    remove_exact_agent_path(&archive_path)?;
+    send_agent_socket_message(
+        socket,
+        AgentMessage::WorkspaceReady {
+            protocol_version: PROTOCOL_VERSION,
+            build_id,
+        },
+    )
+    .await?;
+
+    let mut execution_plan = plan;
+    let mut execution_pipeline = pipeline;
+    clear_remote_requirements(&mut execution_plan, &mut execution_pipeline);
+    let cancellation = CancellationToken::new();
+    let (event_sender, mut event_receiver) = mpsc::channel(512);
+    let execution = execute_pipeline_with_parameters(
+        &execution_plan,
+        &execution_pipeline,
+        &build_workspace,
+        &parameters,
+        cancellation.clone(),
+        event_sender,
+    );
+    tokio::pin!(execution);
+    let mut terminal_event_sent = false;
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        tokio::select! {
+            stop = tokio::signal::ctrl_c() => {
+                stop?;
+                let _ = remove_exact_agent_path(&build_workspace);
+                return Ok(AgentAssignmentResult::Stopped);
+            }
+            _ = heartbeat.tick() => {
+                sequence += 1;
+                send_agent_socket_message(
+                    socket,
+                    AgentMessage::Heartbeat(AgentHeartbeat {
+                        protocol_version: PROTOCOL_VERSION,
+                        agent_id: registration.agent_id,
+                        session_id,
+                        sequence,
+                        running: vec![build_id],
+                        sent_at: Utc::now(),
+                    }),
+                ).await?;
+            }
+            message = event_receiver.recv() => {
+                if let Some(event) = message {
+                    terminal_event_sent |= matches!(event, BuildEvent::BuildFinished { .. });
+                    send_agent_socket_message(
+                        socket,
+                        AgentMessage::Event {
+                            protocol_version: PROTOCOL_VERSION,
+                            event,
+                        },
+                    ).await?;
+                }
+            }
+            message = next_agent_message(socket) => {
+                let Some(message) = message? else {
+                    return Err("Rivet server closed the agent connection during a build".into());
+                };
+                match message {
+                    AgentMessage::Cancel { build_id: cancelled, .. } if cancelled == build_id => {
+                        cancellation.cancel();
+                    }
+                    AgentMessage::HeartbeatAck { .. } => {}
+                    AgentMessage::Error { code, message, .. } => {
+                        return Err(format!("Rivet server rejected build {build_id} ({code}): {message}").into());
+                    }
+                    _ => {
+                        return Err(format!("unexpected server message while running build {build_id}").into());
+                    }
+                }
+            }
+            result = &mut execution => {
+                while let Some(event) = event_receiver.recv().await {
+                    terminal_event_sent |= matches!(event, BuildEvent::BuildFinished { .. });
+                    send_agent_socket_message(
+                        socket,
+                        AgentMessage::Event {
+                            protocol_version: PROTOCOL_VERSION,
+                            event,
+                        },
+                    ).await?;
+                }
+                if let Err(error) = result {
+                    if !terminal_event_sent {
+                        send_agent_socket_message(
+                            socket,
+                            AgentMessage::Error {
+                                protocol_version: PROTOCOL_VERSION,
+                                build_id: Some(build_id),
+                                code: "execution_failed".into(),
+                                message: error.to_string(),
+                            },
+                        ).await?;
+                    }
+                }
+                remove_exact_agent_path(&build_workspace)?;
+                return Ok(AgentAssignmentResult::Complete { sequence });
+            }
+        }
+    }
+}
+
+async fn receive_workspace_archive(
+    socket: &mut AgentSocket,
+    registration: &AgentRegistration,
+    session_id: uuid::Uuid,
+    sequence: &mut u64,
+    build_id: uuid::Uuid,
+    transfer: &rivet_agent_protocol::WorkspaceTransfer,
+    archive_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = fs::File::create(archive_path)?;
+    let mut digest = Sha256::new();
+    let mut received_bytes = 0_u64;
+    let mut expected_sequence = 0_u32;
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        if received_bytes == transfer.total_bytes {
+            break;
+        }
+        tokio::select! {
+            stop = tokio::signal::ctrl_c() => {
+                stop?;
+                return Err("agent stopped while receiving a workspace".into());
+            }
+            _ = heartbeat.tick() => {
+                *sequence += 1;
+                send_agent_socket_message(
+                    socket,
+                    AgentMessage::Heartbeat(AgentHeartbeat {
+                        protocol_version: PROTOCOL_VERSION,
+                        agent_id: registration.agent_id,
+                        session_id,
+                        sequence: *sequence,
+                        running: vec![build_id],
+                        sent_at: Utc::now(),
+                    }),
+                ).await?;
+            }
+            message = next_agent_message(socket) => {
+                let Some(message) = message? else {
+                    return Err("Rivet server closed the agent connection during workspace transfer".into());
+                };
+                match message {
+                    AgentMessage::WorkspaceChunk { build_id: chunk_build, sequence: chunk_sequence, data, .. }
+                        if chunk_build == build_id => {
+                        if chunk_sequence != expected_sequence {
+                            return Err(format!("workspace chunk sequence {chunk_sequence} arrived; expected {expected_sequence}").into());
+                        }
+                        if data.len() > MAX_WORKSPACE_CHUNK_BYTES {
+                            return Err("workspace chunk exceeds the protocol limit".into());
+                        }
+                        received_bytes = received_bytes
+                            .checked_add(data.len() as u64)
+                            .ok_or("workspace transfer size overflow")?;
+                        if received_bytes > transfer.total_bytes {
+                            return Err("workspace transfer exceeded its declared size".into());
+                        }
+                        digest.update(&data);
+                        file.write_all(&data)?;
+                        expected_sequence = expected_sequence.checked_add(1).ok_or("workspace chunk sequence overflow")?;
+                    }
+                    AgentMessage::Cancel { build_id: cancelled, .. } if cancelled == build_id => {
+                        return Err("workspace transfer cancelled by the server".into());
+                    }
+                    AgentMessage::HeartbeatAck { .. } => {}
+                    AgentMessage::Error { code, message, .. } => {
+                        return Err(format!("Rivet server rejected workspace transfer ({code}): {message}").into());
+                    }
+                    _ => return Err(format!("unexpected server message while receiving workspace {build_id}").into()),
+                }
+            }
+        }
+    }
+    file.flush()?;
+    let actual = hex::encode(digest.finalize());
+    if actual != transfer.sha256 {
+        return Err(format!(
+            "workspace checksum mismatch: received {actual}, expected {}",
+            transfer.sha256
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn extract_workspace_archive(
+    archive_path: &Path,
+    destination: &Path,
+    expected_entries: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = fs::File::open(archive_path)?;
+    let mut archive = Archive::new(file);
+    let mut entries = 0_u32;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        entries = entries
+            .checked_add(1)
+            .ok_or("workspace entry count overflow")?;
+        if entries > rivet_agent_protocol::MAX_WORKSPACE_FILES {
+            return Err("workspace archive contains too many entries".into());
+        }
+        let path = entry.path()?.into_owned();
+        validate_archive_path(&path)?;
+        let target = destination.join(&path);
+        if entry.header().entry_type().is_dir() {
+            fs::create_dir_all(&target)?;
+        } else if entry.header().entry_type().is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            entry.unpack(&target)?;
+        } else {
+            return Err(format!(
+                "workspace archive contains unsupported entry: {}",
+                path.display()
+            )
+            .into());
+        }
+    }
+    if entries != expected_entries {
+        return Err(format!(
+            "workspace archive entry count {entries} does not match declared {expected_entries}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_archive_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!("workspace archive path is unsafe: {}", path.display()).into());
+    }
+    Ok(())
+}
+
+fn remove_exact_agent_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to remove symlink workspace path: {}",
+            path.display()
+        )
+        .into());
+    }
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn clear_remote_requirements(plan: &mut rivet_core::ExecutionPlan, pipeline: &mut Pipeline) {
+    for stage in &mut plan.stages {
+        for step in &mut stage.steps {
+            step.definition.agent = None;
+        }
+    }
+    for stage in &mut pipeline.stages {
+        for step in &mut stage.steps {
+            step.agent = None;
+        }
+    }
+}
+
+async fn next_agent_message(
+    socket: &mut AgentSocket,
+) -> Result<Option<AgentMessage>, Box<dyn std::error::Error>> {
+    loop {
+        let Some(message) = socket.next().await else {
+            return Ok(None);
+        };
+        match message? {
+            AgentSocketMessage::Ping(payload) => {
+                socket.send(AgentSocketMessage::Pong(payload)).await?;
+            }
+            AgentSocketMessage::Pong(_) => {}
+            AgentSocketMessage::Close(_) => return Ok(None),
+            message => return decode_agent_socket_message(message).map(Some),
+        }
+    }
+}
+
 async fn send_agent_socket_message(
-    socket: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    socket: &mut AgentSocket,
     message: AgentMessage,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let payload = serde_json::to_string(&message)?;
@@ -498,6 +893,10 @@ fn default_agent_os() -> String {
 
 fn default_agent_arch() -> String {
     std::env::consts::ARCH.to_owned()
+}
+
+fn default_agent_workspace_root() -> PathBuf {
+    std::env::temp_dir().join("rivet-agent-workspaces")
 }
 
 async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Error>> {

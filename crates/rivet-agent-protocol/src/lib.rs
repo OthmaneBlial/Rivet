@@ -24,9 +24,9 @@ const MAX_LABELS: usize = 64;
 const MAX_LABEL_BYTES: usize = 64;
 const MAX_RUNNING_BUILDS: usize = 256;
 const MAX_REQUIREMENT_VALUE_BYTES: usize = 64;
-const MAX_WORKSPACE_CHUNK_BYTES: usize = 128 * 1024;
-const MAX_WORKSPACE_FILES: u32 = 100_000;
-const MAX_WORKSPACE_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_WORKSPACE_CHUNK_BYTES: usize = 128 * 1024;
+pub const MAX_WORKSPACE_FILES: u32 = 100_000;
+pub const MAX_WORKSPACE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentCapabilities {
@@ -260,6 +260,8 @@ pub enum AgentMessage {
     },
     Error {
         protocol_version: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build_id: Option<BuildId>,
         code: String,
         message: String,
     },
