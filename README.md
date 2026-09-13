@@ -5,7 +5,7 @@ from Jenkins.
 
 ## Delivery progress
 
-**43% verified** · `█████████░░░░░░░░░░░`<br>
+**44% verified** · `█████████░░░░░░░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -14,7 +14,8 @@ and unverified work remains at zero until it passes its gate.
 Last verified update: **2026-09-13** · native pipeline execution, FIFO queue,
 SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
 inspection, persisted build-source identity, live queue telemetry, durable
-event replay, and quiet engine offline recovery milestone.
+event replay, quiet engine offline recovery, and explicit Git preparation at
+build admission milestone.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -71,9 +72,18 @@ The versioned API currently exposes health, projects, queued builds, build
 details, persisted logs, cancellation, a live queue snapshot, durable replay,
 and a per-build WebSocket event stream under `/api/v1/`. It also exposes Git repository inspection and an explicit
 prepare operation for fetch/checkout/clean workflows. The server returns
-`202 Accepted` when a build is queued;
-clients read its durable state from the build resource and subscribe to live
-events separately.
+`202 Accepted` when a build is queued. A build request may opt into Git
+fetching, revision checkout, and workspace cleaning; the default remains
+inspection-only. Clients read durable state from the build resource and
+subscribe to live events separately.
+
+The CLI exposes the same explicit SCM boundary, for example:
+
+```sh
+cargo run -p rivet -- run rivet --fetch --revision main --clean
+```
+
+Cleaning is never implicit.
 
 The first executable pipeline format is deliberately explicit:
 

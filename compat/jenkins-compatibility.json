@@ -58,8 +58,9 @@
     {
       "category": "SCM",
       "feature": "Git checkout and webhooks",
-      "status": "planned",
-      "evidence": []
+      "status": "partial",
+      "evidence": ["crates/rivet-scm/src/lib.rs", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
+      "notes": "Explicit local fetch, detached revision checkout, and clean preparation are supported at build admission; provider credentials and webhooks remain planned."
     },
     {
       "category": "Agents",
