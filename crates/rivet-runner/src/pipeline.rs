@@ -118,6 +118,7 @@ pub async fn execute_pipeline_with_parameters_and_cache(
     let mut first_error = None;
 
     while completed.len() < plan.stages.len() && !failed {
+        let mut made_progress = false;
         if cancellation.is_cancelled() {
             execution_cancellation.cancel();
         }
@@ -126,10 +127,26 @@ pub async fn execute_pipeline_with_parameters_and_cache(
                 if completed.contains_key(&stage.id) || running.contains(&stage.id) {
                     continue;
                 }
-                let dependencies_passed = stage.depends_on.iter().all(|dependency| {
-                    matches!(completed.get(dependency), Some(StageStatus::Passed))
+                let dependencies_complete = stage
+                    .depends_on
+                    .iter()
+                    .all(|dependency| completed.contains_key(dependency));
+                if !dependencies_complete {
+                    continue;
+                }
+                let dependencies_blocked = stage.depends_on.iter().any(|dependency| {
+                    !matches!(completed.get(dependency), Some(StageStatus::Passed))
                 });
-                if !dependencies_passed {
+                let condition_passed = pipeline
+                    .stages
+                    .iter()
+                    .find(|definition| definition.name == stage.name)
+                    .and_then(|definition| definition.condition.as_ref())
+                    .is_none_or(|condition| condition.evaluate(&parameters));
+                if dependencies_blocked || !condition_passed {
+                    send_stage_finished(plan, stage, StageStatus::Skipped, &events).await?;
+                    completed.insert(stage.id, StageStatus::Skipped);
+                    made_progress = true;
                     continue;
                 }
                 let stage_id = stage.id;
@@ -142,6 +159,7 @@ pub async fn execute_pipeline_with_parameters_and_cache(
                 let secret_values = secret_values.clone();
                 let stage_cancellation = execution_cancellation.clone();
                 let events = events.clone();
+                made_progress = true;
                 stage_tasks.spawn(async move {
                     let result = execute_stage(
                         &plan,
@@ -159,6 +177,9 @@ pub async fn execute_pipeline_with_parameters_and_cache(
             }
         }
 
+        if stage_tasks.is_empty() && made_progress {
+            continue;
+        }
         if stage_tasks.is_empty() {
             if cancellation.is_cancelled() {
                 break;
@@ -760,6 +781,80 @@ args = ["-c", "sleep 0.2; printf right > right.done"]
             "right"
         );
         while rx.recv().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn skips_conditioned_stages_and_dependents_without_running_steps() {
+        let dir = tempdir().expect("tempdir");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "conditional-run"
+[[parameters]]
+name = "DEPLOY"
+default = "false"
+[[stages]]
+name = "Deploy"
+[stages.condition]
+parameter = "DEPLOY"
+equals = "true"
+[[stages.steps]]
+name = "must-not-run"
+program = "sh"
+args = ["-c", "touch should-not-exist"]
+[[stages]]
+name = "Publish"
+depends_on = ["Deploy"]
+[[stages.steps]]
+name = "also-must-not-run"
+program = "sh"
+args = ["-c", "touch should-not-exist-either"]
+"#,
+        )
+        .expect("conditional pipeline");
+        let plan =
+            ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let (tx, mut rx) = mpsc::channel(64);
+        let status = execute_pipeline_with_parameters(
+            &plan,
+            &pipeline,
+            dir.path(),
+            &BTreeMap::from([(String::from("DEPLOY"), String::from("false"))]),
+            CancellationToken::new(),
+            tx,
+        )
+        .await
+        .expect("runner");
+
+        assert_eq!(status, BuildStatus::Passed);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    BuildEvent::StageFinished {
+                        stage_name, status, ..
+                    } => {
+                        Some((stage_name.as_str(), status.clone()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("Deploy", StageStatus::Skipped),
+                ("Publish", StageStatus::Skipped),
+            ]
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, BuildEvent::StepStarted { .. }))
+        );
+        assert!(!dir.path().join("should-not-exist").exists());
+        assert!(!dir.path().join("should-not-exist-either").exists());
     }
 
     #[tokio::test]

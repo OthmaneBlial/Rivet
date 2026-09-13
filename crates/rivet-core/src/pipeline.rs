@@ -16,6 +16,7 @@ const MAX_STEP_RETRY_DELAY_SECONDS: u64 = 300;
 const MAX_CONTAINER_IMAGE_BYTES: usize = 512;
 const MAX_CONTAINER_NETWORK_BYTES: usize = 128;
 const MAX_CONTAINER_VOLUMES: usize = 16;
+const MAX_STAGE_CONDITION_VALUE_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Pipeline {
@@ -72,7 +73,35 @@ pub struct Stage {
     /// stages while keeping the execution graph explicit.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// Optional deterministic gate evaluated against resolved build
+    /// parameters before the stage is admitted to the runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<StageCondition>,
     pub steps: Vec<Step>,
+}
+
+/// A deliberately small declarative stage gate. Arbitrary expressions and
+/// process execution are intentionally not part of the pipeline contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StageCondition {
+    pub parameter: String,
+    #[serde(default)]
+    pub equals: Option<String>,
+    #[serde(default)]
+    pub not_equals: Option<String>,
+}
+
+impl StageCondition {
+    pub fn evaluate(&self, parameters: &BTreeMap<String, String>) -> bool {
+        let actual = parameters.get(&self.parameter).map(String::as_str);
+        if let Some(expected) = self.equals.as_deref() {
+            return actual == Some(expected);
+        }
+        if let Some(expected) = self.not_equals.as_deref() {
+            return actual != Some(expected);
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -192,6 +221,12 @@ pub enum PipelineError {
     StageDependsOnSelf { stage: String },
     #[error("stage {stage:?} declares duplicate dependency {dependency:?}")]
     DuplicateStageDependency { stage: String, dependency: String },
+    #[error("stage {stage:?} declares an invalid condition")]
+    InvalidStageCondition { stage: String },
+    #[error("stage {stage:?} condition references unknown parameter {parameter:?}")]
+    UnknownStageConditionParameter { stage: String, parameter: String },
+    #[error("stage {stage:?} condition cannot inspect secret parameter {parameter:?}")]
+    SecretStageConditionParameter { stage: String, parameter: String },
     #[error("stage dependencies contain a cycle")]
     StageDependencyCycle,
     #[error("step {step:?} in stage {stage:?} cannot be empty")]
@@ -502,6 +537,43 @@ impl Pipeline {
             }
             if !stage_names.insert(stage.name.as_str()) {
                 return Err(PipelineError::DuplicateStage(stage.name.clone()));
+            }
+            if let Some(condition) = &stage.condition {
+                if !valid_parameter_name(&condition.parameter) {
+                    return Err(PipelineError::InvalidStageCondition {
+                        stage: stage.name.clone(),
+                    });
+                }
+                if !parameter_names.contains(condition.parameter.as_str()) {
+                    return Err(PipelineError::UnknownStageConditionParameter {
+                        stage: stage.name.clone(),
+                        parameter: condition.parameter.clone(),
+                    });
+                }
+                if self
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.name == condition.parameter && parameter.secret)
+                {
+                    return Err(PipelineError::SecretStageConditionParameter {
+                        stage: stage.name.clone(),
+                        parameter: condition.parameter.clone(),
+                    });
+                }
+                let condition_value = condition
+                    .equals
+                    .as_deref()
+                    .or(condition.not_equals.as_deref());
+                if condition.equals.is_some() == condition.not_equals.is_some()
+                    || condition_value.is_some_and(|value| {
+                        value.len() > MAX_STAGE_CONDITION_VALUE_BYTES
+                            || value.chars().any(char::is_control)
+                    })
+                {
+                    return Err(PipelineError::InvalidStageCondition {
+                        stage: stage.name.clone(),
+                    });
+                }
             }
 
             let mut step_names = std::collections::HashSet::new();
@@ -975,6 +1047,104 @@ program = "true"
         assert!(matches!(
             unknown,
             PipelineError::UnknownStageDependency { .. }
+        ));
+    }
+
+    #[test]
+    fn validates_and_evaluates_safe_stage_conditions() {
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "conditional"
+[[parameters]]
+name = "DEPLOY"
+default = "false"
+[[stages]]
+name = "Deploy"
+[stages.condition]
+parameter = "DEPLOY"
+equals = "true"
+[[stages.steps]]
+name = "deploy"
+program = "true"
+"#,
+        )
+        .expect("conditional pipeline");
+        let condition = pipeline.stages[0]
+            .condition
+            .as_ref()
+            .expect("stage condition");
+        assert!(!condition.evaluate(&BTreeMap::from([
+            ("DEPLOY".to_owned(), "false".to_owned(),)
+        ])));
+        assert!(condition.evaluate(&BTreeMap::from([("DEPLOY".to_owned(), "true".to_owned(),)])));
+
+        let both_operators = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "invalid-condition"
+[[parameters]]
+name = "DEPLOY"
+[[stages]]
+name = "Deploy"
+[stages.condition]
+parameter = "DEPLOY"
+equals = "true"
+not_equals = "false"
+[[stages.steps]]
+name = "deploy"
+program = "true"
+"#,
+        )
+        .expect_err("conditions must use one operator");
+        assert!(matches!(
+            both_operators,
+            PipelineError::InvalidStageCondition { stage } if stage == "Deploy"
+        ));
+
+        let unknown_parameter = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "unknown-condition"
+[[stages]]
+name = "Deploy"
+[stages.condition]
+parameter = "MISSING"
+equals = "true"
+[[stages.steps]]
+name = "deploy"
+program = "true"
+"#,
+        )
+        .expect_err("conditions must name a declared parameter");
+        assert!(matches!(
+            unknown_parameter,
+            PipelineError::UnknownStageConditionParameter { parameter, .. }
+                if parameter == "MISSING"
+        ));
+
+        let secret_parameter = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "secret-condition"
+[[parameters]]
+name = "TOKEN"
+secret = true
+[[stages]]
+name = "Deploy"
+[stages.condition]
+parameter = "TOKEN"
+equals = "true"
+[[stages.steps]]
+name = "deploy"
+program = "true"
+"#,
+        )
+        .expect_err("conditions must not inspect secret parameters");
+        assert!(matches!(
+            secret_parameter,
+            PipelineError::SecretStageConditionParameter { parameter, .. }
+                if parameter == "TOKEN"
         ));
     }
 

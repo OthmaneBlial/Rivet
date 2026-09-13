@@ -17,6 +17,6 @@ pub use model::{
 };
 pub use pipeline::{
     AgentRequirement, CacheSpec, ContainerPullPolicy, ContainerSpec, ContainerVolume,
-    ParameterSpec, Pipeline, PipelineError, REDACTED_PARAMETER_VALUE, Stage, Step,
+    ParameterSpec, Pipeline, PipelineError, REDACTED_PARAMETER_VALUE, Stage, StageCondition, Step,
 };
 pub use schedule::{CronExpression, CronExpressionError};

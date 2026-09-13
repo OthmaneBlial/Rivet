@@ -118,10 +118,10 @@ methods receive their original input unchanged.
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
 arrays, validated repository-scoped workspaces, dependency-checked stage DAGs,
-stable topological execution order, parallel independent stages, persisted
-domain-safe IDs, and typed build events. Conditional graph branches remain
-future work; this is not Jenkins parity and does not claim production readiness
-yet.
+stable topological execution order, parallel independent stages, deterministic
+parameter-gated stages with explicit `skipped` outcomes, persisted domain-safe
+IDs, and typed build events. Arbitrary expression conditions remain future
+work; this is not Jenkins parity and does not claim production readiness yet.
 
 ## Workspace
 
