@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.24 / 100** · displayed conservatively as the
+Weighted evidence score: **92.27 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -52,9 +52,12 @@ its SHA-256 identity. If the assigned
 agent disconnects, the server makes at most one replacement-agent attempt and
 closes unfinished steps, stages, and builds as failed when recovery is
 unavailable. Steps may also use a bounded, cancellation-aware retry policy
-shared by local and assigned-agent execution. On startup, persisted incomplete builds are reconciled
-idempotently so a crashed server cannot leave history stuck forever; resuming
-the same remote attempt after restart and cross-restart retry recovery remain
+shared by local and assigned-agent execution. On startup, persisted incomplete
+builds are reconciled idempotently so a crashed server cannot leave history
+stuck forever. Non-secret remote attempts additionally retain their plan and
+redacted parameters and are redispatched with the same build identity when a
+compatible agent returns; attempts that require secret values fail closed.
+Transport-level exactly-once delivery and cross-restart retry recovery remain
 future gates. Authenticated deployments persist bounded success/failure audit records
 without request bodies or Bearer values and expose them only to administrators.
 Server deployments can exchange an authenticated API token for a twelve-hour

@@ -275,6 +275,36 @@ impl AgentRegistry {
         })
     }
 
+    pub async fn reserve_for_agent(
+        &self,
+        requirements: &AgentRequirements,
+        build_id: rivet_core::BuildId,
+        agent_id: AgentId,
+        now: DateTime<Utc>,
+    ) -> Result<AgentReservation, AgentRegistryError> {
+        requirements.validate()?;
+        let mut agents = self.agents.write().await;
+        if agents
+            .values()
+            .any(|entry| entry.reserved.contains_key(&build_id))
+        {
+            return Err(AgentRegistryError::ReservationConflict(build_id));
+        }
+        let requested = requirements.requested_executors();
+        let entry = agents
+            .get_mut(&agent_id)
+            .filter(|entry| self.status(entry, now) == AgentStatus::Online)
+            .filter(|entry| entry.capabilities.supports(requirements))
+            .filter(|entry| available_executors(entry) >= requested)
+            .ok_or(AgentRegistryError::NoMatchingAgent)?;
+        entry.reserved.insert(build_id, requested);
+        Ok(AgentReservation {
+            agent_id,
+            session_id: entry.session_id,
+            build_id,
+        })
+    }
+
     pub async fn release(&self, reservation: &AgentReservation) -> bool {
         let mut agents = self.agents.write().await;
         let Some(entry) = agents.get_mut(&reservation.agent_id) else {
@@ -637,5 +667,34 @@ mod tests {
             .expect("released capacity");
         assert_eq!(second.agent_id, agent_id);
         assert_eq!(lease.session_id, first.session_id);
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_can_prefer_the_original_agent_session() {
+        let registry = AgentRegistry::default();
+        let now = Utc::now();
+        let preferred_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        registry
+            .register(registration(preferred_id), now)
+            .await
+            .expect("preferred agent");
+        registry
+            .register(registration(other_id), now)
+            .await
+            .expect("other agent");
+        let build_id = Uuid::new_v4();
+        let reservation = registry
+            .reserve_for_agent(&AgentRequirements::default(), build_id, preferred_id, now)
+            .await
+            .expect("preferred reservation");
+        assert_eq!(reservation.agent_id, preferred_id);
+        let preferred = registry
+            .list(now)
+            .await
+            .into_iter()
+            .find(|agent| agent.agent_id == preferred_id)
+            .expect("preferred summary");
+        assert_eq!(preferred.reserved, vec![build_id]);
     }
 }

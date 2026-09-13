@@ -233,6 +233,22 @@ pub struct AuthSessionRecord {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
+/// Durable metadata needed to re-dispatch a remote build after the server
+/// process is recreated. Parameter values are redacted according to the
+/// pipeline before they reach this record; a build containing secret
+/// parameters is therefore never resumed from this table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteAttemptRecord {
+    pub build_id: BuildId,
+    pub project_id: ProjectId,
+    pub agent_id: Uuid,
+    pub requirements_json: String,
+    pub plan: ExecutionPlan,
+    pub pipeline: Pipeline,
+    pub parameters: BTreeMap<String, String>,
+    pub created_at: DateTime<Utc>,
+}
+
 impl Storage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
@@ -308,6 +324,11 @@ impl Storage {
             &connection,
             10,
             Some(include_str!("../migrations/010_event_idempotency.sql")),
+        )?;
+        apply_migration(
+            &connection,
+            11,
+            Some(include_str!("../migrations/011_remote_attempts.sql")),
         )?;
         backfill_event_hashes(&connection)?;
         Ok(Self {
@@ -831,6 +852,75 @@ impl Storage {
         })
     }
 
+    /// Record the non-secret payload required to re-dispatch a remote build.
+    /// The build row must already exist; the foreign key makes a crashed
+    /// cleanup unable to leave an orphaned assignment record.
+    pub fn create_remote_attempt(
+        &self,
+        build_id: BuildId,
+        project_id: ProjectId,
+        agent_id: Uuid,
+        requirements_json: &str,
+        plan: &ExecutionPlan,
+        pipeline: &Pipeline,
+        parameters: &BTreeMap<String, String>,
+    ) -> Result<RemoteAttemptRecord, StorageError> {
+        let record = RemoteAttemptRecord {
+            build_id,
+            project_id,
+            agent_id,
+            requirements_json: requirements_json.to_owned(),
+            plan: plan.clone(),
+            pipeline: pipeline.clone(),
+            parameters: pipeline.redact_parameters(parameters),
+            created_at: Utc::now(),
+        };
+        let plan_json = serde_json::to_string(&record.plan)?;
+        let pipeline_json = serde_json::to_string(&record.pipeline)?;
+        let parameters_json = serde_json::to_string(&record.parameters)?;
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        connection.execute(
+            "INSERT INTO remote_attempts(
+                build_id, project_id, agent_id, requirements_json,
+                plan_json, pipeline_json, parameters_json, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                record.build_id.to_string(),
+                record.project_id.to_string(),
+                record.agent_id.to_string(),
+                &record.requirements_json,
+                plan_json,
+                pipeline_json,
+                parameters_json,
+                record.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(record)
+    }
+
+    pub fn list_remote_attempts(&self) -> Result<Vec<RemoteAttemptRecord>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT build_id, project_id, agent_id, requirements_json,
+                    plan_json, pipeline_json, parameters_json, created_at
+             FROM remote_attempts ORDER BY created_at ASC, build_id ASC",
+        )?;
+        let rows = statement.query_map([], raw_remote_attempt)?;
+        rows.map(|row| {
+            row.map_err(StorageError::from)
+                .and_then(parse_remote_attempt)
+        })
+        .collect()
+    }
+
+    pub fn delete_remote_attempt(&self, build_id: BuildId) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(connection.execute(
+            "DELETE FROM remote_attempts WHERE build_id = ?1",
+            params![build_id.to_string()],
+        )? == 1)
+    }
+
     pub fn apply_event(&self, event: &BuildEvent) -> Result<(), StorageError> {
         let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let transaction = connection.transaction()?;
@@ -974,9 +1064,22 @@ impl Storage {
         &self,
         timestamp: DateTime<Utc>,
     ) -> Result<Vec<BuildId>, StorageError> {
+        self.recover_incomplete_builds_except(timestamp, &BTreeSet::new())
+    }
+
+    /// Reconcile incomplete work while preserving explicitly durable remote
+    /// attempts for a server-level redispatcher.
+    pub fn recover_incomplete_builds_except(
+        &self,
+        timestamp: DateTime<Utc>,
+        preserved: &BTreeSet<BuildId>,
+    ) -> Result<Vec<BuildId>, StorageError> {
         let builds = self.list_incomplete_builds()?;
         let mut recovered = Vec::new();
         for build in builds {
+            if preserved.contains(&build.id) {
+                continue;
+            }
             let Some(details) = self.get_build_details(build.id)? else {
                 continue;
             };
@@ -1427,6 +1530,16 @@ type RawAuthSession = (
     String,
     Option<String>,
 );
+type RawRemoteAttempt = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
 fn validate_audit_field(value: &str, field: &'static str) -> Result<(), StorageError> {
     if value.trim().is_empty()
@@ -1537,6 +1650,32 @@ fn parse_auth_session(raw: RawAuthSession) -> Result<AuthSessionRecord, StorageE
         created_at: parse_timestamp(&raw.5)?,
         expires_at: parse_timestamp(&raw.6)?,
         revoked_at: raw.7.as_deref().map(parse_timestamp).transpose()?,
+    })
+}
+
+fn raw_remote_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRemoteAttempt> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+    ))
+}
+
+fn parse_remote_attempt(raw: RawRemoteAttempt) -> Result<RemoteAttemptRecord, StorageError> {
+    Ok(RemoteAttemptRecord {
+        build_id: parse_uuid(&raw.0)?,
+        project_id: parse_uuid(&raw.1)?,
+        agent_id: parse_uuid(&raw.2)?,
+        requirements_json: raw.3,
+        plan: serde_json::from_str(&raw.4)?,
+        pipeline: serde_json::from_str(&raw.5)?,
+        parameters: serde_json::from_str(&raw.6)?,
+        created_at: parse_timestamp(&raw.7)?,
     })
 }
 
@@ -2489,6 +2628,121 @@ program = "true"
             ),
             Err(StorageError::InvalidSessionRole)
         ));
+    }
+
+    #[test]
+    fn remote_attempts_survive_reopen_and_preserve_incomplete_builds() {
+        let directory = tempdir().expect("tempdir");
+        let database = directory.path().join("rivet.db");
+        let (project, pipeline, _) = fixture();
+        let storage = Storage::open(&database).expect("open");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let plan = ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), project.id);
+        let build = storage
+            .create_build(&project, &plan, &pipeline, None)
+            .expect("build");
+        storage
+            .apply_event(&BuildEvent::BuildQueued {
+                build_id: build.id,
+                project_id: project.id,
+                timestamp: Utc::now(),
+            })
+            .expect("queue build");
+        let agent_id = Uuid::new_v4();
+        let parameters = BTreeMap::from([("PROFILE".to_owned(), "release".to_owned())]);
+        let created = storage
+            .create_remote_attempt(
+                build.id,
+                project.id,
+                agent_id,
+                r#"{"os":"linux","executors":1}"#,
+                &plan,
+                &pipeline,
+                &parameters,
+            )
+            .expect("remote attempt");
+        assert_eq!(created.plan.build_id, plan.build_id);
+
+        drop(storage);
+        let reopened = Storage::open(&database).expect("reopen");
+        let attempts = reopened.list_remote_attempts().expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].build_id, build.id);
+        assert_eq!(attempts[0].agent_id, agent_id);
+        assert_eq!(attempts[0].parameters, parameters);
+        assert!(
+            reopened
+                .recover_incomplete_builds_except(Utc::now(), &BTreeSet::from([build.id]),)
+                .expect("preserve remote build")
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .get_build_details(build.id)
+                .expect("details")
+                .expect("build")
+                .build
+                .status,
+            BuildStatus::Queued
+        );
+        assert!(reopened.delete_remote_attempt(build.id).expect("delete"));
+        assert!(
+            reopened
+                .list_remote_attempts()
+                .expect("empty attempts")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn remote_attempts_never_persist_secret_parameter_values() {
+        let storage = Storage::open_in_memory().expect("storage");
+        let project = Project::new("secret-remote", ".", "Rivetfile.toml").expect("project");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "secret-remote"
+parameters = [{ name = "TOKEN", secret = true }]
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let plan = ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), project.id);
+        let build = storage
+            .create_build_with_parameters(
+                &project,
+                &plan,
+                &pipeline,
+                None,
+                &BTreeMap::from([("TOKEN".to_owned(), "do-not-store".to_owned())]),
+            )
+            .expect("build");
+        let record = storage
+            .create_remote_attempt(
+                build.id,
+                project.id,
+                Uuid::new_v4(),
+                r#"{"os":"linux"}"#,
+                &plan,
+                &pipeline,
+                &BTreeMap::from([("TOKEN".to_owned(), "do-not-store".to_owned())]),
+            )
+            .expect("remote attempt");
+        let serialized = serde_json::to_string(&record).expect("record JSON");
+        assert!(!serialized.contains("do-not-store"));
+        assert_eq!(
+            record.parameters.get("TOKEN").map(String::as_str),
+            Some(rivet_core::REDACTED_PARAMETER_VALUE)
+        );
     }
 
     #[test]

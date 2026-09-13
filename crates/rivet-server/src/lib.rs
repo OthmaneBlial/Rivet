@@ -38,8 +38,8 @@ use rivet_scm::{
     GitSshCredential, ScmError,
 };
 use rivet_storage::{
-    ArtifactRecord, AuditEventRecord, BuildDetails, BuildRecord, LogRecord, ScheduleRecord,
-    Storage, StorageError,
+    ArtifactRecord, AuditEventRecord, BuildDetails, BuildRecord, LogRecord, RemoteAttemptRecord,
+    ScheduleRecord, Storage, StorageError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -719,8 +719,26 @@ pub async fn serve_with_listener(
         .transpose()?
         .map(Arc::new);
     let storage = Storage::open(storage_path)?;
-    let recovered_builds = storage.recover_incomplete_builds(Utc::now())?;
+    let remote_attempts = storage.list_remote_attempts()?;
+    let mut resumable_remote_attempts = Vec::new();
+    let mut preserved_remote_builds = std::collections::BTreeSet::new();
+    for attempt in remote_attempts {
+        let details = storage.get_build_details(attempt.build_id)?;
+        let Some(details) = details else {
+            let _ = storage.delete_remote_attempt(attempt.build_id)?;
+            continue;
+        };
+        if details.build.status.is_terminal() || attempt.pipeline.has_secret_parameters() {
+            let _ = storage.delete_remote_attempt(attempt.build_id)?;
+            continue;
+        }
+        preserved_remote_builds.insert(attempt.build_id);
+        resumable_remote_attempts.push(attempt);
+    }
+    let recovered_builds =
+        storage.recover_incomplete_builds_except(Utc::now(), &preserved_remote_builds)?;
     for build_id in &recovered_builds {
+        let _ = storage.delete_remote_attempt(*build_id)?;
         tracing::warn!(
             %build_id,
             "reconciled an incomplete build left by a previous server process"
@@ -755,6 +773,7 @@ pub async fn serve_with_listener(
     tracing::info!(bind = %bind, "Rivet server listening");
     let shutdown = CancellationToken::new();
     spawn_schedule_dispatcher(state.clone(), shutdown.clone());
+    spawn_remote_recovery_dispatcher(state.clone(), resumable_remote_attempts, shutdown.clone());
     let result = axum::serve(listener, router_with_origins(state, &allowed_origins)?)
         .with_graceful_shutdown(wait_for_shutdown_signal())
         .await;
@@ -2412,6 +2431,146 @@ fn spawn_schedule_dispatcher(state: AppState, shutdown: CancellationToken) {
     });
 }
 
+fn spawn_remote_recovery_dispatcher(
+    state: AppState,
+    attempts: Vec<RemoteAttemptRecord>,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut pending = attempts
+            .into_iter()
+            .map(|attempt| (attempt.build_id, attempt))
+            .collect::<BTreeMap<_, _>>();
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = interval.tick() => {
+                    let build_ids = pending.keys().copied().collect::<Vec<_>>();
+                    for build_id in build_ids {
+                        let Some(attempt) = pending.get(&build_id).cloned() else {
+                            continue;
+                        };
+                        let details = match state.storage.get_build_details(build_id) {
+                            Ok(Some(details)) => details,
+                            Ok(None) => {
+                                pending.remove(&build_id);
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::error!(?error, %build_id, "could not inspect remote attempt during recovery");
+                                continue;
+                            }
+                        };
+                        if details.build.status.is_terminal() {
+                            if let Err(error) = state.storage.delete_remote_attempt(build_id) {
+                                tracing::warn!(?error, %build_id, "could not remove terminal remote attempt");
+                            }
+                            pending.remove(&build_id);
+                            continue;
+                        }
+                        if state.active_builds.lock().await.contains_key(&build_id) {
+                            continue;
+                        }
+                        let requirements = match serde_json::from_str::<AgentRequirements>(&attempt.requirements_json) {
+                            Ok(requirements) => requirements,
+                            Err(error) => {
+                                tracing::error!(?error, %build_id, "remote attempt requirements are invalid");
+                                continue;
+                            }
+                        };
+                        let reservation = match state
+                            .agents
+                            .reserve_for_agent(&requirements, build_id, attempt.agent_id, Utc::now())
+                            .await
+                        {
+                            Ok(reservation) => reservation,
+                            Err(AgentRegistryError::NoMatchingAgent) => match state
+                                .agents
+                                .reserve(&requirements, build_id, Utc::now())
+                                .await
+                            {
+                                Ok(reservation) => reservation,
+                                Err(AgentRegistryError::NoMatchingAgent) => continue,
+                                Err(error) => {
+                                    tracing::debug!(?error, %build_id, "no replacement agent is ready for remote recovery");
+                                    continue;
+                                }
+                            },
+                            Err(AgentRegistryError::ReservationConflict(_)) => continue,
+                            Err(error) => {
+                                tracing::debug!(?error, %build_id, "original agent is not ready for remote recovery");
+                                continue;
+                            }
+                        };
+                        let Some(project) = (match state.storage.get_project_by_id(attempt.project_id) {
+                            Ok(project) => project,
+                            Err(error) => {
+                                tracing::error!(?error, %build_id, "could not load project for remote recovery");
+                                None
+                            }
+                        }) else {
+                            state.agents.release(&reservation).await;
+                            continue;
+                        };
+                        let workspace = PathBuf::from(project.repository_path);
+                        if let Err(error) = attempt.pipeline.resolve_workspace(&workspace) {
+                            tracing::error!(?error, %build_id, "remote recovery workspace is no longer valid");
+                            state.agents.release(&reservation).await;
+                            continue;
+                        }
+                        if details.build.status == BuildStatus::Pending {
+                            if let Err(error) = state.storage.apply_event(&BuildEvent::BuildQueued {
+                                build_id,
+                                project_id: attempt.project_id,
+                                timestamp: Utc::now(),
+                            }) {
+                                tracing::error!(?error, %build_id, "could not queue recovered remote build");
+                                state.agents.release(&reservation).await;
+                                continue;
+                            }
+                        }
+                        let cancellation = CancellationToken::new();
+                        let already_active = state
+                            .active_builds
+                            .lock()
+                            .await
+                            .insert(build_id, cancellation.clone())
+                            .is_some();
+                        if already_active {
+                            state.agents.release(&reservation).await;
+                            continue;
+                        }
+                        let (events, received_events) = mpsc::channel(512);
+                        spawn_event_projector(
+                            state.storage.clone(),
+                            state.events.clone(),
+                            attempt.pipeline.clone(),
+                            workspace.clone(),
+                            false,
+                            received_events,
+                        );
+                        spawn_remote_build_task(
+                            state.clone(),
+                            reservation,
+                            requirements,
+                            attempt.plan.clone(),
+                            attempt.pipeline,
+                            workspace,
+                            attempt.parameters,
+                            cancellation,
+                            events,
+                            Some(details),
+                        );
+                        pending.remove(&build_id);
+                    }
+                }
+            }
+        }
+    });
+}
+
 async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
@@ -2669,6 +2828,11 @@ async fn enqueue_project_build(
     let parameters = pipeline.resolve_parameters(&request.parameters)?;
     let plan = ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), project.id);
     let remote_requirements = remote_agent_requirements(&pipeline)?;
+    let remote_requirements_json = remote_requirements
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| ApiError::BadRequest(format!("invalid remote requirements: {error}")))?;
     let remote_workspace = remote_requirements
         .as_ref()
         .map(|_| {
@@ -2704,6 +2868,26 @@ async fn enqueue_project_build(
             return Err(error.into());
         }
     };
+    if let Some(reservation) = reservation.as_ref() {
+        if let Err(error) = state.storage.create_remote_attempt(
+            plan.build_id,
+            plan.project_id,
+            reservation.agent_id,
+            remote_requirements_json
+                .as_deref()
+                .expect("serialized remote requirements"),
+            &plan,
+            &pipeline,
+            &parameters,
+        ) {
+            state.agents.release(reservation).await;
+            let _ = state.storage.apply_event(&BuildEvent::BuildCancelled {
+                build_id: plan.build_id,
+                timestamp: Utc::now(),
+            });
+            return Err(error.into());
+        }
+    }
     let cancellation = CancellationToken::new();
     state
         .active_builds
@@ -2711,31 +2895,15 @@ async fn enqueue_project_build(
         .await
         .insert(build.id, cancellation.clone());
 
-    let (events, mut received_events) = mpsc::channel(512);
-    let event_storage = state.storage.clone();
-    let event_bus = state.events.clone();
-    let artifact_pipeline = pipeline.clone();
-    let artifact_workspace = repository_root.clone();
-    let collect_local_artifacts = reservation.is_none();
-    tokio::spawn(async move {
-        while let Some(event) = received_events.recv().await {
-            let event = if collect_local_artifacts {
-                finalize_artifacts(
-                    &event_storage,
-                    &artifact_pipeline,
-                    &artifact_workspace,
-                    event,
-                )
-            } else {
-                event
-            };
-            if let Err(error) = event_storage.apply_event(&event) {
-                tracing::error!(?error, "could not project Rivet build event");
-                continue;
-            }
-            let _ = event_bus.send(event);
-        }
-    });
+    let (events, received_events) = mpsc::channel(512);
+    spawn_event_projector(
+        state.storage.clone(),
+        state.events.clone(),
+        pipeline.clone(),
+        repository_root.clone(),
+        reservation.is_none(),
+        received_events,
+    );
 
     if let Some(reservation) = reservation {
         events
@@ -2748,34 +2916,18 @@ async fn enqueue_project_build(
             .map_err(|_| ApiError::BadRequest("remote build event channel closed".into()))?;
         let requirements =
             remote_requirements.expect("a reservation exists only for remote requirements");
-        let remote_build_id = plan.build_id;
-        let remote_state = state.clone();
-        tokio::spawn(async move {
-            let result = run_remote_build_with_recovery(
-                remote_state.clone(),
-                reservation,
-                requirements,
-                plan,
-                pipeline.clone(),
-                remote_workspace.expect("remote workspace was resolved"),
-                parameters,
-                cancellation,
-                events.clone(),
-            )
-            .await;
-            if let Err(error) = result {
-                tracing::error!(
-                    ?error,
-                    build_id = %remote_build_id,
-                    "remote Rivet build failed before completion"
-                );
-            }
-            remote_state
-                .active_builds
-                .lock()
-                .await
-                .remove(&remote_build_id);
-        });
+        spawn_remote_build_task(
+            state.clone(),
+            reservation,
+            requirements,
+            plan,
+            pipeline,
+            remote_workspace.expect("remote workspace was resolved"),
+            parameters,
+            cancellation,
+            events,
+            None,
+        );
     } else {
         let handle = state
             .scheduler
@@ -2797,6 +2949,71 @@ async fn enqueue_project_build(
         build: response_build,
         status: BuildStatus::Queued,
     })
+}
+
+fn spawn_event_projector(
+    storage: Storage,
+    event_bus: broadcast::Sender<BuildEvent>,
+    pipeline: Pipeline,
+    workspace: PathBuf,
+    collect_local_artifacts: bool,
+    mut received_events: mpsc::Receiver<BuildEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = received_events.recv().await {
+            let event = if collect_local_artifacts {
+                finalize_artifacts(&storage, &pipeline, &workspace, event)
+            } else {
+                event
+            };
+            if let Err(error) = storage.apply_event(&event) {
+                tracing::error!(?error, "could not project Rivet build event");
+                continue;
+            }
+            let _ = event_bus.send(event);
+        }
+    });
+}
+
+fn spawn_remote_build_task(
+    state: AppState,
+    reservation: AgentReservation,
+    requirements: AgentRequirements,
+    plan: ExecutionPlan,
+    pipeline: Pipeline,
+    workspace: PathBuf,
+    parameters: BTreeMap<String, String>,
+    cancellation: CancellationToken,
+    events: mpsc::Sender<BuildEvent>,
+    resume_details: Option<BuildDetails>,
+) {
+    let build_id = plan.build_id;
+    tokio::spawn(async move {
+        let result = run_remote_build_with_recovery(
+            state.clone(),
+            reservation,
+            requirements,
+            plan,
+            pipeline,
+            workspace,
+            parameters,
+            cancellation,
+            events,
+            resume_details,
+        )
+        .await;
+        if let Err(error) = result {
+            tracing::error!(
+                ?error,
+                build_id = %build_id,
+                "remote Rivet build failed before completion"
+            );
+        }
+        if let Err(error) = state.storage.delete_remote_attempt(build_id) {
+            tracing::warn!(?error, build_id = %build_id, "could not delete remote attempt record");
+        }
+        state.active_builds.lock().await.remove(&build_id);
+    });
 }
 
 fn remote_agent_requirements(pipeline: &Pipeline) -> Result<Option<AgentRequirements>, ApiError> {
@@ -2869,12 +3086,36 @@ async fn run_remote_build_with_recovery(
     parameters: BTreeMap<String, String>,
     cancellation: CancellationToken,
     events: mpsc::Sender<BuildEvent>,
+    resume_details: Option<BuildDetails>,
 ) -> Result<(), RemoteBuildError> {
     let mut reservation = initial_reservation;
-    let mut suppress_build_started = false;
-    let mut active_stages = HashSet::new();
-    let mut active_steps = HashSet::new();
-    let mut build_started = false;
+    let mut suppress_build_started = resume_details
+        .as_ref()
+        .is_some_and(|details| details.build.status == BuildStatus::Running);
+    let mut active_stages = resume_details
+        .as_ref()
+        .map(|details| {
+            details
+                .stages
+                .iter()
+                .filter(|stage| stage.stage.status == rivet_core::StageStatus::Running)
+                .map(|stage| stage.stage.id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut active_steps = resume_details
+        .as_ref()
+        .map(|details| {
+            details
+                .stages
+                .iter()
+                .flat_map(|stage| stage.steps.iter())
+                .filter(|step| step.status == rivet_core::StepStatus::Running)
+                .map(|step| step.id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut build_started = suppress_build_started;
     for attempt in 0..=MAX_REMOTE_RECOVERY_ATTEMPTS {
         let (route_sender, received_messages) = mpsc::channel(1024);
         state.remote_messages.lock().await.insert(
@@ -3956,7 +4197,8 @@ mod tests {
     use chrono::TimeZone;
     use futures_util::{SinkExt, StreamExt};
     use rivet_agent_protocol::{
-        AgentCapabilities, AgentHeartbeat, AgentRegistration, AgentRequirements, PROTOCOL_VERSION,
+        AgentCapabilities, AgentHeartbeat, AgentMessage, AgentRegistration, AgentRequirements,
+        PROTOCOL_VERSION,
     };
     use rivet_auth::{ApiTokenRecord, AuthPolicyDocument, Role};
     use rivet_extension_protocol::{
@@ -4713,6 +4955,106 @@ mod tests {
         ));
         socket.close(None).await.expect("close");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_recovery_dispatcher_reuses_persisted_build_identity() {
+        let directory = tempdir().expect("workspace");
+        fs::write(directory.path().join("source.txt"), "source\n").expect("source");
+        let project = Project::new(
+            "remote-recovery",
+            directory.path().to_string_lossy().into_owned(),
+            "Rivetfile.toml",
+        )
+        .expect("project");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "remote-recovery"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+agent = { os = "macos", arch = "aarch64", labels = ["recovery"] }
+"#,
+        )
+        .expect("pipeline");
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let plan = ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), project.id);
+        let build = storage
+            .create_build(&project, &plan, &pipeline, None)
+            .expect("build");
+        storage
+            .apply_event(&BuildEvent::BuildQueued {
+                build_id: build.id,
+                project_id: project.id,
+                timestamp: Utc::now(),
+            })
+            .expect("queue build");
+        let requirements = AgentRequirements {
+            os: Some("macos".into()),
+            arch: Some("aarch64".into()),
+            labels: vec!["recovery".into()],
+            ..AgentRequirements::default()
+        };
+        let attempt = storage
+            .create_remote_attempt(
+                build.id,
+                project.id,
+                uuid::Uuid::new_v4(),
+                &serde_json::to_string(&requirements).expect("requirements JSON"),
+                &plan,
+                &pipeline,
+                &BTreeMap::new(),
+            )
+            .expect("remote attempt");
+        let state = AppState::new(storage);
+        let (outbound, mut received) = mpsc::channel(16);
+        state
+            .agents
+            .register_with_sender(
+                AgentRegistration {
+                    protocol_version: PROTOCOL_VERSION,
+                    agent_id: attempt.agent_id,
+                    name: "recovery-agent".into(),
+                    capabilities: AgentCapabilities {
+                        os: "macos".into(),
+                        arch: "aarch64".into(),
+                        docker: false,
+                        labels: vec!["recovery".into()],
+                        executors: 1,
+                    },
+                },
+                Utc::now(),
+                outbound,
+            )
+            .await
+            .expect("agent");
+        let shutdown = CancellationToken::new();
+        spawn_remote_recovery_dispatcher(state.clone(), vec![attempt.clone()], shutdown.clone());
+        let message = tokio::time::timeout(Duration::from_secs(2), received.recv())
+            .await
+            .expect("recovery assignment timeout")
+            .expect("recovery assignment");
+        let AgentMessage::Assign {
+            build_id: assigned_build,
+            plan: assigned_plan,
+            ..
+        } = message
+        else {
+            panic!("expected a recovery assignment");
+        };
+        assert_eq!(assigned_build, build.id);
+        assert_eq!(assigned_plan, attempt.plan);
+
+        shutdown.cancel();
+        if let Some(cancellation) = state.active_builds.lock().await.remove(&build.id) {
+            cancellation.cancel();
+        }
     }
 
     #[tokio::test]
