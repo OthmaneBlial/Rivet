@@ -10,7 +10,7 @@ use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
@@ -23,7 +23,7 @@ use rivet_core::{
     BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, Pipeline, Project, ScheduleId,
     SourceSnapshot,
 };
-use rivet_credentials::{CredentialError, CredentialVault};
+use rivet_credentials::{CredentialError, CredentialSummary, CredentialVault};
 use rivet_extension_protocol::{ExtensionCatalog, ExtensionCatalogError, ExtensionManifest};
 use rivet_runner::{MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHandle, QueueStats, Scheduler};
 use rivet_scm::{GitHttpCredential, GitPrepareOptions, GitRepository, GitSnapshot, ScmError};
@@ -75,7 +75,7 @@ pub struct AppState {
     gitlab_webhook_secret: Option<Vec<u8>>,
     github_webhook_credential_id: Option<String>,
     gitlab_webhook_credential_id: Option<String>,
-    credentials: Option<Arc<CredentialVault>>,
+    credentials: Option<Arc<Mutex<CredentialVault>>>,
     extensions: Arc<ExtensionCatalog>,
     agents: AgentRegistry,
     remote_messages: Arc<Mutex<HashMap<BuildId, RemoteBuildRoute>>>,
@@ -152,6 +152,10 @@ enum ApiError {
     ArtifactNotFound(uuid::Uuid),
     #[error("could not read artifact: {0}")]
     ArtifactRead(#[source] std::io::Error),
+    #[error("credential vault is not configured")]
+    CredentialsUnavailable,
+    #[error(transparent)]
+    Credentials(#[from] CredentialError),
     #[error("{0}")]
     BadRequest(String),
     #[error("permission denied: {0}")]
@@ -206,6 +210,22 @@ impl IntoResponse for ApiError {
             Self::WebhookEventConflict => StatusCode::CONFLICT,
             Self::ArtifactNotFound(_) => StatusCode::NOT_FOUND,
             Self::ArtifactRead(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::CredentialsUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Credentials(error) => match error {
+                CredentialError::CredentialNotFound(_) => StatusCode::NOT_FOUND,
+                CredentialError::InvalidId(_)
+                | CredentialError::InvalidUsername
+                | CredentialError::EmptySecret
+                | CredentialError::WeakPassphrase => StatusCode::BAD_REQUEST,
+                CredentialError::SymlinkPath(_)
+                | CredentialError::VaultNotFound(_)
+                | CredentialError::VaultNotAFile(_)
+                | CredentialError::InvalidFormat(_)
+                | CredentialError::Cryptography
+                | CredentialError::Randomness(_)
+                | CredentialError::Serialization(_)
+                | CredentialError::Filesystem(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            },
             Self::Scm(error) => match error {
                 rivet_scm::ScmError::InvalidRepository(_)
                 | rivet_scm::ScmError::NotGitRepository(_)
@@ -268,6 +288,12 @@ pub struct CreateScheduleRequest {
 #[derive(Debug, Deserialize)]
 pub struct UpdateScheduleRequest {
     pub enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct CredentialWriteRequest {
+    username: String,
+    secret: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -347,6 +373,11 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
         .route("/api/v1/health", get(health))
         .route("/api/v1/auth/me", get(auth_me))
         .route("/api/v1/audit", get(list_audit))
+        .route("/api/v1/credentials", get(list_credentials))
+        .route(
+            "/api/v1/credentials/{id}",
+            put(set_credential).delete(delete_credential),
+        )
         .route("/api/v1/extensions", get(list_extensions))
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/agents/match", post(match_agents))
@@ -506,10 +537,9 @@ async fn prepare_scm(
             "an SCM fetch_ref requires fetch=true".into(),
         ));
     }
-    let credential = resolve_git_credential(
-        state.credentials.as_deref(),
-        request.credential_id.as_deref(),
-    )?;
+    let credential =
+        resolve_git_credential(state.credentials.as_ref(), request.credential_id.as_deref())
+            .await?;
     Ok(Json(
         repository
             .prepare_with_credential(
@@ -582,7 +612,9 @@ pub async fn serve_with_listener(
         config.credentials_file.as_ref(),
         config.credentials_passphrase.as_deref(),
     ) {
-        (Some(path), Some(passphrase)) => Some(Arc::new(CredentialVault::open(path, passphrase)?)),
+        (Some(path), Some(passphrase)) => Some(Arc::new(Mutex::new(CredentialVault::open(
+            path, passphrase,
+        )?))),
         (None, None) => None,
         _ => return Err(ServerError::IncompleteCredentialVaultConfig),
     };
@@ -765,7 +797,7 @@ impl AppState {
         storage: Storage,
         token: Option<&str>,
         webhook_secret: Option<&str>,
-        credentials: Option<Arc<CredentialVault>>,
+        credentials: Option<Arc<Mutex<CredentialVault>>>,
     ) -> Self {
         let mut state = Self::new(storage);
         state.auth_digest = token.map(|token| hash_token(token.as_bytes()));
@@ -782,6 +814,73 @@ async fn auth_me(Extension(principal): Extension<Principal>) -> Json<AuthMeRespo
         role: principal.role(),
         projects: principal.projects().map(str::to_owned).collect(),
     })
+}
+
+fn configured_credentials(state: &AppState) -> Result<&Arc<Mutex<CredentialVault>>, ApiError> {
+    state
+        .credentials
+        .as_ref()
+        .ok_or(ApiError::CredentialsUnavailable)
+}
+
+async fn list_credentials(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<CredentialSummary>>, ApiError> {
+    require_global(&principal, Permission::Administer)?;
+    let vault = configured_credentials(&state)?;
+    Ok(Json(vault.lock().await.list()))
+}
+
+async fn set_credential(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<CredentialWriteRequest>,
+) -> Result<Json<CredentialSummary>, ApiError> {
+    require_global(&principal, Permission::Administer)?;
+    let vault = configured_credentials(&state)?;
+    let mut vault = vault.lock().await;
+    vault.set_http_basic(id.clone(), request.username, request.secret)?;
+    let summary = vault
+        .list()
+        .into_iter()
+        .find(|credential| credential.id == id)
+        .ok_or_else(|| ApiError::BadRequest("credential was not persisted".into()))?;
+    record_credential_audit(&state.storage, principal.id(), &id, "set");
+    Ok(Json(summary))
+}
+
+async fn delete_credential(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
+) -> Result<StatusCode, ApiError> {
+    require_global(&principal, Permission::Administer)?;
+    let vault = configured_credentials(&state)?;
+    vault.lock().await.remove(&id)?;
+    record_credential_audit(&state.storage, principal.id(), &id, "remove");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn record_credential_audit(
+    storage: &Storage,
+    actor_id: &str,
+    credential_id: &str,
+    operation: &str,
+) {
+    if let Err(error) = storage.append_audit_event(
+        Utc::now(),
+        Some(actor_id),
+        "credentials.manage",
+        credential_id,
+        operation,
+    ) {
+        tracing::warn!(
+            ?error,
+            "could not persist credential management audit event"
+        );
+    }
 }
 
 async fn list_audit(
@@ -2171,7 +2270,7 @@ async fn enqueue_project_build(
     let source = capture_source_snapshot(
         &repository_root,
         request.scm.as_ref(),
-        state.credentials.as_deref(),
+        state.credentials.as_ref(),
     )
     .await?;
     let pipeline = Pipeline::load(&project.pipeline_path)?;
@@ -3228,7 +3327,7 @@ fn finalize_artifacts(
 async fn capture_source_snapshot(
     path: &Path,
     prepare: Option<&PrepareScmRequest>,
-    credentials: Option<&CredentialVault>,
+    credentials: Option<&Arc<Mutex<CredentialVault>>>,
 ) -> Result<Option<SourceSnapshot>, ApiError> {
     match GitRepository::open(path).await {
         Ok(repository) => {
@@ -3245,7 +3344,8 @@ async fn capture_source_snapshot(
                         ));
                     }
                     let credential =
-                        resolve_git_credential(credentials, request.credential_id.as_deref())?;
+                        resolve_git_credential(credentials, request.credential_id.as_deref())
+                            .await?;
                     repository
                         .prepare_with_credential(
                             &GitPrepareOptions {
@@ -3277,8 +3377,8 @@ async fn capture_source_snapshot(
     }
 }
 
-fn resolve_git_credential(
-    credentials: Option<&CredentialVault>,
+async fn resolve_git_credential(
+    credentials: Option<&Arc<Mutex<CredentialVault>>>,
     credential_id: Option<&str>,
 ) -> Result<Option<GitHttpCredential>, ApiError> {
     let Some(credential_id) = credential_id else {
@@ -3292,6 +3392,7 @@ fn resolve_git_credential(
     let vault = credentials.ok_or_else(|| {
         ApiError::BadRequest("this server has no configured SCM credential vault".into())
     })?;
+    let vault = vault.lock().await;
     let credential = vault.get(credential_id).map_err(|error| {
         ApiError::BadRequest(format!("could not resolve SCM credential: {error}"))
     })?;
@@ -4010,6 +4111,106 @@ mod tests {
             event.action == "auth.authenticate"
                 && event.outcome == "success"
                 && event.actor_id.as_deref() == Some("legacy-token")
+        }));
+    }
+
+    #[tokio::test]
+    async fn admin_credential_api_rotates_without_returning_secrets() {
+        let directory = tempdir().expect("tempdir");
+        let vault_path = directory.path().join("credentials.vault");
+        let vault = CredentialVault::open_or_create(&vault_path, "credential-api-passphrase")
+            .expect("vault");
+        let storage = Storage::open_in_memory().expect("storage");
+        let mut state = AppState::new(storage.clone());
+        state.credentials = Some(Arc::new(Mutex::new(vault)));
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/credentials")
+                    .body(Body::empty())
+                    .expect("list request"),
+            )
+            .await
+            .expect("list response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let initial = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("initial body");
+        assert_eq!(&initial[..], b"[]");
+
+        let put = |secret: &'static str| {
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/credentials/github")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"username":"oauth2","secret":"{secret}"}}"#
+                )))
+                .expect("credential request")
+        };
+        let response = router(state.clone())
+            .oneshot(put("first-secret"))
+            .await
+            .expect("credential response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("credential body");
+        let summary: serde_json::Value = serde_json::from_slice(&body).expect("summary JSON");
+        assert_eq!(summary["id"], "github");
+        assert_eq!(summary["username"], "oauth2");
+        assert!(
+            !body
+                .windows(b"first-secret".len())
+                .any(|window| { window == b"first-secret" })
+        );
+
+        let response = router(state.clone())
+            .oneshot(put("rotated-secret"))
+            .await
+            .expect("rotation response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("rotation body");
+        assert!(
+            !body
+                .windows(b"rotated-secret".len())
+                .any(|window| { window == b"rotated-secret" })
+        );
+        let stored = state
+            .credentials
+            .as_ref()
+            .expect("configured vault")
+            .lock()
+            .await
+            .get("github")
+            .expect("rotated credential");
+        assert_eq!(stored.secret(), "rotated-secret");
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/credentials/github")
+                    .body(Body::empty())
+                    .expect("delete request"),
+            )
+            .await
+            .expect("delete response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let events = storage.list_audit_events(10).expect("audit events");
+        assert!(events.iter().any(|event| {
+            event.action == "credentials.manage"
+                && event.resource == "github"
+                && event.outcome == "set"
+        }));
+        assert!(events.iter().any(|event| {
+            event.action == "credentials.manage"
+                && event.resource == "github"
+                && event.outcome == "remove"
         }));
     }
 

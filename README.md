@@ -350,8 +350,13 @@ credential ID, for example `{ "remote": "origin", "fetch": true,
 validated `fetch_ref`. Rivet resolves the ID locally, passes HTTP
 Basic auth to the Git child process through ephemeral configuration, and
 redacts the secret and encoded header from command errors. The vault stores
-authenticated ciphertext only; credential rotation, keychain integration, and
-project-level access control remain future gates.
+authenticated ciphertext only. When the server is configured with the vault,
+administrators can manage its lifecycle through `GET /api/v1/credentials`,
+`PUT /api/v1/credentials/<id>`, and `DELETE /api/v1/credentials/<id>`.
+Responses contain only IDs and usernames; replacement and removal require the
+administrator permission and append a bounded audit event without recording
+the secret. Keychain integration and project-level access control remain
+future gates.
 
 The same `--credential-id`, `--credentials-file`, and
 `--credentials-passphrase-file` flags can be passed to `rivet run` when a
