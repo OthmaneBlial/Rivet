@@ -28,6 +28,8 @@ const MAX_ID_BYTES: usize = 64;
 const MAX_USERNAME_BYTES: usize = 256;
 const MAX_PROJECT_BYTES: usize = 256;
 const MAX_PROJECTS: usize = 64;
+const MAX_KEYCHAIN_LABEL_BYTES: usize = 256;
+pub const DEFAULT_KEYCHAIN_SERVICE: &str = "Rivet";
 
 #[derive(Debug, Error)]
 pub enum CredentialError {
@@ -47,6 +49,8 @@ pub enum CredentialError {
     InvalidProject(String),
     #[error("credential project scope contains too many projects")]
     TooManyProjects,
+    #[error("keychain {0} is empty or too long")]
+    InvalidKeychainLabel(&'static str),
     #[error("credential secret cannot be empty")]
     EmptySecret,
     #[error("credential was not found: {0}")]
@@ -61,6 +65,58 @@ pub enum CredentialError {
     Serialization(#[from] serde_json::Error),
     #[error("credential vault filesystem operation failed: {0}")]
     Filesystem(#[from] std::io::Error),
+    #[error("OS keychain operation failed: {0}")]
+    Keychain(String),
+}
+
+/// Small OS-backed secret store used for vault passphrases. The passphrase is
+/// never placed in command-line arguments or Rivet configuration files.
+pub struct CredentialKeychain {
+    service: String,
+}
+
+impl CredentialKeychain {
+    pub fn new(service: impl Into<String>) -> Result<Self, CredentialError> {
+        let service = service.into();
+        validate_keychain_label(&service, "service")?;
+        Ok(Self { service })
+    }
+
+    pub fn rivet() -> Self {
+        Self {
+            service: DEFAULT_KEYCHAIN_SERVICE.to_owned(),
+        }
+    }
+
+    pub fn set_passphrase(&self, account: &str, passphrase: &str) -> Result<(), CredentialError> {
+        validate_keychain_label(account, "account")?;
+        validate_passphrase(passphrase.as_bytes())?;
+        let entry = keyring::Entry::new(&self.service, account)
+            .map_err(|error| CredentialError::Keychain(error.to_string()))?;
+        entry
+            .set_password(passphrase)
+            .map_err(|error| CredentialError::Keychain(error.to_string()))
+    }
+
+    pub fn get_passphrase(&self, account: &str) -> Result<Zeroizing<String>, CredentialError> {
+        validate_keychain_label(account, "account")?;
+        let entry = keyring::Entry::new(&self.service, account)
+            .map_err(|error| CredentialError::Keychain(error.to_string()))?;
+        let passphrase = entry
+            .get_password()
+            .map_err(|error| CredentialError::Keychain(error.to_string()))?;
+        validate_passphrase(passphrase.as_bytes())?;
+        Ok(Zeroizing::new(passphrase))
+    }
+
+    pub fn delete_passphrase(&self, account: &str) -> Result<(), CredentialError> {
+        validate_keychain_label(account, "account")?;
+        let entry = keyring::Entry::new(&self.service, account)
+            .map_err(|error| CredentialError::Keychain(error.to_string()))?;
+        entry
+            .delete_credential()
+            .map_err(|error| CredentialError::Keychain(error.to_string()))
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -432,6 +488,13 @@ fn validate_project(project: &str) -> Result<(), CredentialError> {
     Ok(())
 }
 
+fn validate_keychain_label(value: &str, label: &'static str) -> Result<(), CredentialError> {
+    if value.trim().is_empty() || value.len() > MAX_KEYCHAIN_LABEL_BYTES || value.contains('\0') {
+        return Err(CredentialError::InvalidKeychainLabel(label));
+    }
+    Ok(())
+}
+
 fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; KEY_BYTES], CredentialError> {
     validate_passphrase(passphrase)?;
     let mut key = [0u8; KEY_BYTES];
@@ -647,6 +710,34 @@ mod tests {
             vault.set_http_basic_for_projects("invalid", "oauth2", "secret", ["bad/name"]),
             Err(CredentialError::InvalidProject(_))
         ));
+    }
+
+    #[test]
+    fn keychain_labels_and_passphrases_are_validated_before_access() {
+        assert!(CredentialKeychain::new(" ").is_err());
+        assert!(
+            CredentialKeychain::rivet()
+                .set_passphrase("account", "short")
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "touches the user's OS keychain; run explicitly for local verification"]
+    fn macos_keychain_round_trips_and_cleans_up() {
+        let account = format!("rivet-test-{}", Uuid::new_v4());
+        let keychain = CredentialKeychain::rivet();
+        let passphrase = "local-keychain-fixture-passphrase";
+        keychain
+            .set_passphrase(&account, passphrase)
+            .expect("store keychain fixture");
+        let stored = keychain
+            .get_passphrase(&account)
+            .expect("read keychain fixture");
+        let cleanup = keychain.delete_passphrase(&account);
+        assert_eq!(stored.as_str(), passphrase);
+        cleanup.expect("remove keychain fixture");
     }
 
     #[test]

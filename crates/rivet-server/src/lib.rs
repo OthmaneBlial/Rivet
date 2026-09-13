@@ -23,7 +23,7 @@ use rivet_core::{
     BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, Pipeline, Project, ScheduleId,
     SourceSnapshot,
 };
-use rivet_credentials::{CredentialError, CredentialSummary, CredentialVault};
+use rivet_credentials::{CredentialError, CredentialKeychain, CredentialSummary, CredentialVault};
 use rivet_extension_protocol::{
     ExtensionCatalog, ExtensionCatalogError, ExtensionKind, ExtensionManager,
     ExtensionManagerError, ExtensionManifest,
@@ -103,6 +103,7 @@ pub struct ServerConfig {
     pub gitlab_webhook_credential_id: Option<String>,
     pub credentials_file: Option<PathBuf>,
     pub credentials_passphrase: Option<String>,
+    pub credentials_keychain_account: Option<String>,
     pub extension_manifest_dir: Option<PathBuf>,
     pub allowed_origins: Vec<String>,
 }
@@ -229,6 +230,7 @@ impl IntoResponse for ApiError {
                 | CredentialError::InvalidUsername
                 | CredentialError::InvalidProject(_)
                 | CredentialError::TooManyProjects
+                | CredentialError::InvalidKeychainLabel(_)
                 | CredentialError::EmptySecret
                 | CredentialError::WeakPassphrase => StatusCode::BAD_REQUEST,
                 CredentialError::SymlinkPath(_)
@@ -238,7 +240,8 @@ impl IntoResponse for ApiError {
                 | CredentialError::Cryptography
                 | CredentialError::Randomness(_)
                 | CredentialError::Serialization(_)
-                | CredentialError::Filesystem(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                | CredentialError::Filesystem(_)
+                | CredentialError::Keychain(_) => StatusCode::INTERNAL_SERVER_ERROR,
             },
             Self::Scm(error) => match error {
                 rivet_scm::ScmError::InvalidRepository(_)
@@ -625,6 +628,7 @@ pub async fn serve(storage_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(
             gitlab_webhook_credential_id: None,
             credentials_file: None,
             credentials_passphrase: None,
+            credentials_keychain_account: None,
             extension_manifest_dir: None,
             allowed_origins: default_allowed_origins(),
         },
@@ -664,11 +668,19 @@ pub async fn serve_with_listener(
     let credentials = match (
         config.credentials_file.as_ref(),
         config.credentials_passphrase.as_deref(),
+        config.credentials_keychain_account.as_deref(),
     ) {
-        (Some(path), Some(passphrase)) => Some(Arc::new(Mutex::new(CredentialVault::open(
+        (Some(path), Some(passphrase), None) => Some(Arc::new(Mutex::new(CredentialVault::open(
             path, passphrase,
         )?))),
-        (None, None) => None,
+        (Some(path), None, Some(account)) => {
+            let passphrase = CredentialKeychain::rivet().get_passphrase(account)?;
+            Some(Arc::new(Mutex::new(CredentialVault::open(
+                path,
+                passphrase.as_bytes(),
+            )?)))
+        }
+        (None, None, None) => None,
         _ => return Err(ServerError::IncompleteCredentialVaultConfig),
     };
     let extensions = ExtensionCatalog::from_directory(config.extension_manifest_dir.as_deref())?;
@@ -772,13 +784,25 @@ fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
     {
         return Err(ServerError::EmptyProviderWebhookCredential { provider: "GitLab" });
     }
-    if config.credentials_file.is_some() != config.credentials_passphrase.is_some() {
-        return Err(ServerError::IncompleteCredentialVaultConfig);
+    match (
+        config.credentials_file.is_some(),
+        config.credentials_passphrase.is_some(),
+        config.credentials_keychain_account.is_some(),
+    ) {
+        (false, false, false) | (true, true, false) | (true, false, true) => {}
+        _ => return Err(ServerError::IncompleteCredentialVaultConfig),
     }
     if config
         .credentials_passphrase
         .as_deref()
         .is_some_and(|passphrase| passphrase.trim().is_empty())
+    {
+        return Err(ServerError::IncompleteCredentialVaultConfig);
+    }
+    if config
+        .credentials_keychain_account
+        .as_deref()
+        .is_some_and(|account| account.trim().is_empty())
     {
         return Err(ServerError::IncompleteCredentialVaultConfig);
     }

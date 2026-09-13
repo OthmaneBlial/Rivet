@@ -10,6 +10,7 @@ aes-gcm.workspace = true
 argon2.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+keyring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **90 / 100 points** (**90.28 weighted evidence
+The current verified total is **90 / 100 points** (**90.76 weighted evidence
 points**, displayed conservatively as 90%).
 
 | Workstream | Weight | Current state | Gate for completion |
@@ -24,7 +24,7 @@ points**, displayed conservatively as 90%).
 | Container execution | 4 | partial | validated container declarations and bounded Docker command assembly pass; Docker runtime cleanup, timeout/cancellation, image policy, and artifact extraction remain unverified |
 | Artifacts | 4 | partial | local and remote workspace collection, upload/download, bounded checksum-verified transfer, metadata, storage boundary, and explicit retention pruning for completed builds pass; remote object backends remain |
 | CI cache | 3 | partial | validated exact project-scoped primary/fallback keys, safe relative paths, atomic local archive save/restore, corrupt-entry recovery, fallback selection, and bounded local age-ordered pruning pass; remote cache backends remain |
-| Secrets and credentials | 6 | partial | secret parameters require explicit runtime values, persisted values/API responses are redacted, logs are masked, retries require fresh secret input, and a passphrase-encrypted local credential vault with private-file CLI setup, project allow-lists, admin-only list/rotate/remove API, audit events, and scoped build/webhook resolution passes; keychain integration and richer ownership workflows remain |
+| Secrets and credentials | 6 | partial | secret parameters require explicit runtime values, persisted values/API responses are redacted, logs are masked, retries require fresh secret input, and a passphrase-encrypted local credential vault with private-file CLI setup, project allow-lists, admin-only list/rotate/remove API, audit events, scoped build/webhook resolution, and an OS-keychain-backed vault passphrase source passes locally; deployment-specific keychain policy and richer ownership workflows remain |
 | Authentication and authorization | 4 | partial | protected remote transport with private Bearer tokens, policy-file token digests, roles, project scopes, route authorization, agent-connect permission checks, local token creation/listing/revocation, optional RFC3339 token expiration enforcement, and bounded admin-only authentication audit history pass; users, sessions, and external identity providers remain |
 | Extension protocol | 4 | partial | versioned manifest, WASM/subprocess kind model, declared permission vocabulary, bounded length-prefixed JSON framing, direct-argument subprocess host, bounded local catalog discovery/API, desktop extension model, root-confined subprocess lifecycle manager with per-request permission enforcement, and administrator-only server/desktop subprocess lifecycle controls pass; WASM runtime and richer extension capability wiring remain |
 | Jenkins migration analyzer | 3 | partial | bounded Jenkinsfile analysis, headless API delivery, rendered desktop report, and valid drafts for deterministic quoted shell steps pass; full Groovy parsing, plugin semantics, and broad generated Rivetfile conversion remain |
@@ -41,7 +41,7 @@ scaffold, passing unrelated test, or interface alone does not complete a gate.
 The next gates are the WASM runtime and richer extension capability wiring, the final Tauri-window
 flow inside the packaged app, API
 deployment hardening, resuming remote attempts across server restart and
-richer retry policy, keychain-backed credential storage, user
+richer retry policy, broader keychain policy coverage, user
 sessions and external identity providers, live compatibility capture adapters
 and a permanent differential regression corpus, broader repository-event
 mapping, upstream triggers, full Groovy/plugin migration

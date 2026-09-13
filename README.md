@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **90% verified** · `██████████████████░░`<br>
-Weighted evidence score: **90.28 / 100** · displayed conservatively as the
+Weighted evidence score: **90.76 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -375,8 +375,24 @@ replacement and removal require the administrator permission and append a
 bounded audit event without recording the secret. A credential with no project
 scope is global for backwards compatibility; `--project` (repeatable) or the
 API `projects` array restricts it to named projects. Build admission, webhooks,
-`rivet run`, and `scm prepare --project` enforce that allow-list. Keychain
-integration remains a future gate.
+`rivet run`, and `scm prepare --project` enforce that allow-list. The vault
+passphrase can also live in the operating-system credential store instead of a
+file:
+
+```sh
+cargo run -p rivet -- credential keychain-set rivet-server \
+  --passphrase-file /secure/path/rivet.credentials.passphrase
+cargo run -p rivet -- --data-dir .rivet server \
+  --credentials-file /secure/path/rivet.credentials.vault \
+  --credentials-keychain-account rivet-server
+```
+
+The keychain command uses a private passphrase file only during setup; Rivet
+then reads the passphrase from the OS store at server startup. There is no
+automatic plaintext-file fallback when the keychain mode is selected. A local
+macOS write/read/delete round-trip is covered by an explicit opt-in test;
+deployment-specific keychain prompts and policies still require validation on
+each target OS.
 
 The desktop control room exposes the same admin-only lifecycle when the server
 has a vault configured: it shows credential IDs, usernames, and non-secret

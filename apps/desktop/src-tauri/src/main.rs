@@ -45,6 +45,7 @@ fn main() {
                         gitlab_webhook_credential_id: None,
                         credentials_file: None,
                         credentials_passphrase: None,
+                        credentials_keychain_account: None,
                         extension_manifest_dir: None,
                         allowed_origins: Vec::new(),
                     },

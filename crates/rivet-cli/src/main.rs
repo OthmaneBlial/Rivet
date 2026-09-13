@@ -15,7 +15,7 @@ use rivet_core::{
     BuildEvent, BuildStatus, CronExpression, ExecutionPlan, LogStream, Pipeline, Project,
     ScheduleId, SourceSnapshot,
 };
-use rivet_credentials::CredentialVault;
+use rivet_credentials::{CredentialKeychain, CredentialVault};
 use rivet_migration::{analyze_jenkinsfile_file, generate_rivetfile_draft_file};
 use rivet_runner::execute_pipeline_with_parameters;
 use rivet_runner::{CacheStore, MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHandle, Scheduler};
@@ -137,6 +137,9 @@ enum Command {
         /// Read the credential vault passphrase from a private file.
         #[arg(long)]
         credentials_passphrase_file: Option<PathBuf>,
+        /// Read the credential vault passphrase from the OS keychain account.
+        #[arg(long, conflicts_with = "credentials_passphrase_file")]
+        credentials_keychain_account: Option<String>,
         /// Load regular JSON extension manifests from this local directory.
         #[arg(long)]
         extension_manifest_dir: Option<PathBuf>,
@@ -228,6 +231,14 @@ enum CredentialCommand {
         #[arg(long)]
         vault_file: Option<PathBuf>,
     },
+    /// Store a vault passphrase in the operating-system keychain.
+    KeychainSet {
+        account: String,
+        #[arg(long)]
+        passphrase_file: PathBuf,
+    },
+    /// Remove a vault passphrase from the operating-system keychain.
+    KeychainRemove { account: String },
     /// List credential IDs and usernames without revealing secrets.
     List {
         #[arg(long)]
@@ -475,6 +486,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             gitlab_webhook_credential_id,
             credentials_file,
             credentials_passphrase_file,
+            credentials_keychain_account,
             extension_manifest_dir,
             allowed_origins,
         } => {
@@ -508,6 +520,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     gitlab_webhook_credential_id,
                     credentials_file,
                     credentials_passphrase,
+                    credentials_keychain_account,
                     extension_manifest_dir,
                     allowed_origins,
                 },
@@ -1824,6 +1837,18 @@ fn manage_credentials(
             let mut vault = CredentialVault::open_or_create(&vault_path, passphrase)?;
             vault.set_http_basic_for_projects(id.clone(), username, secret, projects)?;
             println!("Stored credential {id} in {}", vault.path().display());
+        }
+        CredentialCommand::KeychainSet {
+            account,
+            passphrase_file,
+        } => {
+            let passphrase = read_private_value(&passphrase_file, "credential vault passphrase")?;
+            CredentialKeychain::rivet().set_passphrase(&account, &passphrase)?;
+            println!("Stored the vault passphrase in the OS keychain account {account}");
+        }
+        CredentialCommand::KeychainRemove { account } => {
+            CredentialKeychain::rivet().delete_passphrase(&account)?;
+            println!("Removed the vault passphrase from the OS keychain account {account}");
         }
         CredentialCommand::List {
             passphrase_file,
