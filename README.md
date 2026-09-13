@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**86% verified** · `██████████████████░░`<br>
-Weighted evidence score: **86.97 / 100** · displayed conservatively as the
+**87% verified** · `███████████████████░`<br>
+Weighted evidence score: **87.03 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -20,7 +20,8 @@ inspection, persisted build-source identity, live queue telemetry, durable
 event replay, quiet engine offline recovery, explicit Git preparation at build
 admission, parameterized builds, local artifact storage and retention pruning,
 protected server
-transport, build retry, pre-execution queue cancellation, build artifact
+transport with safe request IDs and structured method/route/status tracing,
+build retry, pre-execution queue cancellation, build artifact
 downloads, and a light-default desktop theme with an accessible dark-mode
 toggle, persistent UTC cron schedules, server dispatch, desktop schedule
 controls, signed generic webhook delivery with idempotent redelivery,

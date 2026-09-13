@@ -405,6 +405,7 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
         .layer(cors)
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
+        .layer(middleware::from_fn(request_id))
         .with_state(state))
 }
 
@@ -856,6 +857,38 @@ async fn security_headers(request: axum::http::Request<Body>, next: Next) -> Res
         HeaderValue::from_static("DENY"),
     );
     response
+}
+
+async fn request_id(request: axum::http::Request<Body>, next: Next) -> Response {
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| valid_request_id(value))
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let mut response = next.run(request).await;
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    tracing::info!(
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+        status = response.status().as_u16(),
+        "Rivet HTTP request"
+    );
+    response
+}
+
+fn valid_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
 fn hash_token(token: &[u8]) -> [u8; 32] {
@@ -3313,6 +3346,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_id_is_propagated_or_safely_regenerated() {
+        let app = router(AppState::new(Storage::open_in_memory().expect("storage")));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .header("x-request-id", "desktop-startup-01")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("desktop-startup-01")
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .header("x-request-id", "not a safe id")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let generated = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("generated request ID");
+        assert_ne!(generated, "not a safe id");
+        assert!(uuid::Uuid::parse_str(generated).is_ok());
+    }
+
+    #[tokio::test]
     async fn migration_route_reports_findings_and_a_valid_draft() {
         let app = router(AppState::new(Storage::open_in_memory().expect("storage")));
         let body = serde_json::to_vec(&serde_json::json!({
@@ -3713,6 +3787,7 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get("x-request-id").is_some());
         assert_eq!(
             response
                 .headers()

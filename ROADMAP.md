@@ -5,8 +5,8 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **86 / 100 points** (**86.97 weighted evidence
-points**, displayed conservatively as 86%).
+The current verified total is **87 / 100 points** (**87.03 weighted evidence
+points**, displayed conservatively as 87%).
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
@@ -15,7 +15,7 @@ points**, displayed conservatively as 86%).
 | Native process runner | 6 | verified | stdout/stderr streaming, timeout, cancellation, process-group cleanup tests |
 | Queue and scheduler | 6 | partial | FIFO tie ordering, bounded priorities, global/per-project limits, live telemetry, pre-execution cancellation, and authenticated pause/resume administration pass; resource requirements remain |
 | SQLite persistence | 6 | verified | Migration, build graph projection, reopen/history test |
-| API and live transport | 6 | partial | REST/loopback WebSocket, durable event replay, queue telemetry, build retry, schedule endpoints/dispatch, graceful SIGINT/SIGTERM shutdown, exact CORS allow-list, body limits, security headers, and policy-backed identity/project authorization pass; user sessions and deployment operations remain |
+| API and live transport | 6 | partial | REST/loopback WebSocket, durable event replay, queue telemetry, build retry, schedule endpoints/dispatch, graceful SIGINT/SIGTERM shutdown, safe request IDs with structured method/route/status tracing, exact CORS allow-list, body limits, security headers, and policy-backed identity/project authorization pass; user sessions and deployment operations remain |
 | CLI operator workflow | 3 | partial | project/run/history, parameterized builds, artifact listing, retry, and schedule management work; richer cancellation and inspection remain |
 | Tauri desktop control room | 10 | partial | native bundle, embedded engine health, rendered light-default/dark-toggle UX, artifact/retry views, schedule controls, online/offline recovery, real client build flow, and an ephemeral loopback engine origin in the packaged launch pass; final Tauri-window interaction and release QA remain |
 | Git/SCM integration | 8 | partial | direct Git inspect/checkout/fetch/clean operations, REST/CLI surfaces, explicit build-admission preparation, persisted build source identity, provider-neutral credential IDs, ephemeral Git auth handoff, and provider push adapters pass; credential/project lifecycle remains |
