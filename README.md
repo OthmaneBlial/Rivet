@@ -5,7 +5,7 @@ from Jenkins.
 
 ## Delivery progress
 
-**68% verified** · `█████████████▊░░░░░░`<br>
+**69% verified** · `█████████████▉░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -26,10 +26,9 @@ save, explicit Docker container command assembly with bounded workspace mounts,
 and a bounded Jenkinsfile migration analyzer with line-level support findings
 plus safe drafts for deterministic shell steps, exposed through the headless
 API and rendered in the desktop control room. The server also exposes a
-versioned agent handshake/heartbeat registry
-with online and stale state, while remote build assignment remains
-intentionally unimplemented until its transport and failure semantics are
-complete.
+versioned agent handshake/heartbeat registry with online/stale state, capacity-aware
+matching, and a rendered fleet view. Remote build assignment remains intentionally
+unimplemented until its transport and failure semantics are complete.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -151,8 +150,9 @@ Remote agents use a versioned WebSocket contract at
 system, architecture, Docker availability, labels, and executor capacity,
 then send monotone heartbeats. `GET /api/v1/agents` reports the current
 ephemeral registry; silent agents become `stale` after the heartbeat window.
-Build assignment, remote logs, artifacts, and lost-job recovery remain future
-gates.
+`POST /api/v1/agents/match` accepts exact capability requirements and excludes
+stale or saturated agents. Build assignment, remote logs, artifacts, and
+lost-job recovery remain future gates.
 
 The CLI exposes the same explicit SCM boundary, for example:
 

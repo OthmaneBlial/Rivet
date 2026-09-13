@@ -109,8 +109,8 @@
       "category": "Agents",
       "feature": "Versioned agent registration and heartbeat",
       "status": "partial",
-      "evidence": ["crates/rivet-agent-protocol/src/lib.rs", "crates/rivet-server/src/agent_registry.rs", "crates/rivet-server/src/lib.rs"],
-      "notes": "Agents can negotiate protocol version, advertise capabilities, reconnect with session fencing, and appear online or stale through the server registry; remote assignment, execution, transfer, and lost-job handling remain planned."
+      "evidence": ["crates/rivet-agent-protocol/src/lib.rs", "crates/rivet-server/src/agent_registry.rs", "crates/rivet-server/src/lib.rs", "apps/desktop/src/App.tsx"],
+      "notes": "Agents can negotiate protocol version, advertise capabilities, reconnect with session fencing, appear online or stale, and match only when capability and available executor requirements pass through POST /api/v1/agents/match; the desktop exposes the live fleet registry, while remote assignment, execution, transfer, and lost-job handling remain planned."
     },
     {
       "category": "Security",
