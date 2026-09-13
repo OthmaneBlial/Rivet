@@ -3,6 +3,7 @@ use chrono::Utc;
 use rivet_core::{BuildEvent, BuildId, BuildStatus, ExecutionPlan, Pipeline};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -27,9 +28,23 @@ pub enum SchedulerError {
     MissingResult,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueStats {
+    pub queued: usize,
+    pub running: usize,
+    pub capacity: usize,
+}
+
+struct SchedulerMetrics {
+    queued: AtomicUsize,
+    running: AtomicUsize,
+    capacity: usize,
+}
+
 pub struct Scheduler {
     queue: mpsc::Sender<QueueRequest>,
     worker: JoinHandle<()>,
+    metrics: Arc<SchedulerMetrics>,
 }
 
 pub struct QueueHandle {
@@ -52,15 +67,22 @@ impl Scheduler {
         }
         let (queue, mut receiver) = mpsc::channel::<QueueRequest>(256);
         let global = Arc::new(Semaphore::new(global_concurrency));
+        let metrics = Arc::new(SchedulerMetrics {
+            queued: AtomicUsize::new(0),
+            running: AtomicUsize::new(0),
+            capacity: global_concurrency,
+        });
         let project_limit = per_project_concurrency.unwrap_or(global_concurrency);
         let project_slots = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
             BuildId,
             Arc<Semaphore>,
         >::new()));
+        let worker_metrics = metrics.clone();
         let worker = tokio::spawn(async move {
             while let Some(request) = receiver.recv().await {
                 let global = global.clone();
                 let project_slots = project_slots.clone();
+                let metrics = worker_metrics.clone();
                 let project_id = request.plan.project_id;
                 let project_slot = {
                     let mut slots = project_slots.lock().await;
@@ -73,6 +95,7 @@ impl Scheduler {
                     let global_permit = match global.acquire_owned().await {
                         Ok(permit) => permit,
                         Err(_) => {
+                            metrics.queued.fetch_sub(1, Ordering::Relaxed);
                             let _ = request
                                 .completion
                                 .send(Err(RunnerError::EventChannelClosed));
@@ -83,12 +106,15 @@ impl Scheduler {
                         Ok(permit) => permit,
                         Err(_) => {
                             drop(global_permit);
+                            metrics.queued.fetch_sub(1, Ordering::Relaxed);
                             let _ = request
                                 .completion
                                 .send(Err(RunnerError::EventChannelClosed));
                             return;
                         }
                     };
+                    metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                    metrics.running.fetch_add(1, Ordering::Relaxed);
                     let result = execute_pipeline(
                         &request.plan,
                         &request.pipeline,
@@ -99,11 +125,24 @@ impl Scheduler {
                     .await;
                     drop(project_permit);
                     drop(global_permit);
+                    metrics.running.fetch_sub(1, Ordering::Relaxed);
                     let _ = request.completion.send(result);
                 });
             }
         });
-        Self { queue, worker }
+        Self {
+            queue,
+            worker,
+            metrics,
+        }
+    }
+
+    pub fn stats(&self) -> QueueStats {
+        QueueStats {
+            queued: self.metrics.queued.load(Ordering::Relaxed),
+            running: self.metrics.running.load(Ordering::Relaxed),
+            capacity: self.metrics.capacity,
+        }
     }
 
     pub async fn enqueue(
@@ -123,7 +162,9 @@ impl Scheduler {
             .await
             .map_err(|_| SchedulerError::Closed)?;
         let (completion, result) = oneshot::channel();
-        self.queue
+        self.metrics.queued.fetch_add(1, Ordering::Relaxed);
+        if self
+            .queue
             .send(QueueRequest {
                 plan: plan.clone(),
                 pipeline,
@@ -133,7 +174,11 @@ impl Scheduler {
                 completion,
             })
             .await
-            .map_err(|_| SchedulerError::Closed)?;
+            .is_err()
+        {
+            self.metrics.queued.fetch_sub(1, Ordering::Relaxed);
+            return Err(SchedulerError::Closed);
+        }
         Ok(QueueHandle {
             build_id: plan.build_id,
             cancellation,
@@ -215,6 +260,70 @@ args = ["-c", "printf done > result.txt"]
         );
         // Let spawned reader tasks finish before the test drops its receivers.
         sleep(Duration::from_millis(10)).await;
+        drop(receivers);
+    }
+
+    #[tokio::test]
+    async fn exposes_configured_capacity_without_fake_work() {
+        let scheduler = Scheduler::new(3, Some(1));
+        assert_eq!(
+            scheduler.stats(),
+            QueueStats {
+                queued: 0,
+                running: 0,
+                capacity: 3,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_work_waiting_for_a_project_slot_as_queued() {
+        let dir = tempdir().expect("tempdir");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "queue-stats"
+[[stages]]
+name = "run"
+[[stages.steps]]
+name = "wait"
+program = "sh"
+args = ["-c", "sleep 0.4"]
+"#,
+        )
+        .expect("pipeline");
+        let scheduler = Scheduler::new(2, Some(1));
+        let project_id = uuid::Uuid::new_v4();
+        let mut handles = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..2 {
+            let plan = ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), project_id);
+            let (tx, rx) = mpsc::channel(64);
+            receivers.push(rx);
+            handles.push(
+                scheduler
+                    .enqueue(
+                        plan,
+                        pipeline.clone(),
+                        dir.path().to_path_buf(),
+                        CancellationToken::new(),
+                        tx,
+                    )
+                    .await
+                    .expect("enqueue"),
+            );
+        }
+        sleep(Duration::from_millis(100)).await;
+        let stats = scheduler.stats();
+        assert_eq!(stats.capacity, 2);
+        assert_eq!(stats.running, 1);
+        assert_eq!(stats.queued, 1);
+        for handle in handles {
+            assert_eq!(
+                handle.wait().await.expect("scheduler").expect("run"),
+                BuildStatus::Passed
+            );
+        }
         drop(receivers);
     }
 }

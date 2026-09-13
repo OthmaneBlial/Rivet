@@ -14,7 +14,7 @@ use chrono::Utc;
 use rivet_core::{
     BuildEvent, BuildId, BuildStatus, ExecutionPlan, Pipeline, Project, SourceSnapshot,
 };
-use rivet_runner::{QueueHandle, Scheduler};
+use rivet_runner::{QueueHandle, QueueStats, Scheduler};
 use rivet_scm::{GitPrepareOptions, GitRepository, GitSnapshot, ScmError};
 use rivet_storage::{BuildDetails, BuildRecord, LogRecord, Storage, StorageError};
 use serde::{Deserialize, Serialize};
@@ -111,9 +111,17 @@ struct QueueBuildResponse {
     status: BuildStatus,
 }
 
+#[derive(Debug, Serialize)]
+struct QueueStatusResponse {
+    queued: usize,
+    running: usize,
+    capacity: usize,
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/queue", get(queue_status))
         .route("/api/v1/projects", get(list_projects).post(create_project))
         .route(
             "/api/v1/projects/{name}/builds",
@@ -220,6 +228,19 @@ async fn health() -> Json<HealthResponse> {
         status: "ok",
         service: "rivet-server",
         timestamp: Utc::now(),
+    })
+}
+
+async fn queue_status(State(state): State<AppState>) -> Json<QueueStatusResponse> {
+    let QueueStats {
+        queued,
+        running,
+        capacity,
+    } = state.scheduler.stats();
+    Json(QueueStatusResponse {
+        queued,
+        running,
+        capacity,
     })
 }
 
@@ -470,7 +491,7 @@ fn build_by_number(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::ServiceExt;
 
@@ -487,5 +508,22 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn queue_route_reports_scheduler_capacity() {
+        let app = router(AppState::new(Storage::open_in_memory().expect("storage")));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/queue")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        assert_eq!(&body[..], br#"{"queued":0,"running":0,"capacity":2}"#);
     }
 }

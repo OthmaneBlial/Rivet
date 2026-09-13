@@ -9,4 +9,4 @@ mod scheduler;
 
 pub use pipeline::{RunnerError, execute_pipeline};
 pub use process::{LogLine, ProcessError, ProcessOutcome, ProcessResult, ProcessSpec, run_process};
-pub use scheduler::{QueueHandle, Scheduler, SchedulerError};
+pub use scheduler::{QueueHandle, QueueStats, Scheduler, SchedulerError};

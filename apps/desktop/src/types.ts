@@ -87,3 +87,9 @@ export interface QueueResponse {
   build: BuildRecord;
   status: BuildStatus;
 }
+
+export interface QueueStats {
+  queued: number;
+  running: number;
+  capacity: number;
+}

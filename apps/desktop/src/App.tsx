@@ -9,6 +9,7 @@ import {
   health,
   logs,
   projects,
+  queueStats as fetchQueueStats,
   queueBuild,
 } from "./api";
 import type {
@@ -83,6 +84,7 @@ function App() {
   const [projectsList, setProjectsList] = useState<Project[]>([]);
   const [projectName, setProjectName] = useState("");
   const [buildList, setBuildList] = useState<BuildRecord[]>([]);
+  const [queueStatus, setQueueStatus] = useState<{ queued: number; running: number; capacity: number } | null>(null);
   const [selectedBuild, setSelectedBuild] = useState<number | null>(null);
   const [details, setDetails] = useState<BuildDetails | null>(null);
   const [logLines, setLogLines] = useState<LogRecord[]>([]);
@@ -136,6 +138,14 @@ function App() {
     }
   }, [projectName, selectedBuild]);
 
+  const loadQueueStatus = useCallback(async () => {
+    try {
+      setQueueStatus(await fetchQueueStats());
+    } catch {
+      setQueueStatus(null);
+    }
+  }, []);
+
   useEffect(() => {
     void health().then(() => setEngineOnline(true)).catch(() => setEngineOnline(false));
     void loadProjects();
@@ -155,6 +165,12 @@ function App() {
     socket.onerror = () => socket.close();
     return () => socket.close();
   }, [loadBuildList, loadBuildView, projectName, selectedBuild]);
+
+  useEffect(() => {
+    void loadQueueStatus();
+    const interval = window.setInterval(() => void loadQueueStatus(), 1000);
+    return () => window.clearInterval(interval);
+  }, [loadQueueStatus]);
 
   async function runSelectedPipeline() {
     if (!projectName) return;
@@ -308,7 +324,7 @@ function App() {
             <section className="metric-grid" aria-label="Pipeline metrics">
               <MetricCard label="Latest run" value={latest ? `#${latest.number}` : "—"} detail={latest ? STATUS_LABEL[latest.status] : "No runs yet"} accent={latest?.status ?? "neutral"} />
               <MetricCard label="Success rate" value={`${successRate}%`} detail={`${buildList.length} recorded runs`} accent="cyan" />
-              <MetricCard label="Queue" value={buildList.filter((build) => build.status === "queued").length.toString().padStart(2, "0")} detail="local capacity / 01" accent="amber" />
+              <MetricCard label="Queue" value={(queueStatus?.queued ?? buildList.filter((build) => build.status === "queued").length).toString().padStart(2, "0")} detail={queueStatus ? `${queueStatus.running} running / ${queueStatus.capacity} slots` : "local capacity / 01"} accent="amber" />
               <MetricCard label="Last signal" value={latest ? formatTime(latest.finished_at ?? latest.started_at) : "—"} detail={latest ? duration(latest) : "Waiting for first run"} accent="neutral" />
             </section>
 

@@ -4,6 +4,7 @@ import type {
   LogRecord,
   Project,
   QueueResponse,
+  QueueStats,
 } from "./types";
 
 export const ENGINE_ORIGIN =
@@ -42,6 +43,10 @@ export function health(): Promise<HealthResponse> {
 
 export function projects(): Promise<Project[]> {
   return request<Project[]>("/api/v1/projects");
+}
+
+export function queueStats(): Promise<QueueStats> {
+  return request<QueueStats>("/api/v1/queue");
 }
 
 export function builds(project: string): Promise<BuildRecord[]> {
