@@ -1,5 +1,9 @@
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
+use futures_util::{SinkExt, StreamExt};
+use rivet_agent_protocol::{
+    AgentCapabilities, AgentHeartbeat, AgentId, AgentMessage, AgentRegistration, PROTOCOL_VERSION,
+};
 use rivet_core::{
     BuildEvent, BuildStatus, CronExpression, ExecutionPlan, LogStream, Pipeline, Project,
     ScheduleId, SourceSnapshot,
@@ -13,6 +17,11 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
+use tokio::time::Duration;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message as AgentSocketMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_util::sync::CancellationToken;
 
 const SAMPLE_PIPELINE: &str = r#"version = 1
@@ -103,6 +112,8 @@ enum Command {
         #[command(subcommand)]
         command: AnalyzeCommand,
     },
+    /// Connect this machine to a Rivet server as a heartbeat-only agent.
+    Agent(AgentArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -168,6 +179,37 @@ struct RunArgs {
     clean_ignored: bool,
     #[arg(long = "param", value_name = "NAME=VALUE")]
     parameters: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct AgentArgs {
+    /// WebSocket endpoint exposed by the Rivet server.
+    #[arg(long, default_value = "ws://127.0.0.1:7878/api/v1/agents/connect")]
+    server: String,
+    /// Stable agent identity; a new UUID is generated when omitted.
+    #[arg(long)]
+    id: Option<AgentId>,
+    /// Human-readable name shown in the fleet registry.
+    #[arg(long, default_value_t = default_agent_name())]
+    name: String,
+    /// Operating system capability advertised to the scheduler.
+    #[arg(long, default_value_t = default_agent_os())]
+    os: String,
+    /// CPU architecture capability advertised to the scheduler.
+    #[arg(long, default_value_t = default_agent_arch())]
+    arch: String,
+    /// Advertise Docker availability.
+    #[arg(long)]
+    docker: bool,
+    /// Add an exact scheduler label. May be supplied more than once.
+    #[arg(long = "label")]
+    labels: Vec<String>,
+    /// Number of local executor slots advertised to the scheduler.
+    #[arg(long, default_value_t = 1)]
+    executors: u16,
+    /// Read a Bearer token from a private file without persisting it.
+    #[arg(long)]
+    token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -236,6 +278,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Scm { command } => inspect_scm(command).await?,
         Command::Schedule { command } => manage_schedule(&cli.data_dir, command)?,
         Command::Analyze { command } => analyze_file(command)?,
+        Command::Agent(args) => run_agent(args).await?,
     }
     Ok(())
 }
@@ -261,6 +304,159 @@ fn analyze_file(command: AnalyzeCommand) -> Result<(), Box<dyn std::error::Error
         }
     }
     Ok(())
+}
+
+async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let agent_id = args.id.unwrap_or_else(uuid::Uuid::new_v4);
+    let registration = AgentRegistration {
+        protocol_version: PROTOCOL_VERSION,
+        agent_id,
+        name: args.name,
+        capabilities: AgentCapabilities {
+            os: args.os,
+            arch: args.arch,
+            docker: args.docker,
+            labels: args.labels,
+            executors: args.executors,
+        },
+    };
+    registration.validate()?;
+
+    let mut request = args.server.into_client_request()?;
+    if let Some(token_file) = args.token_file.as_deref() {
+        let token = read_auth_token(token_file)?;
+        request.headers_mut().insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
+    }
+    let (mut socket, _) = connect_async(request).await?;
+    send_agent_socket_message(&mut socket, AgentMessage::Register(registration.clone())).await?;
+    let registered = socket
+        .next()
+        .await
+        .ok_or("Rivet server closed the agent connection during registration")??;
+    let session_id = match decode_agent_socket_message(registered)? {
+        AgentMessage::Registered {
+            agent_id: registered_agent,
+            session_id,
+            ..
+        } if registered_agent == registration.agent_id => session_id,
+        AgentMessage::Error { code, message, .. } => {
+            return Err(format!("agent registration rejected ({code}): {message}").into());
+        }
+        _ => return Err("Rivet server did not acknowledge this agent registration".into()),
+    };
+
+    println!(
+        "Connected agent {} ({}) with {} executor{}",
+        registration.name,
+        registration.agent_id,
+        registration.capabilities.executors,
+        if registration.capabilities.executors == 1 {
+            ""
+        } else {
+            "s"
+        }
+    );
+    let mut sequence = 0;
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("Stopping agent heartbeat...");
+                break;
+            }
+            _ = heartbeat.tick() => {
+                sequence += 1;
+                send_agent_socket_message(
+                    &mut socket,
+                    AgentMessage::Heartbeat(AgentHeartbeat {
+                        protocol_version: PROTOCOL_VERSION,
+                        agent_id: registration.agent_id,
+                        session_id,
+                        sequence,
+                        running: Vec::new(),
+                        sent_at: Utc::now(),
+                    }),
+                ).await?;
+            }
+            message = socket.next() => {
+                let Some(message) = message else { break; };
+                match message? {
+                    AgentSocketMessage::Ping(payload) => {
+                        socket.send(AgentSocketMessage::Pong(payload)).await?;
+                    }
+                    AgentSocketMessage::Pong(_) => {}
+                    AgentSocketMessage::Close(_) => break,
+                    message => match decode_agent_socket_message(message)? {
+                        AgentMessage::HeartbeatAck { .. } => {}
+                        AgentMessage::Error { code, message, .. } => {
+                            return Err(format!("agent connection error ({code}): {message}").into());
+                        }
+                        AgentMessage::Assign { .. } => {
+                            send_agent_socket_message(
+                                &mut socket,
+                                AgentMessage::Error {
+                                    protocol_version: PROTOCOL_VERSION,
+                                    code: "assignment_not_supported".into(),
+                                    message: "this heartbeat-only client cannot execute remote assignments".into(),
+                                },
+                            ).await?;
+                            break;
+                        }
+                        _ => {}
+                    },
+                }
+            }
+        }
+    }
+    let _ = socket.close(None).await;
+    Ok(())
+}
+
+async fn send_agent_socket_message(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    message: AgentMessage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = serde_json::to_string(&message)?;
+    socket
+        .send(AgentSocketMessage::Text(payload.into()))
+        .await?;
+    Ok(())
+}
+
+fn decode_agent_socket_message(
+    message: AgentSocketMessage,
+) -> Result<AgentMessage, Box<dyn std::error::Error>> {
+    let payload = match message {
+        AgentSocketMessage::Text(text) => text.to_string(),
+        AgentSocketMessage::Binary(bytes) => String::from_utf8(bytes.to_vec())?,
+        AgentSocketMessage::Ping(_) | AgentSocketMessage::Pong(_) => {
+            return Err("control frame is not an agent message".into());
+        }
+        AgentSocketMessage::Close(_) => return Err("agent websocket closed".into()),
+        AgentSocketMessage::Frame(_) => {
+            return Err("raw websocket frame is not an agent message".into());
+        }
+    };
+    let message: AgentMessage = serde_json::from_str(&payload)?;
+    message.validate()?;
+    Ok(message)
+}
+
+fn default_agent_name() -> String {
+    format!("{}-{}", default_agent_os(), default_agent_arch())
+}
+
+fn default_agent_os() -> String {
+    std::env::consts::OS.to_owned()
+}
+
+fn default_agent_arch() -> String {
+    std::env::consts::ARCH.to_owned()
 }
 
 async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Error>> {

@@ -11,13 +11,16 @@ path = "src/main.rs"
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
+futures-util = "0.3"
 rivet-core = { path = "../rivet-core" }
+rivet-agent-protocol = { path = "../rivet-agent-protocol" }
 rivet-migration = { path = "../rivet-migration" }
 rivet-runner = { path = "../rivet-runner" }
 rivet-scm = { path = "../rivet-scm" }
 rivet-server = { path = "../rivet-server" }
 rivet-storage = { path = "../rivet-storage" }
 serde_json.workspace = true
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+tokio-tungstenite = "0.29"
 uuid.workspace = true
