@@ -83,6 +83,12 @@ enum Command {
     Run(RunArgs),
     /// Show persisted build history.
     Builds { project: String },
+    /// Inspect one persisted build, including stage and step outcomes.
+    Inspect {
+        project: String,
+        #[arg(long)]
+        build: i64,
+    },
     /// Show persisted output for a build number.
     Logs {
         project: String,
@@ -479,6 +485,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Run(args) => run_project(&cli.data_dir, args).await?,
         Command::Builds { project } => list_builds(&cli.data_dir, &project)?,
+        Command::Inspect { project, build } => inspect_build(&cli.data_dir, &project, build)?,
         Command::Logs { project, build } => show_logs(&cli.data_dir, &project, build)?,
         Command::Artifacts { project, build } => list_artifacts(&cli.data_dir, &project, build)?,
         Command::Artifact { command } => manage_artifacts(&cli.data_dir, command)?,
@@ -2299,6 +2306,72 @@ fn list_builds(data_dir: &Path, name: &str) -> Result<(), Box<dyn std::error::Er
             build.id,
             build.queued_at.to_rfc3339()
         );
+    }
+    Ok(())
+}
+
+fn inspect_build(
+    data_dir: &Path,
+    name: &str,
+    number: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = open_storage(data_dir)?;
+    let project = storage
+        .get_project_by_name(name)?
+        .ok_or_else(|| format!("project not found: {name}"))?;
+    let build = storage
+        .list_builds(project.id)?
+        .into_iter()
+        .find(|build| build.number == number)
+        .ok_or_else(|| format!("build not found: {name} #{number}"))?;
+    let details = storage
+        .get_build_details(build.id)?
+        .ok_or_else(|| format!("build details not found: {name} #{number}"))?;
+
+    println!("Project: {}", project.name);
+    println!("Build: #{} ({})", details.build.number, details.build.id);
+    println!("Status: {}", status_label(&details.build.status));
+    println!("Queued: {}", details.build.queued_at.to_rfc3339());
+    if let Some(started_at) = details.build.started_at {
+        println!("Started: {}", started_at.to_rfc3339());
+    }
+    if let Some(finished_at) = details.build.finished_at {
+        println!("Finished: {}", finished_at.to_rfc3339());
+    }
+    if let Some(source) = details.build.source {
+        println!(
+            "Source: {} {} {} ({})",
+            source.provider,
+            source.revision,
+            source.reference.as_deref().unwrap_or("detached"),
+            if source.dirty { "dirty" } else { "clean" }
+        );
+    }
+    if !details.build.parameters.is_empty() {
+        println!("Parameters:");
+        for (name, value) in details.build.parameters {
+            println!("  {name} = {value}");
+        }
+    }
+
+    println!("Stages:");
+    for stage in details.stages {
+        println!(
+            "  [{}] {}",
+            status_label(&stage.stage.status),
+            stage.stage.name
+        );
+        for step in stage.steps {
+            let exit_code = step
+                .exit_code
+                .map_or_else(|| "—".to_owned(), |code| code.to_string());
+            println!(
+                "    [{}] {} (exit {})",
+                status_label(&step.status),
+                step.name,
+                exit_code
+            );
+        }
     }
     Ok(())
 }

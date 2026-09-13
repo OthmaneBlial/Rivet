@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.27 / 100** · displayed conservatively as the
+Weighted evidence score: **92.31 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -143,6 +143,7 @@ cargo run -p rivet -- project create rivet --repository .
 cargo run -p rivet -- run rivet
 cargo run -p rivet -- run rivet --priority 20
 cargo run -p rivet -- builds rivet
+cargo run -p rivet -- inspect rivet --build 1
 cargo run -p rivet -- logs rivet --build 1
 ```
 
