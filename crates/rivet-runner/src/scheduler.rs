@@ -1,14 +1,18 @@
 use crate::{RunnerError, execute_pipeline_with_parameters_and_cache};
 use chrono::Utc;
 use rivet_core::{BuildEvent, BuildId, BuildStatus, ExecutionPlan, Pipeline, ProjectId};
-use std::collections::BTreeMap;
+use std::cmp::Ordering as Comparison;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use thiserror::Error;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+pub const MIN_QUEUE_PRIORITY: i32 = -100;
+pub const MAX_QUEUE_PRIORITY: i32 = 100;
 
 struct QueueRequest {
     plan: ExecutionPlan,
@@ -18,6 +22,48 @@ struct QueueRequest {
     cancellation: CancellationToken,
     events: mpsc::Sender<BuildEvent>,
     completion: oneshot::Sender<Result<BuildStatus, RunnerError>>,
+    priority: i32,
+    sequence: u64,
+}
+
+struct PendingRequest {
+    priority: i32,
+    sequence: u64,
+    request: QueueRequest,
+}
+
+impl PendingRequest {
+    fn new(request: QueueRequest) -> Self {
+        Self {
+            priority: request.priority,
+            sequence: request.sequence,
+            request,
+        }
+    }
+}
+
+impl PartialEq for PendingRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority && self.sequence == other.sequence
+    }
+}
+
+impl Eq for PendingRequest {}
+
+impl Ord for PendingRequest {
+    fn cmp(&self, other: &Self) -> Comparison {
+        self.priority
+            .cmp(&other.priority)
+            // BinaryHeap is a max-heap; an earlier sequence must therefore
+            // compare greater when priorities are equal.
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+
+impl PartialOrd for PendingRequest {
+    fn partial_cmp(&self, other: &Self) -> Option<Comparison> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -43,22 +89,38 @@ struct SchedulerMetrics {
     capacity: usize,
 }
 
+struct RunningBuildGuard {
+    metrics: Arc<SchedulerMetrics>,
+    wake: Arc<Notify>,
+}
+
+impl Drop for RunningBuildGuard {
+    fn drop(&mut self) {
+        self.metrics.running.fetch_sub(1, Ordering::Relaxed);
+        self.wake.notify_waiters();
+    }
+}
+
 pub struct Scheduler {
     queue: mpsc::Sender<QueueRequest>,
     worker: JoinHandle<()>,
     metrics: Arc<SchedulerMetrics>,
+    wake: Arc<Notify>,
+    next_sequence: AtomicU64,
 }
 
 pub struct QueueHandle {
     pub build_id: BuildId,
     cancellation: CancellationToken,
     completion: oneshot::Receiver<Result<BuildStatus, RunnerError>>,
+    wake: Arc<Notify>,
 }
 
 impl Scheduler {
-    /// Start a FIFO queue with a global execution limit and optional per-
-    /// project limit. Queue admission is separate from execution permits, so
-    /// callers can persist `queued` before a worker starts.
+    /// Start a priority queue with FIFO tie ordering, a global execution
+    /// limit, and an optional per-project limit. Queue admission is separate
+    /// from execution permits, so callers can persist `queued` before a
+    /// worker starts.
     pub fn new(global_concurrency: usize, per_project_concurrency: Option<usize>) -> Self {
         Self::new_with_cache(global_concurrency, per_project_concurrency, None)
     }
@@ -83,83 +145,147 @@ impl Scheduler {
             capacity: global_concurrency,
         });
         let project_limit = per_project_concurrency.unwrap_or(global_concurrency);
-        let project_slots = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-            ProjectId,
-            Arc<Semaphore>,
-        >::new()));
+        let project_slots = Arc::new(tokio::sync::Mutex::new(
+            HashMap::<ProjectId, Arc<Semaphore>>::new(),
+        ));
         let worker_metrics = metrics.clone();
         let worker_cache_root = cache_root;
+        let wake = Arc::new(Notify::new());
+        let worker_wake = wake.clone();
         let worker = tokio::spawn(async move {
-            while let Some(request) = receiver.recv().await {
-                let global = global.clone();
-                let project_slots = project_slots.clone();
-                let metrics = worker_metrics.clone();
-                let cache_root = worker_cache_root.clone();
-                let project_id = request.plan.project_id;
-                let project_slot = {
-                    let mut slots = project_slots.lock().await;
-                    slots
-                        .entry(project_id)
-                        .or_insert_with(|| Arc::new(Semaphore::new(project_limit)))
-                        .clone()
-                };
-                tokio::spawn(async move {
-                    if request.cancellation.is_cancelled() {
-                        metrics.queued.fetch_sub(1, Ordering::Relaxed);
-                        finish_queued_cancellation(request).await;
-                        return;
+            let mut pending = BinaryHeap::<PendingRequest>::new();
+            let mut queue_closed = false;
+            loop {
+                if !queue_closed {
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(request) => pending.push(PendingRequest::new(request)),
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                queue_closed = true;
+                                break;
+                            }
+                        }
                     }
-                    let global_permit = match global.acquire_owned().await {
+                }
+
+                if pending.is_empty() {
+                    if queue_closed {
+                        break;
+                    }
+                    match receiver.recv().await {
+                        Some(request) => pending.push(PendingRequest::new(request)),
+                        None => queue_closed = true,
+                    }
+                    continue;
+                }
+
+                let mut blocked = Vec::with_capacity(pending.len());
+                let mut admitted = false;
+                while let Some(entry) = pending.pop() {
+                    let request = entry.request;
+                    if request.cancellation.is_cancelled() {
+                        worker_metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                        tokio::spawn(finish_queued_cancellation(request));
+                        continue;
+                    }
+
+                    let global_permit = match global.clone().try_acquire_owned() {
                         Ok(permit) => permit,
-                        Err(_) => {
-                            metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                        Err(tokio::sync::TryAcquireError::NoPermits) => {
+                            blocked.push(PendingRequest::new(request));
+                            continue;
+                        }
+                        Err(tokio::sync::TryAcquireError::Closed) => {
+                            worker_metrics.queued.fetch_sub(1, Ordering::Relaxed);
                             let _ = request
                                 .completion
                                 .send(Err(RunnerError::EventChannelClosed));
-                            return;
+                            continue;
                         }
                     };
-                    let project_permit = match project_slot.acquire_owned().await {
+                    let project_id = request.plan.project_id;
+                    let project_slot = {
+                        let mut slots = project_slots.lock().await;
+                        slots
+                            .entry(project_id)
+                            .or_insert_with(|| Arc::new(Semaphore::new(project_limit)))
+                            .clone()
+                    };
+                    let project_permit = match project_slot.try_acquire_owned() {
                         Ok(permit) => permit,
-                        Err(_) => {
+                        Err(tokio::sync::TryAcquireError::NoPermits) => {
                             drop(global_permit);
-                            metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                            blocked.push(PendingRequest::new(request));
+                            continue;
+                        }
+                        Err(tokio::sync::TryAcquireError::Closed) => {
+                            drop(global_permit);
+                            worker_metrics.queued.fetch_sub(1, Ordering::Relaxed);
                             let _ = request
                                 .completion
                                 .send(Err(RunnerError::EventChannelClosed));
-                            return;
+                            continue;
                         }
                     };
                     if request.cancellation.is_cancelled() {
                         drop(project_permit);
                         drop(global_permit);
-                        metrics.queued.fetch_sub(1, Ordering::Relaxed);
-                        finish_queued_cancellation(request).await;
-                        return;
+                        worker_metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                        tokio::spawn(finish_queued_cancellation(request));
+                        admitted = true;
+                        continue;
                     }
-                    metrics.queued.fetch_sub(1, Ordering::Relaxed);
-                    metrics.running.fetch_add(1, Ordering::Relaxed);
-                    let result = execute_pipeline_with_parameters_and_cache(
-                        &request.plan,
-                        &request.pipeline,
-                        request.repository_root,
-                        &request.parameters,
-                        request.cancellation,
-                        request.events,
-                        cache_root.as_deref(),
-                    )
-                    .await;
-                    drop(project_permit);
-                    drop(global_permit);
-                    metrics.running.fetch_sub(1, Ordering::Relaxed);
-                    let _ = request.completion.send(result);
-                });
+
+                    worker_metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                    worker_metrics.running.fetch_add(1, Ordering::Relaxed);
+                    let metrics = worker_metrics.clone();
+                    let wake = worker_wake.clone();
+                    let cache_root = worker_cache_root.clone();
+                    tokio::spawn(async move {
+                        let _running = RunningBuildGuard { metrics, wake };
+                        let result = execute_pipeline_with_parameters_and_cache(
+                            &request.plan,
+                            &request.pipeline,
+                            request.repository_root,
+                            &request.parameters,
+                            request.cancellation,
+                            request.events,
+                            cache_root.as_deref(),
+                        )
+                        .await;
+                        drop(project_permit);
+                        drop(global_permit);
+                        let _ = request.completion.send(result);
+                    });
+                    admitted = true;
+                }
+                pending.extend(blocked);
+
+                if pending.is_empty() || admitted {
+                    continue;
+                }
+                if queue_closed {
+                    worker_wake.notified().await;
+                } else {
+                    tokio::select! {
+                        request = receiver.recv() => {
+                            match request {
+                                Some(request) => pending.push(PendingRequest::new(request)),
+                                None => queue_closed = true,
+                            }
+                        }
+                        _ = worker_wake.notified() => {}
+                    }
+                }
             }
         });
         Self {
             queue,
             worker,
             metrics,
+            wake,
+            next_sequence: AtomicU64::new(0),
         }
     }
 
@@ -199,6 +325,49 @@ impl Scheduler {
         cancellation: CancellationToken,
         events: mpsc::Sender<BuildEvent>,
     ) -> Result<QueueHandle, SchedulerError> {
+        self.enqueue_with_priority_and_parameters(
+            plan,
+            pipeline,
+            repository_root,
+            parameters,
+            0,
+            cancellation,
+            events,
+        )
+        .await
+    }
+
+    pub async fn enqueue_with_priority(
+        &self,
+        plan: ExecutionPlan,
+        pipeline: Pipeline,
+        repository_root: PathBuf,
+        priority: i32,
+        cancellation: CancellationToken,
+        events: mpsc::Sender<BuildEvent>,
+    ) -> Result<QueueHandle, SchedulerError> {
+        self.enqueue_with_priority_and_parameters(
+            plan,
+            pipeline,
+            repository_root,
+            BTreeMap::new(),
+            priority,
+            cancellation,
+            events,
+        )
+        .await
+    }
+
+    pub async fn enqueue_with_priority_and_parameters(
+        &self,
+        plan: ExecutionPlan,
+        pipeline: Pipeline,
+        repository_root: PathBuf,
+        parameters: BTreeMap<String, String>,
+        priority: i32,
+        cancellation: CancellationToken,
+        events: mpsc::Sender<BuildEvent>,
+    ) -> Result<QueueHandle, SchedulerError> {
         events
             .send(BuildEvent::BuildQueued {
                 build_id: plan.build_id,
@@ -208,6 +377,7 @@ impl Scheduler {
             .await
             .map_err(|_| SchedulerError::Closed)?;
         let (completion, result) = oneshot::channel();
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         self.metrics.queued.fetch_add(1, Ordering::Relaxed);
         if self
             .queue
@@ -219,6 +389,8 @@ impl Scheduler {
                 cancellation: cancellation.clone(),
                 events,
                 completion,
+                priority,
+                sequence,
             })
             .await
             .is_err()
@@ -230,6 +402,7 @@ impl Scheduler {
             build_id: plan.build_id,
             cancellation,
             completion: result,
+            wake: self.wake.clone(),
         })
     }
 }
@@ -257,6 +430,7 @@ async fn finish_queued_cancellation(request: QueueRequest) {
 impl QueueHandle {
     pub fn cancel(&self) {
         self.cancellation.cancel();
+        self.wake.notify_one();
     }
 
     pub async fn wait(self) -> Result<Result<BuildStatus, RunnerError>, SchedulerError> {
@@ -328,6 +502,87 @@ args = ["-c", "printf done > result.txt"]
         // Let spawned reader tasks finish before the test drops its receivers.
         sleep(Duration::from_millis(10)).await;
         drop(receivers);
+    }
+
+    #[tokio::test]
+    async fn queue_runs_higher_priority_work_before_older_lower_priority_work() {
+        let dir = tempdir().expect("tempdir");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "priority"
+[[parameters]]
+name = "LABEL"
+[[stages]]
+name = "run"
+[[stages.steps]]
+name = "write"
+program = "sh"
+args = ["-c", "printf '%s' \"$LABEL\" >> priority.txt; sleep 0.35"]
+"#,
+        )
+        .expect("pipeline");
+        let project_id = uuid::Uuid::new_v4();
+        let scheduler = Scheduler::new(1, Some(1));
+        let (first_tx, first_rx) = mpsc::channel(64);
+        let first = scheduler
+            .enqueue_with_priority_and_parameters(
+                ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), project_id),
+                pipeline.clone(),
+                dir.path().to_path_buf(),
+                BTreeMap::from([(String::from("LABEL"), String::from("first"))]),
+                0,
+                CancellationToken::new(),
+                first_tx,
+            )
+            .await
+            .expect("first enqueue");
+        for _ in 0..40 {
+            if scheduler.stats().running == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(scheduler.stats().running, 1);
+
+        let (low_tx, low_rx) = mpsc::channel(64);
+        let low = scheduler
+            .enqueue_with_priority_and_parameters(
+                ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), project_id),
+                pipeline.clone(),
+                dir.path().to_path_buf(),
+                BTreeMap::from([(String::from("LABEL"), String::from("low"))]),
+                -10,
+                CancellationToken::new(),
+                low_tx,
+            )
+            .await
+            .expect("low enqueue");
+        let (high_tx, high_rx) = mpsc::channel(64);
+        let high = scheduler
+            .enqueue_with_priority_and_parameters(
+                ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), project_id),
+                pipeline,
+                dir.path().to_path_buf(),
+                BTreeMap::from([(String::from("LABEL"), String::from("high"))]),
+                10,
+                CancellationToken::new(),
+                high_tx,
+            )
+            .await
+            .expect("high enqueue");
+
+        for handle in [first, low, high] {
+            assert_eq!(
+                handle.wait().await.expect("scheduler").expect("run"),
+                BuildStatus::Passed
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(dir.path().join("priority.txt")).expect("priority output"),
+            "firsthighlow"
+        );
+        drop((first_rx, low_rx, high_rx));
     }
 
     #[tokio::test]

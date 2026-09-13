@@ -25,7 +25,7 @@ use rivet_core::{
 };
 use rivet_credentials::{CredentialError, CredentialVault};
 use rivet_extension_protocol::{ExtensionCatalog, ExtensionCatalogError, ExtensionManifest};
-use rivet_runner::{QueueHandle, QueueStats, Scheduler};
+use rivet_runner::{MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHandle, QueueStats, Scheduler};
 use rivet_scm::{GitHttpCredential, GitPrepareOptions, GitRepository, GitSnapshot, ScmError};
 use rivet_storage::{
     ArtifactRecord, AuditEventRecord, BuildDetails, BuildRecord, LogRecord, ScheduleRecord,
@@ -252,6 +252,9 @@ pub struct QueueBuildRequest {
     pub scm: Option<PrepareScmRequest>,
     #[serde(default)]
     pub parameters: BTreeMap<String, String>,
+    /// Higher values are admitted before older lower-priority builds.
+    #[serde(default)]
+    pub priority: i32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1490,6 +1493,7 @@ async fn enqueue_webhook_build(
         QueueBuildRequest {
             scm,
             parameters: request.parameters,
+            priority: 0,
         },
     )
     .await
@@ -1949,6 +1953,11 @@ async fn enqueue_project_build(
     project: Project,
     request: QueueBuildRequest,
 ) -> Result<QueueBuildResponse, ApiError> {
+    if !(MIN_QUEUE_PRIORITY..=MAX_QUEUE_PRIORITY).contains(&request.priority) {
+        return Err(ApiError::BadRequest(format!(
+            "build priority must be between {MIN_QUEUE_PRIORITY} and {MAX_QUEUE_PRIORITY}"
+        )));
+    }
     let repository_root = PathBuf::from(&project.repository_path);
     let source = capture_source_snapshot(
         &repository_root,
@@ -2070,11 +2079,12 @@ async fn enqueue_project_build(
     } else {
         let handle = state
             .scheduler
-            .enqueue_with_parameters(
+            .enqueue_with_priority_and_parameters(
                 plan,
                 pipeline,
                 repository_root,
                 parameters,
+                request.priority,
                 cancellation.clone(),
                 events,
             )

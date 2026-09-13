@@ -6,14 +6,15 @@ from Jenkins.
 ## Delivery progress
 
 **85% verified** · `█████████████████░░░`<br>
-Weighted evidence score: **85.63 / 100** · displayed conservatively as the
+Weighted evidence score: **85.93 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
 and unverified work remains at zero until it passes its gate.
 
-Last verified update: **2026-09-13** · native pipeline execution, FIFO queue,
+Last verified update: **2026-09-13** · native pipeline execution, priority-aware
+FIFO queue,
 SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
 inspection, persisted build-source identity, live queue telemetry, durable
 event replay, quiet engine offline recovery, explicit Git preparation at build
@@ -100,6 +101,7 @@ From a repository containing `Rivetfile.toml`:
 cargo run -p rivet -- init .
 cargo run -p rivet -- project create rivet --repository .
 cargo run -p rivet -- run rivet
+cargo run -p rivet -- run rivet --priority 20
 cargo run -p rivet -- builds rivet
 cargo run -p rivet -- logs rivet --build 1
 ```
@@ -107,7 +109,10 @@ cargo run -p rivet -- logs rivet --build 1
 The build command uses the Rust queue, real child processes, live event
 projection, and SQLite history. For Git repositories, the build record also
 captures the commit, reference, remote, and dirty state observed at admission.
-Press Ctrl-C during a running step to exercise the cancellation path.
+Use `--priority -100..100` to move urgent builds ahead of older queued work;
+equal priorities retain FIFO order and per-project/global capacity limits still
+apply. The HTTP build body accepts the same `priority` field. Press Ctrl-C
+during a running step to exercise the cancellation path.
 
 ## Run headless
 

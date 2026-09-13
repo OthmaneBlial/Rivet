@@ -18,7 +18,7 @@ use rivet_core::{
 use rivet_credentials::CredentialVault;
 use rivet_migration::{analyze_jenkinsfile_file, generate_rivetfile_draft_file};
 use rivet_runner::execute_pipeline_with_parameters;
-use rivet_runner::{CacheStore, QueueHandle, Scheduler};
+use rivet_runner::{CacheStore, MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHandle, Scheduler};
 use rivet_scm::{GitHttpCredential, GitPrepareOptions, GitRepository, ScmError};
 use rivet_storage::Storage;
 use sha2::{Digest, Sha256};
@@ -354,6 +354,9 @@ struct RunArgs {
     credentials_passphrase_file: Option<PathBuf>,
     #[arg(long = "param", value_name = "NAME=VALUE")]
     parameters: Vec<String>,
+    /// Queue priority from -100 to 100; higher values run first.
+    #[arg(long, default_value_t = 0)]
+    priority: i32,
 }
 
 #[derive(Debug, Args)]
@@ -1909,12 +1912,19 @@ async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::
         args.credentials_passphrase_file.as_deref(),
     )?;
     let supplied_parameters = parse_parameters(&args.parameters)?;
+    if !(MIN_QUEUE_PRIORITY..=MAX_QUEUE_PRIORITY).contains(&args.priority) {
+        return Err(format!(
+            "build priority must be between {MIN_QUEUE_PRIORITY} and {MAX_QUEUE_PRIORITY}"
+        )
+        .into());
+    }
     run_project_with_options(
         data_dir,
         &args.project,
         scm,
         supplied_parameters,
         credential,
+        args.priority,
     )
     .await
 }
@@ -1957,7 +1967,7 @@ async fn retry_project(
         parameters.extend(replacements);
         parameters
     };
-    run_project_with_options(data_dir, name, None, supplied_parameters, None).await
+    run_project_with_options(data_dir, name, None, supplied_parameters, None, 0).await
 }
 
 async fn run_project_with_options(
@@ -1966,6 +1976,7 @@ async fn run_project_with_options(
     scm: Option<GitPrepareOptions>,
     supplied_parameters: BTreeMap<String, String>,
     credential: Option<GitHttpCredential>,
+    priority: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage = open_storage(data_dir)?;
     let project = storage
@@ -2008,11 +2019,12 @@ async fn run_project_with_options(
     let cancellation = CancellationToken::new();
     let scheduler = Scheduler::new_with_cache(1, Some(1), Some(storage.cache_root()));
     let handle = scheduler
-        .enqueue_with_parameters(
+        .enqueue_with_priority_and_parameters(
             plan,
             pipeline,
             PathBuf::from(project.repository_path.clone()),
             parameters,
+            priority,
             cancellation.clone(),
             events,
         )

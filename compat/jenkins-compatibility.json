@@ -44,10 +44,10 @@
     },
     {
       "category": "Queue",
-      "feature": "FIFO queue with global and per-project limits",
+      "feature": "Priority queue with FIFO ties and global/per-project limits",
       "status": "partial",
       "evidence": ["crates/rivet-runner/src/scheduler.rs"],
-      "notes": "Queued cancellation is handled before execution; priority, resource requirements, and observable queue administration remain planned."
+      "notes": "Higher bounded priorities run before older lower-priority work while equal priorities retain FIFO order; queued cancellation is handled before execution, while resource requirements and observable queue administration remain planned."
     },
     {
       "category": "Artifacts",

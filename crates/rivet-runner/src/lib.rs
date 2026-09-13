@@ -14,4 +14,6 @@ pub use pipeline::{
     execute_pipeline_with_parameters_and_cache,
 };
 pub use process::{LogLine, ProcessError, ProcessOutcome, ProcessResult, ProcessSpec, run_process};
-pub use scheduler::{QueueHandle, QueueStats, Scheduler, SchedulerError};
+pub use scheduler::{
+    MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHandle, QueueStats, Scheduler, SchedulerError,
+};
