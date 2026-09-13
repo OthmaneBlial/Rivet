@@ -6,14 +6,14 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.67 / 100** · displayed conservatively as the
+Weighted evidence score: **92.73 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
 and unverified work remains at zero until it passes its gate.
 
-Last verified update: **2026-09-13** · native pipeline execution, priority-aware
+Last verified update: **2026-09-14** · native pipeline execution, priority-aware
 FIFO queue with pause/resume controls,
 SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
 inspection, persisted build-source identity, live queue telemetry, durable
@@ -28,7 +28,8 @@ toggle, persistent UTC cron schedules, server dispatch, desktop schedule
 controls, signed generic webhook delivery with idempotent redelivery,
 policy-backed API identities with role/project authorization,
 secret-parameter redaction/masking, a passphrase-encrypted SCM credential vault
-with typed HTTP/SSH credentials, non-secret credential references and project allow-lists, and a packaged desktop launch with an
+with typed HTTP/SSH credentials, non-secret credential references, project allow-lists,
+and deployment-specific OS-keychain service/account isolation, and a packaged desktop launch with an
 ephemeral loopback engine origin, project-scoped local CI cache restore and
 save, explicit Docker/Podman container command assembly with bounded workspace mounts,
 and a bounded Jenkinsfile migration analyzer with line-level support findings
@@ -462,7 +463,12 @@ then reads the passphrase from the OS store at server startup. There is no
 automatic plaintext-file fallback when the keychain mode is selected. A local
 macOS write/read/delete round-trip is covered by an explicit opt-in test;
 deployment-specific keychain prompts and policies still require validation on
-each target OS.
+each target OS. Deployments can isolate the service namespace explicitly by
+passing `--service rivet-production` to `credential keychain-set` and
+`credential keychain-remove`, then passing
+`--credentials-keychain-service rivet-production` to `server`; omitting it
+preserves the compatibility service name `Rivet`. A custom service is rejected
+unless a keychain account is also selected.
 
 The desktop control room exposes the same admin-only lifecycle when the server
 has a vault configured: it shows credential IDs, usernames, and non-secret

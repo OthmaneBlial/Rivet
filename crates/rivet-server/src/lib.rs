@@ -218,6 +218,9 @@ pub struct ServerConfig {
     pub credentials_file: Option<PathBuf>,
     pub credentials_passphrase: Option<String>,
     pub credentials_keychain_account: Option<String>,
+    /// Optional deployment-specific OS keychain service for the vault
+    /// passphrase. The default service remains `Rivet` for compatibility.
+    pub credentials_keychain_service: Option<String>,
     /// Optional deployment-controlled OpenSSH trust root for SSH SCM fetches.
     /// When absent, OpenSSH's normal system/user known-hosts files apply.
     pub ssh_known_hosts_file: Option<PathBuf>,
@@ -799,6 +802,7 @@ pub async fn serve(storage_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(
             credentials_file: None,
             credentials_passphrase: None,
             credentials_keychain_account: None,
+            credentials_keychain_service: None,
             ssh_known_hosts_file: None,
             extension_manifest_dir: None,
             allowed_origins: default_allowed_origins(),
@@ -845,7 +849,13 @@ pub async fn serve_with_listener(
             path, passphrase,
         )?))),
         (Some(path), None, Some(account)) => {
-            let passphrase = CredentialKeychain::rivet().get_passphrase(account)?;
+            let keychain = config
+                .credentials_keychain_service
+                .as_deref()
+                .map(CredentialKeychain::new)
+                .transpose()?
+                .unwrap_or_else(CredentialKeychain::rivet);
+            let passphrase = keychain.get_passphrase(account)?;
             Some(Arc::new(Mutex::new(CredentialVault::open(
                 path,
                 passphrase.as_bytes(),
@@ -979,8 +989,12 @@ fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
         config.credentials_file.is_some(),
         config.credentials_passphrase.is_some(),
         config.credentials_keychain_account.is_some(),
+        config.credentials_keychain_service.is_some(),
     ) {
-        (false, false, false) | (true, true, false) | (true, false, true) => {}
+        (false, false, false, false)
+        | (true, true, false, false)
+        | (true, false, true, false)
+        | (true, false, true, true) => {}
         _ => return Err(ServerError::IncompleteCredentialVaultConfig),
     }
     if config
@@ -996,6 +1010,16 @@ fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
         .is_some_and(|account| account.trim().is_empty())
     {
         return Err(ServerError::IncompleteCredentialVaultConfig);
+    }
+    if config
+        .credentials_keychain_service
+        .as_deref()
+        .is_some_and(|service| service.trim().is_empty())
+    {
+        return Err(ServerError::IncompleteCredentialVaultConfig);
+    }
+    if let Some(service) = config.credentials_keychain_service.as_deref() {
+        CredentialKeychain::new(service.to_owned())?;
     }
     if let Some(path) = config.ssh_known_hosts_file.as_deref() {
         validate_known_hosts_file(path)
@@ -4893,6 +4917,60 @@ mod tests {
         assert_eq!(payload["service"], "rivet-server");
         assert_eq!(payload["storage"], "ok");
         assert!(payload.get("error").is_none());
+    }
+
+    #[test]
+    fn keychain_service_requires_an_explicit_account() {
+        let config = ServerConfig {
+            bind: "127.0.0.1:7878".parse().expect("bind"),
+            auth_token: None,
+            auth_policy_file: None,
+            webhook_secret: None,
+            github_webhook_secret: None,
+            gitlab_webhook_secret: None,
+            github_webhook_credential_id: None,
+            gitlab_webhook_credential_id: None,
+            credentials_file: None,
+            credentials_passphrase: None,
+            credentials_keychain_account: None,
+            credentials_keychain_service: Some("rivet-production".into()),
+            ssh_known_hosts_file: None,
+            extension_manifest_dir: None,
+            allowed_origins: Vec::new(),
+        };
+
+        assert!(matches!(
+            validate_config(&config),
+            Err(ServerError::IncompleteCredentialVaultConfig)
+        ));
+    }
+
+    #[test]
+    fn invalid_keychain_service_is_rejected_before_startup() {
+        let config = ServerConfig {
+            bind: "127.0.0.1:7878".parse().expect("bind"),
+            auth_token: None,
+            auth_policy_file: None,
+            webhook_secret: None,
+            github_webhook_secret: None,
+            gitlab_webhook_secret: None,
+            github_webhook_credential_id: None,
+            gitlab_webhook_credential_id: None,
+            credentials_file: Some(PathBuf::from("credentials.vault")),
+            credentials_passphrase: None,
+            credentials_keychain_account: Some("rivet-production".into()),
+            credentials_keychain_service: Some("rivet\0production".into()),
+            ssh_known_hosts_file: None,
+            extension_manifest_dir: None,
+            allowed_origins: Vec::new(),
+        };
+
+        assert!(matches!(
+            validate_config(&config),
+            Err(ServerError::Credentials(
+                CredentialError::InvalidKeychainLabel("service")
+            ))
+        ));
     }
 
     #[tokio::test]

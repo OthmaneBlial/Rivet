@@ -790,6 +790,7 @@ mod tests {
     #[test]
     fn keychain_labels_and_passphrases_are_validated_before_access() {
         assert!(CredentialKeychain::new(" ").is_err());
+        assert!(CredentialKeychain::new("rivet-production").is_ok());
         assert!(
             CredentialKeychain::rivet()
                 .set_passphrase("account", "short")

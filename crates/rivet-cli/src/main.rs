@@ -316,6 +316,9 @@ enum Command {
         /// Read the credential vault passphrase from the OS keychain account.
         #[arg(long, conflicts_with = "credentials_passphrase_file")]
         credentials_keychain_account: Option<String>,
+        /// Use a deployment-specific OS keychain service with the account.
+        #[arg(long, requires = "credentials_keychain_account")]
+        credentials_keychain_service: Option<String>,
         /// Use this deployment-controlled OpenSSH known-hosts file for SSH SCM fetches.
         #[arg(long)]
         ssh_known_hosts_file: Option<PathBuf>,
@@ -417,9 +420,17 @@ enum CredentialCommand {
         account: String,
         #[arg(long)]
         passphrase_file: PathBuf,
+        /// OS keychain service; defaults to the shared Rivet service.
+        #[arg(long, default_value = "Rivet")]
+        service: String,
     },
     /// Remove a vault passphrase from the operating-system keychain.
-    KeychainRemove { account: String },
+    KeychainRemove {
+        account: String,
+        /// OS keychain service; defaults to the shared Rivet service.
+        #[arg(long, default_value = "Rivet")]
+        service: String,
+    },
     /// List credential IDs and usernames without revealing secrets.
     List {
         #[arg(long)]
@@ -697,6 +708,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             credentials_file,
             credentials_passphrase_file,
             credentials_keychain_account,
+            credentials_keychain_service,
             ssh_known_hosts_file,
             extension_manifest_dir,
             allowed_origins,
@@ -732,6 +744,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     credentials_file,
                     credentials_passphrase,
                     credentials_keychain_account,
+                    credentials_keychain_service,
                     ssh_known_hosts_file,
                     extension_manifest_dir,
                     allowed_origins,
@@ -2036,14 +2049,19 @@ fn manage_credentials(
         CredentialCommand::KeychainSet {
             account,
             passphrase_file,
+            service,
         } => {
             let passphrase = read_private_value(&passphrase_file, "credential vault passphrase")?;
-            CredentialKeychain::rivet().set_passphrase(&account, &passphrase)?;
-            println!("Stored the vault passphrase in the OS keychain account {account}");
+            CredentialKeychain::new(service.clone())?.set_passphrase(&account, &passphrase)?;
+            println!(
+                "Stored the vault passphrase in the OS keychain service {service}, account {account}"
+            );
         }
-        CredentialCommand::KeychainRemove { account } => {
-            CredentialKeychain::rivet().delete_passphrase(&account)?;
-            println!("Removed the vault passphrase from the OS keychain account {account}");
+        CredentialCommand::KeychainRemove { account, service } => {
+            CredentialKeychain::new(service.clone())?.delete_passphrase(&account)?;
+            println!(
+                "Removed the vault passphrase from the OS keychain service {service}, account {account}"
+            );
         }
         CredentialCommand::List {
             passphrase_file,

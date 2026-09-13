@@ -132,14 +132,14 @@
       "feature": "Secret parameter redaction and log masking",
       "status": "partial",
       "evidence": ["crates/rivet-core/src/pipeline.rs", "crates/rivet-storage/src/lib.rs", "crates/rivet-runner/src/pipeline.rs", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
-      "notes": "Secret parameters require runtime input without defaults, are redacted in persisted build/API data, masked in emitted process output, and must be supplied again for retries. SCM credentials can be stored as authenticated ciphertext in a passphrase-encrypted local vault, referenced by ID, and rotated or removed through an administrator-only API with bounded audit events; project allow-lists and an OS-keychain-backed vault passphrase source are supported, while deployment-specific keychain policy and richer ownership workflows remain planned."
+      "notes": "Secret parameters require runtime input without defaults, are redacted in persisted build/API data, masked in emitted process output, and must be supplied again for retries. SCM credentials can be stored as authenticated ciphertext in a passphrase-encrypted local vault, referenced by ID, and rotated or removed through an administrator-only API with bounded audit events; project allow-lists and an OS-keychain-backed vault passphrase source with validated deployment-specific service/account selection are supported, while target-OS keychain prompts/ACLs and richer ownership workflows remain planned."
     },
     {
       "category": "Security",
       "feature": "Encrypted SCM credential vault",
       "status": "partial",
       "evidence": ["crates/rivet-credentials/src/lib.rs", "crates/rivet-scm/src/lib.rs", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
-      "notes": "The CLI reads a passphrase and secret from private regular files, stores only authenticated ciphertext, lists metadata without secrets, and the server resolves non-secret IDs for Git fetches. The server also exposes administrator-only list/replace/remove operations with audit events that never record the secret. Project allow-lists and an OS-keychain-backed vault passphrase source are supported; deployment-specific keychain policy and richer ownership workflows remain planned."
+      "notes": "The CLI reads a passphrase and secret from private regular files, stores only authenticated ciphertext, lists metadata without secrets, and the server resolves non-secret IDs for Git fetches. The server also exposes administrator-only list/replace/remove operations with audit events that never record the secret. Project allow-lists and an OS-keychain-backed vault passphrase source are supported, with explicit service/account selection and validation for deployment isolation; target-OS keychain prompts/ACLs and richer ownership workflows remain planned."
     },
     {
       "category": "Plugins",
