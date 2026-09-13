@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**85% verified** · `█████████████████░░░`<br>
-Weighted evidence score: **85.93 / 100** · displayed conservatively as the
+**86% verified** · `██████████████████░░`<br>
+Weighted evidence score: **86.13 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -18,7 +18,8 @@ FIFO queue,
 SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
 inspection, persisted build-source identity, live queue telemetry, durable
 event replay, quiet engine offline recovery, explicit Git preparation at build
-admission, parameterized builds, local artifact storage, protected server
+admission, parameterized builds, local artifact storage and retention pruning,
+protected server
 transport, build retry, pre-execution queue cancellation, build artifact
 downloads, and a light-default desktop theme with an accessible dark-mode
 toggle, persistent UTC cron schedules, server dispatch, desktop schedule
@@ -441,7 +442,9 @@ files stay inside the pipeline workspace, are copied to local Rivet storage
 with a SHA-256 checksum, and are available through the build artifacts API or
 `rivet artifacts`. Remote agents package only declared artifact matches and
 return them through bounded checksum-verified archive chunks before the build
-is marked passed.
+is marked passed. Retention pruning removes the oldest artifacts from completed
+builds under an explicit byte budget; active-build artifacts, symlinks, and
+non-regular paths are preserved.
 
 Old local cache archives can be removed with an explicit byte budget; only
 regular `.tar` entries are eligible, while symlinks and temporary files are
@@ -449,6 +452,7 @@ left untouched:
 
 ```sh
 cargo run -p rivet -- cache prune --max-bytes 5368709120
+cargo run -p rivet -- artifact prune --max-bytes 10737418240
 ```
 
 A step can opt into explicit Docker execution with `[stages.steps.container]`.

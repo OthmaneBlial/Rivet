@@ -54,7 +54,7 @@
       "feature": "Build artifact collection, checksums, and download",
       "status": "partial",
       "evidence": ["crates/rivet-core/src/pipeline.rs", "crates/rivet-storage/src/lib.rs", "crates/rivet-server/src/lib.rs"],
-      "notes": "Local workspace artifacts are copied into build-scoped storage and exposed through the API. Remote agents package declared matches into bounded checksum-verified chunks before the server validates and stores them; retention policies and remote object stores remain planned."
+      "notes": "Local workspace artifacts are copied into build-scoped storage and exposed through the API. Remote agents package declared matches into bounded checksum-verified chunks before the server validates and stores them; explicit age-ordered pruning of completed-build artifacts is available, while remote object stores remain planned."
     },
     {
       "category": "Execution",

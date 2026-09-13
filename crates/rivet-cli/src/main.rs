@@ -93,6 +93,11 @@ enum Command {
         #[arg(long)]
         build: i64,
     },
+    /// Inspect and prune artifacts stored from completed builds.
+    Artifact {
+        #[command(subcommand)]
+        command: ArtifactCommand,
+    },
     /// Queue a new build using a completed build's parameters.
     Retry {
         project: String,
@@ -285,6 +290,15 @@ enum CacheCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum ArtifactCommand {
+    /// Remove oldest completed-build artifacts until they fit a byte budget.
+    Prune {
+        #[arg(long, value_name = "BYTES")]
+        max_bytes: u64,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum AuthRoleArg {
     Admin,
@@ -438,6 +452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Builds { project } => list_builds(&cli.data_dir, &project)?,
         Command::Logs { project, build } => show_logs(&cli.data_dir, &project, build)?,
         Command::Artifacts { project, build } => list_artifacts(&cli.data_dir, &project, build)?,
+        Command::Artifact { command } => manage_artifacts(&cli.data_dir, command)?,
         Command::Retry {
             project,
             build,
@@ -1623,6 +1638,30 @@ fn manage_cache(data_dir: &Path, command: CacheCommand) -> Result<(), Box<dyn st
         CacheCommand::Prune { max_bytes } => {
             let storage = open_storage(data_dir)?;
             let result = CacheStore::new(storage.cache_root()).prune(max_bytes)?;
+            println!(
+                "removed {} entr{} ({} bytes); {} bytes remain",
+                result.removed_entries,
+                if result.removed_entries == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                result.removed_bytes,
+                result.remaining_bytes
+            );
+        }
+    }
+    Ok(())
+}
+
+fn manage_artifacts(
+    data_dir: &Path,
+    command: ArtifactCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        ArtifactCommand::Prune { max_bytes } => {
+            let storage = open_storage(data_dir)?;
+            let result = storage.prune_artifacts(max_bytes)?;
             println!(
                 "removed {} entr{} ({} bytes); {} bytes remain",
                 result.removed_entries,

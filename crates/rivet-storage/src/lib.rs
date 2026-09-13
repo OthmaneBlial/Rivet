@@ -174,6 +174,13 @@ pub struct ArtifactRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactPruneResult {
+    pub removed_entries: usize,
+    pub removed_bytes: u64,
+    pub remaining_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScheduleRecord {
     pub id: ScheduleId,
@@ -1164,6 +1171,79 @@ impl Storage {
             })
         })
     }
+
+    /// Remove oldest artifacts from completed builds until their recorded
+    /// total fits the byte budget. Active-build artifacts, symlinks, and
+    /// non-regular paths are preserved.
+    pub fn prune_artifacts(&self, max_bytes: u64) -> Result<ArtifactPruneResult, StorageError> {
+        let candidates = {
+            let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+            let mut statement = connection.prepare(
+                "SELECT a.id, a.build_id, a.name, a.relative_path, a.size_bytes,
+                        a.checksum, a.created_at
+                 FROM build_artifacts a
+                 JOIN builds b ON b.id = a.build_id
+                 WHERE b.status IN ('passed', 'failed', 'cancelled')
+                 ORDER BY a.created_at ASC, a.id ASC",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?;
+            rows.map(|row| {
+                let artifact = parse_artifact(row?)?;
+                let path = self
+                    .artifact_root
+                    .join(artifact.build_id.to_string())
+                    .join(artifact.id.to_string());
+                Ok::<_, StorageError>((artifact, path))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut remaining_bytes = candidates.iter().fold(0_u64, |total, (artifact, _)| {
+            total.saturating_add(artifact.size_bytes)
+        });
+        let mut removed_entries = 0;
+        let mut removed_bytes = 0_u64;
+        for (artifact, path) in candidates {
+            if remaining_bytes <= max_bytes {
+                break;
+            }
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => continue,
+                Ok(metadata) if metadata.is_file() => fs::remove_file(&path)?,
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(StorageError::Filesystem(error)),
+            }
+
+            let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+            let deleted = connection.execute(
+                "DELETE FROM build_artifacts WHERE id = ?1",
+                params![artifact.id.to_string()],
+            )?;
+            if deleted == 0 {
+                continue;
+            }
+            remaining_bytes = remaining_bytes.saturating_sub(artifact.size_bytes);
+            removed_entries += 1;
+            removed_bytes = removed_bytes.saturating_add(artifact.size_bytes);
+        }
+
+        Ok(ArtifactPruneResult {
+            removed_entries,
+            removed_bytes,
+            remaining_bytes,
+        })
+    }
 }
 
 type RawProject = (String, String, String, String, String);
@@ -1790,6 +1870,127 @@ program = "true"
         drop(storage);
         let reopened = Storage::open(&database).expect("reopen");
         assert_eq!(reopened.artifacts(build.id).expect("artifacts"), collected);
+    }
+
+    #[test]
+    fn prunes_oldest_completed_artifacts_without_touching_active_builds() {
+        let directory = tempdir().expect("tempdir");
+        let workspace = directory.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "artifact-retention"
+[[artifacts]]
+name = "bundle"
+paths = ["artifact.txt"]
+[[stages]]
+name = "Build"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+        let project = Project::new(
+            "artifact-retention",
+            workspace.to_string_lossy().into_owned(),
+            workspace
+                .join("Rivetfile.toml")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .expect("project");
+        let database = directory.path().join("rivet.db");
+        let storage = Storage::open(&database).expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+
+        let mut completed = Vec::new();
+        for contents in ["a", "bb", "ccc"] {
+            fs::write(workspace.join("artifact.txt"), contents).expect("artifact");
+            let plan = ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), project.id);
+            let build = storage
+                .create_build(&project, &plan, &pipeline, None)
+                .expect("build");
+            let artifacts = storage
+                .collect_artifacts(build.id, &pipeline, &workspace)
+                .expect("collect");
+            completed.push(artifacts[0].clone());
+            storage
+                .apply_event(&BuildEvent::BuildQueued {
+                    build_id: build.id,
+                    project_id: project.id,
+                    timestamp: Utc::now(),
+                })
+                .expect("queued");
+            storage
+                .apply_event(&BuildEvent::BuildStarted {
+                    build_id: build.id,
+                    timestamp: Utc::now(),
+                })
+                .expect("started");
+            storage
+                .apply_event(&BuildEvent::BuildFinished {
+                    build_id: build.id,
+                    status: BuildStatus::Passed,
+                    timestamp: Utc::now(),
+                })
+                .expect("finished");
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+
+        fs::write(workspace.join("artifact.txt"), "live").expect("active artifact");
+        let active_plan = ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), project.id);
+        let active_build = storage
+            .create_build(&project, &active_plan, &pipeline, None)
+            .expect("active build");
+        let active_artifact = storage
+            .collect_artifacts(active_build.id, &pipeline, &workspace)
+            .expect("active collect")[0]
+            .clone();
+
+        let first_prune = storage.prune_artifacts(3).expect("first prune");
+        assert_eq!(first_prune.removed_entries, 2);
+        assert_eq!(first_prune.removed_bytes, 3);
+        assert_eq!(first_prune.remaining_bytes, 3);
+        assert!(
+            storage
+                .artifact_file(completed[0].id)
+                .expect("first lookup")
+                .is_none()
+        );
+        assert!(
+            storage
+                .artifact_file(completed[1].id)
+                .expect("second lookup")
+                .is_none()
+        );
+        assert!(
+            storage
+                .artifact_file(completed[2].id)
+                .expect("third lookup")
+                .is_some()
+        );
+        assert!(
+            storage
+                .artifact_file(active_artifact.id)
+                .expect("active lookup")
+                .is_some()
+        );
+
+        let second_prune = storage.prune_artifacts(0).expect("second prune");
+        assert_eq!(second_prune.removed_entries, 1);
+        assert_eq!(second_prune.removed_bytes, 3);
+        assert_eq!(second_prune.remaining_bytes, 0);
+        assert_eq!(
+            storage
+                .artifacts(active_build.id)
+                .expect("active artifacts")
+                .len(),
+            1
+        );
     }
 
     #[test]
