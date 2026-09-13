@@ -553,6 +553,15 @@ async fn handle_agent_socket(mut socket: WebSocket, agents: AgentRegistry) {
             Message::Pong(_) => continue,
             message => match decode_agent_message(message) {
                 Ok(AgentMessage::Heartbeat(heartbeat)) => {
+                    if heartbeat.agent_id != lease.agent_id {
+                        let _ = send_agent_error(
+                            &mut socket,
+                            "agent_identity_mismatch",
+                            "heartbeat agent_id does not match the registered session",
+                        )
+                        .await;
+                        break;
+                    }
                     let sequence = heartbeat.sequence;
                     match agents.heartbeat(heartbeat, Utc::now()).await {
                         Ok(_) => {
@@ -1302,9 +1311,14 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use chrono::TimeZone;
+    use futures_util::{SinkExt, StreamExt};
+    use rivet_agent_protocol::{
+        AgentCapabilities, AgentHeartbeat, AgentRegistration, PROTOCOL_VERSION,
+    };
     use std::fs;
     use tempfile::tempdir;
     use tokio::time::sleep;
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -1354,6 +1368,89 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 4096).await.expect("body");
         assert_eq!(&body[..], b"[]");
+    }
+
+    #[tokio::test]
+    async fn agent_websocket_registers_and_acknowledges_heartbeats() {
+        let state = AppState::new(Storage::open_in_memory().expect("storage"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(state.clone()))
+                .await
+                .expect("agent server");
+        });
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/api/v1/agents/connect"))
+                .await
+                .expect("connect");
+        let agent_id = uuid::Uuid::new_v4();
+        let registration = AgentMessage::Register(AgentRegistration {
+            protocol_version: PROTOCOL_VERSION,
+            agent_id,
+            name: "test-agent".into(),
+            capabilities: AgentCapabilities {
+                os: "macos".into(),
+                arch: "aarch64".into(),
+                docker: false,
+                labels: vec!["local".into()],
+                executors: 1,
+            },
+        });
+        socket
+            .send(ClientMessage::Text(
+                serde_json::to_string(&registration)
+                    .expect("registration JSON")
+                    .into(),
+            ))
+            .await
+            .expect("send registration");
+        let registered = socket
+            .next()
+            .await
+            .expect("registered message")
+            .expect("registered frame");
+        let ClientMessage::Text(registered) = registered else {
+            panic!("expected registered text frame");
+        };
+        let AgentMessage::Registered { session_id, .. } =
+            serde_json::from_str(registered.as_ref()).expect("registered JSON")
+        else {
+            panic!("expected registered response");
+        };
+
+        let heartbeat = AgentMessage::Heartbeat(AgentHeartbeat {
+            protocol_version: PROTOCOL_VERSION,
+            agent_id,
+            session_id,
+            sequence: 1,
+            running: vec![],
+            sent_at: Utc::now(),
+        });
+        socket
+            .send(ClientMessage::Text(
+                serde_json::to_string(&heartbeat)
+                    .expect("heartbeat JSON")
+                    .into(),
+            ))
+            .await
+            .expect("send heartbeat");
+        let acknowledged = socket
+            .next()
+            .await
+            .expect("heartbeat ack")
+            .expect("heartbeat frame");
+        let ClientMessage::Text(acknowledged) = acknowledged else {
+            panic!("expected heartbeat ack text frame");
+        };
+        let acknowledged: AgentMessage =
+            serde_json::from_str(acknowledged.as_ref()).expect("ack JSON");
+        assert!(matches!(
+            acknowledged,
+            AgentMessage::HeartbeatAck { sequence: 1, .. }
+        ));
+        socket.close(None).await.expect("close");
+        server.abort();
     }
 
     #[tokio::test]
