@@ -27,9 +27,10 @@ and a bounded Jenkinsfile migration analyzer with line-level support findings
 plus safe drafts for deterministic shell steps, exposed through the headless
 API and rendered in the desktop control room. The server also exposes a
 versioned agent handshake/heartbeat registry with online/stale state, capacity-aware
-matching, a reconnecting heartbeat CLI client, and a rendered fleet view. Remote
-build assignment remains intentionally unimplemented until its transport and
-failure semantics are complete.
+matching, a reconnecting heartbeat CLI client, and a rendered fleet view. Pipeline
+steps can declare exact remote requirements; the local runner refuses those steps
+until assignment exists. Remote build assignment remains intentionally
+unimplemented until its transport and failure semantics are complete.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument

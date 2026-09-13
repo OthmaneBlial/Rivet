@@ -17,7 +17,7 @@
     {"id": "desktop", "weight": 10, "completion": 0.98, "status": "partial"},
     {"id": "scm", "weight": 8, "completion": 0.8, "status": "partial"},
     {"id": "triggers", "weight": 5, "completion": 0.75, "status": "partial"},
-    {"id": "agents", "weight": 10, "completion": 0.55, "status": "partial"},
+    {"id": "agents", "weight": 10, "completion": 0.6, "status": "partial"},
     {"id": "containers", "weight": 4, "completion": 0.2, "status": "partial"},
     {"id": "artifacts", "weight": 4, "completion": 0.75, "status": "partial"},
     {"id": "cache", "weight": 3, "completion": 0.4, "status": "partial"},
