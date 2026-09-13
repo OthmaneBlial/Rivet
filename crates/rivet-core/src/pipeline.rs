@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -10,7 +10,16 @@ pub struct Pipeline {
     pub name: String,
     #[serde(default)]
     pub workspace: Option<PathBuf>,
+    #[serde(default)]
+    pub parameters: Vec<ParameterSpec>,
     pub stages: Vec<Stage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParameterSpec {
+    pub name: String,
+    #[serde(default)]
+    pub default: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,6 +77,18 @@ pub enum PipelineError {
     MissingWorkspace(PathBuf),
     #[error("workspace path has no repository root: {0}")]
     InvalidRepositoryRoot(PathBuf),
+    #[error(
+        "parameter name {0:?} is invalid; use a letter or underscore followed by letters, digits, or underscores"
+    )]
+    InvalidParameterName(String),
+    #[error("parameter name {0:?} is reserved")]
+    ReservedParameterName(String),
+    #[error("duplicate parameter name {0:?}")]
+    DuplicateParameter(String),
+    #[error("parameter {0:?} is not declared by the pipeline")]
+    UnknownParameter(String),
+    #[error("required parameter {0:?} was not provided")]
+    MissingParameter(String),
 }
 
 impl Pipeline {
@@ -97,7 +118,24 @@ impl Pipeline {
             return Err(PipelineError::EmptyStages);
         }
 
-        let mut stage_names = std::collections::HashSet::new();
+        let mut parameter_names = HashSet::new();
+        for parameter in &self.parameters {
+            if !valid_parameter_name(&parameter.name) {
+                return Err(PipelineError::InvalidParameterName(parameter.name.clone()));
+            }
+            if parameter.name == "CI"
+                || parameter.name == "RIVET_BUILD_ID"
+                || parameter.name == "RIVET_PROJECT_ID"
+                || parameter.name.starts_with("RIVET_")
+            {
+                return Err(PipelineError::ReservedParameterName(parameter.name.clone()));
+            }
+            if !parameter_names.insert(parameter.name.as_str()) {
+                return Err(PipelineError::DuplicateParameter(parameter.name.clone()));
+            }
+        }
+
+        let mut stage_names = HashSet::new();
         for stage in &self.stages {
             if stage.name.trim().is_empty() || stage.steps.is_empty() {
                 return Err(PipelineError::EmptyStage(stage.name.clone()));
@@ -138,6 +176,35 @@ impl Pipeline {
         Ok(())
     }
 
+    pub fn resolve_parameters(
+        &self,
+        supplied: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>, PipelineError> {
+        let declared = self
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect::<HashSet<_>>();
+        if let Some(unknown) = supplied
+            .keys()
+            .find(|name| !declared.contains(name.as_str()))
+        {
+            return Err(PipelineError::UnknownParameter(unknown.clone()));
+        }
+
+        self.parameters
+            .iter()
+            .map(|parameter| {
+                supplied
+                    .get(&parameter.name)
+                    .or(parameter.default.as_ref())
+                    .cloned()
+                    .map(|value| (parameter.name.clone(), value))
+                    .ok_or_else(|| PipelineError::MissingParameter(parameter.name.clone()))
+            })
+            .collect()
+    }
+
     /// Resolve a pipeline workspace without allowing it to escape the
     /// associated repository.  The repository root must already exist; the
     /// selected workspace may be created by the runner.
@@ -176,6 +243,12 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+fn valid_parameter_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    matches!(characters.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +279,73 @@ timeout_seconds = 60
         assert_eq!(pipeline.stages[0].steps[0].program, "cargo");
         assert_eq!(pipeline.stages[0].steps[0].args, ["test"]);
         assert_eq!(pipeline.workspace, None);
+    }
+
+    #[test]
+    fn resolves_defaults_and_rejects_unknown_or_missing_parameters() {
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "parameterized"
+
+[[parameters]]
+name = "target"
+default = "debug"
+
+[[parameters]]
+name = "release_channel"
+
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+
+        let resolved = pipeline
+            .resolve_parameters(&BTreeMap::from([(
+                "release_channel".to_owned(),
+                "stable".to_owned(),
+            )]))
+            .expect("parameters resolve");
+        assert_eq!(resolved["target"], "debug");
+        assert_eq!(resolved["release_channel"], "stable");
+
+        assert!(matches!(
+            pipeline.resolve_parameters(&BTreeMap::from([(
+                "unknown".to_owned(),
+                "value".to_owned(),
+            ),])),
+            Err(PipelineError::UnknownParameter(name)) if name == "unknown"
+        ));
+        assert!(matches!(
+            pipeline.resolve_parameters(&BTreeMap::new()),
+            Err(PipelineError::MissingParameter(name)) if name == "release_channel"
+        ));
+    }
+
+    #[test]
+    fn rejects_parameter_names_that_could_override_engine_environment() {
+        let result = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "reserved"
+[[parameters]]
+name = "RIVET_BUILD_ID"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        );
+
+        assert!(matches!(
+            result,
+            Err(PipelineError::ReservedParameterName(name)) if name == "RIVET_BUILD_ID"
+        ));
     }
 
     #[test]
