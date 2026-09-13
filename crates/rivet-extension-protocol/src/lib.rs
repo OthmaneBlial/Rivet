@@ -753,11 +753,13 @@ impl WasmExtension {
         payload: Value,
     ) -> Result<Value, ExtensionHostError> {
         ensure_permission(&self.manifest, permission)?;
+        let method = method.into();
+        validate_method(&method)?;
         let request_id = Uuid::new_v4();
         let request = serde_json::json!({
             "abi_version": WASM_ABI_VERSION,
             "request_id": request_id,
-            "method": method.into(),
+            "method": method,
             "payload": payload,
         });
         let request = serde_json::to_vec(&request).map_err(|error| {

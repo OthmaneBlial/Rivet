@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.36 / 100** · displayed conservatively as the
+Weighted evidence score: **92.38 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -95,8 +95,9 @@ reports the validated catalog. The extension crate also provides a bounded
 subprocess lifecycle manager: it resolves only regular executables below an
 explicit root, rejects symlink/path escapes, permits one session per ID, and
 checks the declared permission on every host request. The server exposes
-administrator-only runtime status and subprocess start/stop actions, and the
-desktop view reflects that state. The bounded WASM runtime accepts only the
+administrator-only runtime status, start/stop actions, and a permission-checked
+`POST /api/v1/extensions/<id>/request` invocation route; the desktop view
+reflects that state. The bounded WASM runtime accepts only the
 documented JSON ABI, denies all module imports, caps module/memory/output
 sizes, and meters execution fuel. Filesystem, network, process, and clock
 capabilities are not exposed to WASM modules.

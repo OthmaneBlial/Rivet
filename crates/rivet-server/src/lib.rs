@@ -31,7 +31,7 @@ use rivet_credentials::{
 };
 use rivet_extension_protocol::{
     ExtensionCatalog, ExtensionCatalogError, ExtensionManager, ExtensionManagerError,
-    ExtensionManifest,
+    ExtensionManifest, ExtensionPermission,
 };
 use rivet_runner::{MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHandle, QueueStats, Scheduler};
 use rivet_scm::{
@@ -43,7 +43,7 @@ use rivet_storage::{
     ScheduleRecord, Storage, StorageError,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
@@ -535,6 +535,13 @@ struct ExtensionRuntimeStatusResponse {
     runtime_available: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct ExtensionRequestInput {
+    permission: ExtensionPermission,
+    method: String,
+    payload: Value,
+}
+
 pub fn router(state: AppState) -> Router {
     router_with_origins(state, &default_allowed_origins())
         .expect("default Rivet origins must be valid")
@@ -560,6 +567,7 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
         .route("/api/v1/extensions/status", get(extension_status))
         .route("/api/v1/extensions/{id}/start", post(start_extension))
         .route("/api/v1/extensions/{id}/stop", post(stop_extension))
+        .route("/api/v1/extensions/{id}/request", post(request_extension))
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/agents/match", post(match_agents))
         .route("/api/v1/agents/connect", get(connect_agent))
@@ -1625,6 +1633,24 @@ async fn stop_extension(
         .await
         .map_err(ApiError::ExtensionManager)?;
     extension_status_for(&state, &id).await
+}
+
+async fn request_extension(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<ExtensionRequestInput>,
+) -> Result<Json<Value>, ApiError> {
+    require_global(&principal, Permission::Administer)?;
+    let manager = state
+        .extension_manager
+        .as_ref()
+        .ok_or(ApiError::ExtensionsUnavailable)?;
+    let result = manager
+        .request(&id, request.permission, request.method, request.payload)
+        .await
+        .map_err(ApiError::ExtensionManager)?;
+    Ok(Json(result))
 }
 
 async fn extension_status_for(
@@ -4754,24 +4780,28 @@ mod tests {
             serde_json::to_vec(&manifest).expect("manifest JSON"),
         )
         .expect("manifest");
-        fs::write(
-            directory.path().join("coverage.wasm"),
-            wat::parse_str(
-                r#"(module
-                    (memory (export "memory") 1 1)
-                    (func (export "rivet_alloc") (param i32) (result i32) i32.const 0)
-                    (func (export "rivet_handle") (param i32 i32) (result i64) i64.const 0))"#,
-            )
-            .expect("WASM module"),
-        )
-        .expect("WASM module file");
+        let response = br#"{"abi_version":1,"result":{"ok":true}}"#;
+        let response_data = response
+            .iter()
+            .map(|byte| format!("\\{byte:02x}"))
+            .collect::<String>();
+        let packed = (u64::try_from(response.len()).expect("response length") << 32) | 1024;
+        let module = wat::parse_str(format!(
+            r#"(module
+                (memory (export "memory") 1 1)
+                (data (i32.const 1024) "{response_data}")
+                (func (export "rivet_alloc") (param i32) (result i32) i32.const 0)
+                (func (export "rivet_handle") (param i32 i32) (result i64) i64.const {packed}))"#
+        ))
+        .expect("WASM module");
+        fs::write(directory.path().join("coverage.wasm"), module).expect("WASM module file");
         let catalog = ExtensionCatalog::from_directory(Some(directory.path())).expect("catalog");
         let manager = ExtensionManager::new(directory.path(), &catalog).expect("manager");
         let mut state = AppState::new(Storage::open_in_memory().expect("storage"));
         state.extensions = Arc::new(catalog);
         state.extension_manager = Some(Arc::new(manager));
 
-        let response = router(state)
+        let response = router(state.clone())
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -4789,6 +4819,40 @@ mod tests {
             &body[..],
             br#"{"id":"coverage.reporter","active":true,"runtime_available":true}"#
         );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/extensions/coverage.reporter/request")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"permission":"read_builds","method":"summary","payload":{"build":7}}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("extension request response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("extension request body");
+        assert_eq!(&body[..], br#"{"ok":true}"#);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/extensions/coverage.reporter/request")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"permission":"trigger_builds","method":"trigger","payload":{}}"#,
+                    ))
+                    .expect("denied request"),
+            )
+            .await
+            .expect("denied extension request response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[cfg(unix)]

@@ -208,6 +208,21 @@ export function stopExtension(id: string): Promise<ExtensionRuntimeStatus> {
   );
 }
 
+export function requestExtension(
+  id: string,
+  permission: ExtensionManifest["permissions"][number],
+  method: string,
+  payload: unknown,
+): Promise<unknown> {
+  return request<unknown>(
+    `/api/v1/extensions/${encodeURIComponent(id)}/request`,
+    {
+      method: "POST",
+      body: JSON.stringify({ permission, method, payload }),
+    },
+  );
+}
+
 export function credentials(): Promise<CredentialSummary[]> {
   return request<CredentialSummary[]>("/api/v1/credentials");
 }

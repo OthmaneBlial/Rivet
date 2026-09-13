@@ -117,7 +117,7 @@
       "feature": "Versioned agent registration, assignment, and remote execution",
       "status": "partial",
       "evidence": ["crates/rivet-agent-protocol/src/lib.rs", "crates/rivet-server/src/agent_registry.rs", "crates/rivet-server/src/workspace_archive.rs", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs", "apps/desktop/src/App.tsx"],
-      "notes": "Agents negotiate a versioned protocol, advertise capabilities, reconnect with bounded backoff and session fencing, appear online or stale, and match only when capability and available executor requirements pass through POST /api/v1/agents/match. Remote builds reserve matching capacity, transfer bounded workspaces and declared artifact bundles, execute through the shared Rust runner, relay typed events and output, and propagate cancellation. A disconnect gets at most one replacement-agent attempt; unavailable recovery closes unfinished work as failed. Rivetfile steps still require identical requirements within one remote build; durable restart recovery, exactly-once semantics, and richer retry policy remain planned."
+      "notes": "Agents negotiate a versioned protocol, advertise capabilities, reconnect with bounded backoff and session fencing, appear online or stale, and match only when capability and available executor requirements pass through POST /api/v1/agents/match. Remote builds reserve matching capacity, transfer bounded workspaces and declared artifact bundles, execute through the shared Rust runner, relay typed events and output, and propagate cancellation. The session transport uses delivery IDs, ACKs, bounded duplicate suppression, and timed retransmission; a disconnect gets at most one replacement-agent attempt, while durable cross-session recovery remains planned."
     },
     {
       "category": "Security",
@@ -131,14 +131,14 @@
       "feature": "Secret parameter redaction and log masking",
       "status": "partial",
       "evidence": ["crates/rivet-core/src/pipeline.rs", "crates/rivet-storage/src/lib.rs", "crates/rivet-runner/src/pipeline.rs", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
-      "notes": "Secret parameters require runtime input without defaults, are redacted in persisted build/API data, masked in emitted process output, and must be supplied again for retries. SCM credentials can be stored as authenticated ciphertext in a passphrase-encrypted local vault, referenced by ID, and rotated or removed through an administrator-only API with bounded audit events; credential ownership, keychain integration, and project access control remain planned."
+      "notes": "Secret parameters require runtime input without defaults, are redacted in persisted build/API data, masked in emitted process output, and must be supplied again for retries. SCM credentials can be stored as authenticated ciphertext in a passphrase-encrypted local vault, referenced by ID, and rotated or removed through an administrator-only API with bounded audit events; project allow-lists and an OS-keychain-backed vault passphrase source are supported, while deployment-specific keychain policy and richer ownership workflows remain planned."
     },
     {
       "category": "Security",
       "feature": "Encrypted SCM credential vault",
       "status": "partial",
       "evidence": ["crates/rivet-credentials/src/lib.rs", "crates/rivet-scm/src/lib.rs", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
-      "notes": "The CLI reads a passphrase and secret from private regular files, stores only authenticated ciphertext, lists metadata without secrets, and the server resolves non-secret IDs for Git fetches. The server also exposes administrator-only list/replace/remove operations with audit events that never record the secret. Keychain-backed storage, audit ownership, and project-level access control remain planned."
+      "notes": "The CLI reads a passphrase and secret from private regular files, stores only authenticated ciphertext, lists metadata without secrets, and the server resolves non-secret IDs for Git fetches. The server also exposes administrator-only list/replace/remove operations with audit events that never record the secret. Project allow-lists and an OS-keychain-backed vault passphrase source are supported; deployment-specific keychain policy and richer ownership workflows remain planned."
     },
     {
       "category": "Plugins",
@@ -152,7 +152,7 @@
       "feature": "Versioned WASM/subprocess extension boundary",
       "status": "partial",
       "evidence": ["crates/rivet-extension-protocol/src/lib.rs", "apps/desktop/src/extensionModel.ts", "apps/desktop/src/App.tsx"],
-      "notes": "Manifests, explicit permissions, bounded length-prefixed JSON frames, a direct-argument subprocess host, bounded local catalog discovery/API, a desktop model, and a root-confined subprocess lifecycle manager with per-request permission enforcement are present. WASM execution and server/desktop lifecycle controls remain planned."
+      "notes": "Manifests, explicit permissions, bounded length-prefixed JSON frames, a direct-argument subprocess host, bounded local catalog discovery/API, a desktop model, a root-confined subprocess lifecycle manager with per-request permission enforcement, server/desktop lifecycle controls, and a capability-free WASM ABI with bounded memory/output and fuel metering are present. Richer host capability wiring remains planned."
     },
     {
       "category": "Differential testing",

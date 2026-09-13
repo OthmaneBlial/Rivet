@@ -1432,7 +1432,7 @@ function AgentsPanel({ agents, online }: { agents: AgentSummary[]; online: boole
           </div>
         )}
       </section>
-      <p className="agent-boundary"><span />Capacity discovery, assignment, remote execution, artifact transfer, and one bounded replacement attempt are verified locally. Durable restart recovery and richer retry policy remain separately gated.</p>
+      <p className="agent-boundary"><span />Capacity discovery, assignment, remote execution, artifact transfer, and one bounded replacement attempt are verified locally. Durable cross-session recovery remains separately gated.</p>
     </div>
   );
 }
@@ -1521,24 +1521,24 @@ function ExtensionsPanel({
             {extensions.map((extension) => {
               const status = statuses.find((candidate) => candidate.id === extension.id);
               const active = status?.active ?? false;
-              const canControl = extension.kind === "subprocess" && status?.runtime_available === true;
+              const canControl = status?.runtime_available === true;
               return (
                 <div className="extension-runtime-row" key={extension.id}>
                   <span className={`extension-runtime-dot ${active ? "active" : ""}`} />
                   <div className="extension-runtime-copy"><strong>{extension.name}</strong><small>{extension.id} · {extension.kind}</small></div>
-                  <span className="extension-runtime-state">{active ? "active" : extension.kind === "wasm" ? "WASM gated" : "stopped"}</span>
+                  <span className="extension-runtime-state">{active ? "active" : "stopped"}</span>
                   <button className="button button-quiet extension-runtime-action" type="button" disabled={!canControl || busyId === extension.id} onClick={() => onToggle(extension, active)}>{busyId === extension.id ? "Working…" : active ? "Stop" : "Start"}</button>
                 </div>
               );
             })}
           </div>
         )}
-        <p className="extension-runtime-boundary"><span>!</span>Starting an extension is an administrator action. WASM remains unavailable until a sandboxed host ABI is configured.</p>
+        <p className="extension-runtime-boundary"><span>!</span>Starting an extension is an administrator action. WASM runs through a capability-free ABI with bounded memory, output, and fuel; subprocesses use direct arguments and declared permissions.</p>
       </section>
 
       <section className="panel extension-empty-card">
         <span className="extension-empty-mark">◇</span>
-        <div><span className="overline">Catalog status</span><strong>{extensions.length ? `${extensions.length} extension${extensions.length === 1 ? "" : "s"} loaded` : "No extensions loaded"}</strong><p>{extensions.length ? "These manifests were validated by the local engine. Subprocess lifecycle actions stay behind the administrator boundary; WASM remains gated." : "Nothing is installed, executed, or granted by this empty view. Add validated manifests to expose the lifecycle surface."}</p></div>
+        <div><span className="overline">Catalog status</span><strong>{extensions.length ? `${extensions.length} extension${extensions.length === 1 ? "" : "s"} loaded` : "No extensions loaded"}</strong><p>{extensions.length ? "These manifests were validated by the local engine. Lifecycle actions stay behind the administrator boundary, and each request must use a declared permission." : "Nothing is installed, executed, or granted by this empty view. Add validated manifests to expose the lifecycle surface."}</p></div>
         <span className="extension-gate">{extensions.length ? "MANIFESTS VALIDATED" : "CATALOG EMPTY"}</span>
       </section>
     </div>
