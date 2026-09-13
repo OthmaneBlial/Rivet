@@ -200,7 +200,7 @@ cargo run -p rivet -- --data-dir .rivet server \
 ```
 
 The token is held in memory, never printed, and never stored in the Rivet
-database. Health checks remain public; API and WebSocket routes require
+database. Liveness and readiness checks remain public; API and WebSocket routes require
 `Authorization: Bearer <token>` when authentication is enabled.
 
 The desktop client attaches a bounded request ID to each API call. It retries
