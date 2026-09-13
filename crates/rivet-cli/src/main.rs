@@ -3,6 +3,7 @@ use rivet_core::{BuildEvent, BuildStatus, ExecutionPlan, LogStream, Pipeline, Pr
 use rivet_runner::{QueueHandle, Scheduler};
 use rivet_storage::Storage;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -52,6 +53,11 @@ enum Command {
         #[arg(long)]
         build: i64,
     },
+    /// Run the headless HTTP/WebSocket service.
+    Server {
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        bind: SocketAddr,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -84,6 +90,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Run { project } => run_project(&cli.data_dir, &project).await?,
         Command::Builds { project } => list_builds(&cli.data_dir, &project)?,
         Command::Logs { project, build } => show_logs(&cli.data_dir, &project, build)?,
+        Command::Server { bind } => {
+            rivet_server::serve(cli.data_dir.join("rivet.db"), bind).await?
+        }
     }
     Ok(())
 }

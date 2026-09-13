@@ -1,0 +1,23 @@
+[package]
+name = "rivet-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+chrono.workspace = true
+futures-util = "0.3"
+rivet-core = { path = "../rivet-core" }
+rivet-runner = { path = "../rivet-runner" }
+rivet-storage = { path = "../rivet-storage" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1.47", features = ["net", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

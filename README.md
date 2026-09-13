@@ -16,6 +16,7 @@ readiness yet.
 crates/
   rivet-core/       domain model, pipeline format, and event schema
   rivet-runner/     process execution, queue, and pipeline orchestration
+  rivet-server/     headless REST/WebSocket transport
   rivet-storage/    SQLite persistence, migrations, and event projection
   rivet-cli/        local operator interface and first runnable slice
 apps/desktop/       Tauri client (next vertical slice)
@@ -45,6 +46,20 @@ cargo run -p rivet -- logs rivet --build 1
 The build command uses the Rust queue, real child processes, live event
 projection, and SQLite history. Press Ctrl-C during a running step to exercise
 the cancellation path.
+
+## Run headless
+
+The same engine can run without the desktop client:
+
+```sh
+cargo run -p rivet -- --data-dir .rivet server --bind 127.0.0.1:7878
+```
+
+The versioned API currently exposes health, projects, queued builds, build
+details, persisted logs, cancellation, and a per-build WebSocket event stream
+under `/api/v1/`. The server returns `202 Accepted` when a build is queued;
+clients read its durable state from the build resource and subscribe to live
+events separately.
 
 The first executable pipeline format is deliberately explicit:
 
