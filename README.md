@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **86% verified** · `██████████████████░░`<br>
-Weighted evidence score: **86.91 / 100** · displayed conservatively as the
+Weighted evidence score: **86.97 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -60,7 +60,9 @@ versioned SHA-256 manifest:
 This produces a locally verifiable artifact, not a signed installer, store
 submission, or hosted CI result.
 
-Rivet's extension surface is intentionally a separate, versioned contract.
+The headless server handles SIGINT/SIGTERM with a graceful HTTP shutdown and
+stops its schedule dispatcher after the listener closes. Rivet's extension
+surface is intentionally a separate, versioned contract.
 `rivet-extension-protocol` validates WASM or direct-subprocess manifests,
 declared permissions, relative entrypoints, and bounded length-prefixed JSON
 frames. An optional local manifest directory is loaded with strict regular

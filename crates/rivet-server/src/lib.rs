@@ -607,8 +607,13 @@ pub async fn serve_with_listener(
         config.allowed_origins
     };
     tracing::info!(bind = %bind, "Rivet server listening");
-    spawn_schedule_dispatcher(state.clone());
-    axum::serve(listener, router_with_origins(state, &allowed_origins)?).await?;
+    let shutdown = CancellationToken::new();
+    spawn_schedule_dispatcher(state.clone(), shutdown.clone());
+    let result = axum::serve(listener, router_with_origins(state, &allowed_origins)?)
+        .with_graceful_shutdown(wait_for_shutdown_signal())
+        .await;
+    shutdown.cancel();
+    result?;
     Ok(())
 }
 
@@ -1745,17 +1750,39 @@ fn validate_webhook_event_id(event_id: String) -> Result<String, ApiError> {
     Ok(event_id.to_owned())
 }
 
-fn spawn_schedule_dispatcher(state: AppState) {
+fn spawn_schedule_dispatcher(state: AppState, shutdown: CancellationToken) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
-            if let Err(error) = dispatch_due_schedules(&state, Utc::now()).await {
-                tracing::error!(?error, "Rivet schedule dispatcher failed");
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = interval.tick() => {
+                    if let Err(error) = dispatch_due_schedules(&state, Utc::now()).await {
+                        tracing::error!(?error, "Rivet schedule dispatcher failed");
+                    }
+                }
             }
         }
     });
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    tracing::info!("Rivet server shutdown requested");
 }
 
 async fn dispatch_due_schedules(state: &AppState, now: DateTime<Utc>) -> Result<usize, ApiError> {
