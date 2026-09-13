@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/rivet-core",
+    "crates/rivet-agent-protocol",
     "crates/rivet-runner",
     "crates/rivet-scm",
     "crates/rivet-server",

@@ -908,6 +908,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rivet-agent-protocol"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rivet-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "rivet-core"
 version = "0.1.0"
 dependencies = [
