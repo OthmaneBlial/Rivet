@@ -114,6 +114,7 @@ const MAX_EXTENSION_STEP_RECORDS: usize = 500;
 const MAX_EXTENSION_LOG_RECORDS: usize = 500;
 const MAX_EXTENSION_ARTIFACT_RECORDS: usize = 100;
 const MAX_EXTENSION_ANNOTATION_RECORDS: usize = 100;
+const MAX_EXTENSION_TRIGGER_PARAMETERS: usize = 64;
 
 struct PendingAgentDelivery {
     envelope: AgentTransportMessage,
@@ -1673,12 +1674,82 @@ async fn request_extension(
         .validate_request(&id, permission)
         .await
         .map_err(ApiError::ExtensionManager)?;
-    let payload = extension_host_payload(&state, permission, &method, input)?;
+    let payload = extension_request_payload(&state, permission, &method, input).await?;
     let result = manager
         .request(&id, permission, method, payload)
         .await
         .map_err(ApiError::ExtensionManager)?;
     Ok(Json(result))
+}
+
+async fn extension_request_payload(
+    state: &AppState,
+    permission: ExtensionPermission,
+    method: &str,
+    input: Value,
+) -> Result<Value, ApiError> {
+    if method == "build.trigger" {
+        extension_trigger_payload(state, permission, method, input).await
+    } else {
+        extension_host_payload(state, permission, method, input)
+    }
+}
+
+async fn extension_trigger_payload(
+    state: &AppState,
+    permission: ExtensionPermission,
+    method: &str,
+    input: Value,
+) -> Result<Value, ApiError> {
+    if permission != ExtensionPermission::TriggerBuilds {
+        return Err(ApiError::BadRequest(
+            "extension host method \"build.trigger\" requires permission TriggerBuilds".into(),
+        ));
+    }
+    let project_id = extension_uuid(&input, "project_id")?;
+    let project = state
+        .storage
+        .get_project_by_id(project_id)?
+        .ok_or_else(|| ApiError::BadRequest("extension project_id was not found".into()))?;
+    let parameters = match input.get("parameters") {
+        Some(value) => {
+            serde_json::from_value::<BTreeMap<String, String>>(value.clone()).map_err(|error| {
+                ApiError::BadRequest(format!("extension trigger parameters are invalid: {error}"))
+            })?
+        }
+        None => BTreeMap::new(),
+    };
+    if parameters.len() > MAX_EXTENSION_TRIGGER_PARAMETERS {
+        return Err(ApiError::BadRequest(format!(
+            "extension trigger accepts at most {MAX_EXTENSION_TRIGGER_PARAMETERS} parameters"
+        )));
+    }
+    let priority = match input.get("priority") {
+        Some(value) => value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| ApiError::BadRequest("extension trigger priority is invalid".into()))?,
+        None => 0,
+    };
+    let queued = enqueue_project_build(
+        state,
+        project,
+        QueueBuildRequest {
+            scm: None,
+            parameters,
+            priority,
+        },
+    )
+    .await?;
+    Ok(json!({
+        "host_protocol_version": 1,
+        "method": method,
+        "input": input,
+        "data": {
+            "build": queued.build,
+            "status": queued.status,
+        },
+    }))
 }
 
 /// Add bounded, read-only host data to the small set of versioned capability
@@ -5065,6 +5136,7 @@ program = "true"
             permissions: vec![
                 ExtensionPermission::ReadBuilds,
                 ExtensionPermission::WriteAnnotations,
+                ExtensionPermission::TriggerBuilds,
             ],
         };
         fs::write(
@@ -5102,10 +5174,24 @@ program = "true"
 "#,
         )
         .expect("host pipeline");
+        let host_pipeline_path = directory.path().join("Rivetfile.toml");
+        fs::write(
+            &host_pipeline_path,
+            r#"
+version = 1
+name = "extension-host-route"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("host pipeline file");
         let host_project = Project::new(
             "extension-host-route",
             directory.path().to_string_lossy().into_owned(),
-            "Rivetfile.toml",
+            host_pipeline_path.to_string_lossy().into_owned(),
         )
         .expect("host project");
         state
@@ -5186,6 +5272,31 @@ program = "true"
             1
         );
 
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/extensions/coverage.reporter/request")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"permission":"trigger_builds","method":"build.trigger","payload":{{"project_id":"{}","priority":10}}}}"#,
+                        host_project.id
+                    )))
+                    .expect("trigger request"),
+            )
+            .await
+            .expect("trigger response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let builds = state
+            .storage
+            .list_builds(host_project.id)
+            .expect("triggered builds");
+        assert_eq!(builds.len(), 2);
+        assert!(matches!(
+            builds[1].status,
+            BuildStatus::Pending | BuildStatus::Queued | BuildStatus::Running | BuildStatus::Passed
+        ));
+
         let response = router(state)
             .oneshot(
                 Request::builder()
@@ -5193,7 +5304,7 @@ program = "true"
                     .uri("/api/v1/extensions/coverage.reporter/request")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"permission":"trigger_builds","method":"trigger","payload":{}}"#,
+                        r#"{"permission":"read_logs","method":"build.logs","payload":{}}"#,
                     ))
                     .expect("denied request"),
             )
@@ -5217,10 +5328,24 @@ program = "true"
 "#,
         )
         .expect("pipeline");
+        let pipeline_path = directory.path().join("Rivetfile.toml");
+        fs::write(
+            &pipeline_path,
+            r#"
+version = 1
+name = "extension-host"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline file");
         let project = Project::new(
             "extension-host",
             directory.path().to_string_lossy().into_owned(),
-            "Rivetfile.toml",
+            pipeline_path.to_string_lossy().into_owned(),
         )
         .expect("project");
         let storage = Storage::open_in_memory().expect("storage");
@@ -5326,6 +5451,28 @@ program = "true"
                 .storage
                 .annotations(build.id)
                 .expect("annotations")
+                .len(),
+            2
+        );
+
+        let triggered = extension_trigger_payload(
+            &state,
+            ExtensionPermission::TriggerBuilds,
+            "build.trigger",
+            json!({
+                "project_id": project.id,
+                "priority": 10,
+                "parameters": {}
+            }),
+        )
+        .await
+        .expect("trigger host method");
+        assert_eq!(triggered["data"]["status"], "queued");
+        assert_eq!(
+            state
+                .storage
+                .list_builds(project.id)
+                .expect("triggered builds")
                 .len(),
             2
         );

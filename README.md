@@ -37,7 +37,7 @@ API and rendered in the desktop control room. The server also exposes
 administrator-only subprocess extension lifecycle status and start/stop
 controls, reflected in the desktop view. A capability-free WASM runtime now
 supports an explicit JSON ABI with no host imports, bounded linear memory,
-bounded output, and fuel metering. Six bounded build, detail, log, artifact,
+bounded output, and fuel metering. Seven bounded build, detail, log, artifact,
 and annotation host methods are available under explicit extension permissions;
 annotation writes are persisted with optional stage scope.
 The
@@ -103,13 +103,14 @@ administrator-only runtime status, start/stop actions, and a permission-checked
 reflects that state. The bounded WASM runtime accepts only the
 documented JSON ABI, denies all module imports, caps module/memory/output
 sizes, and meters execution fuel. Filesystem, network, process, and clock
-capabilities are not exposed to WASM modules. Six host methods are now
+capabilities are not exposed to WASM modules. Seven host methods are now
 versioned: `builds.list` (project UUID), `build.details`, `build.logs`,
 `build.annotations`, and `build.artifacts` (build UUID) are bounded reads;
-`build.annotate` persists a bounded annotation with an optional stage UUID. Each
-requires its matching declared permission, caps returned records, and wraps the
-original input with a host protocol version; unknown extension methods receive
-their original input unchanged.
+`build.annotate` persists a bounded annotation with an optional stage UUID; and
+`build.trigger` queues a real project build with validated parameters and
+priority. Each requires its matching declared permission, caps returned records,
+and wraps the original input with a host protocol version; unknown extension
+methods receive their original input unchanged.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
