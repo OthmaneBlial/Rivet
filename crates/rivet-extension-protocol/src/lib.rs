@@ -730,9 +730,7 @@ impl SubprocessExtension {
         method: impl Into<String>,
         payload: Value,
     ) -> Result<Value, ExtensionHostError> {
-        if !self.manifest.allows(permission) {
-            return Err(ExtensionHostError::PermissionDenied(permission));
-        }
+        ensure_permission(&self.manifest, permission)?;
         self.request(method, payload).await
     }
 
@@ -830,6 +828,17 @@ pub enum ExtensionManagerError {
     NotRunning(String),
     #[error(transparent)]
     Host(#[from] ExtensionHostError),
+}
+
+fn ensure_permission(
+    manifest: &ExtensionManifest,
+    permission: ExtensionPermission,
+) -> Result<(), ExtensionHostError> {
+    if manifest.allows(permission) {
+        Ok(())
+    } else {
+        Err(ExtensionHostError::PermissionDenied(permission))
+    }
 }
 
 fn validate_version(version: u16) -> Result<(), ExtensionProtocolError> {
@@ -1100,6 +1109,18 @@ mod tests {
                 manager.manifest("coverage.reporter").unwrap()
             ),
             Err(ExtensionManagerError::InvalidEntrypoint(_))
+        ));
+    }
+
+    #[test]
+    fn host_permission_boundary_rejects_undeclared_capabilities() {
+        let manifest = manifest(ExtensionKind::Subprocess);
+        assert!(ensure_permission(&manifest, ExtensionPermission::ReadBuilds).is_ok());
+        assert!(matches!(
+            ensure_permission(&manifest, ExtensionPermission::TriggerBuilds),
+            Err(ExtensionHostError::PermissionDenied(
+                ExtensionPermission::TriggerBuilds
+            ))
         ));
     }
 
