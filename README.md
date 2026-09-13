@@ -173,6 +173,9 @@ cargo run -p rivet -- credential set github \
 cargo run -p rivet -- credential list \
   --passphrase-file /secure/path/rivet.credentials.passphrase \
   --vault-file /secure/path/rivet.credentials.vault
+cargo run -p rivet -- scm prepare . --fetch --credential-id github \
+  --credentials-file /secure/path/rivet.credentials.vault \
+  --credentials-passphrase-file /secure/path/rivet.credentials.passphrase
 ```
 
 Start the server with the same vault and a private passphrase file:
@@ -191,6 +194,10 @@ redacts the secret and encoded header from command errors. The vault stores
 authenticated ciphertext only; provider-specific repository-event adapters,
 credential rotation, keychain integration, and project-level access control
 remain future gates.
+
+The same `--credential-id`, `--credentials-file`, and
+`--credentials-passphrase-file` flags can be passed to `rivet run` when a
+local build needs an authenticated fetch.
 
 Remote agents use a versioned WebSocket contract at
 `GET /api/v1/agents/connect`. Agents register capabilities such as operating
