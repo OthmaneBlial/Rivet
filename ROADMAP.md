@@ -5,8 +5,8 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **75 / 100 points** (**75.92 weighted evidence
-points**, displayed conservatively as 75%).
+The current verified total is **77 / 100 points** (**77.52 weighted evidence
+points**, displayed conservatively as 77%).
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
@@ -18,13 +18,13 @@ points**, displayed conservatively as 75%).
 | API and live transport | 6 | partial | REST/loopback WebSocket, durable event replay, queue telemetry, build retry, schedule endpoints/dispatch, exact CORS allow-list, body limits, and security headers pass; full identity/authz and deployment operations remain |
 | CLI operator workflow | 3 | partial | project/run/history, parameterized builds, artifact listing, retry, and schedule management work; richer cancellation and inspection remain |
 | Tauri desktop control room | 10 | partial | native bundle, embedded engine health, rendered light-default/dark-toggle UX, artifact/retry views, schedule controls, online/offline recovery, real client build flow, and an ephemeral loopback engine origin in the packaged launch pass; final Tauri-window interaction and release QA remain |
-| Git/SCM integration | 8 | partial | direct Git inspect/checkout/fetch/clean operations, REST/CLI surfaces, explicit build-admission preparation, and persisted build source identity pass; credentials and provider hooks remain |
+| Git/SCM integration | 8 | partial | direct Git inspect/checkout/fetch/clean operations, REST/CLI surfaces, explicit build-admission preparation, persisted build source identity, provider-neutral credential IDs, and ephemeral Git auth handoff pass; provider hooks remain |
 | Triggers and scheduling | 5 | partial | manual/API entry points, validated persistent UTC cron schedules/server dispatch, and signed generic webhook delivery pass; provider repository events and upstream triggers remain |
 | Remote agents | 10 | partial | authenticated versioned registration/heartbeat contract, explicit pipeline requirements with local safety refusal, reconnecting agent CLI, reconnect-safe sessions, stale detection, capacity-aware online matching, rendered fleet view, matching capacity reservation, bounded workspace and artifact transfer, shared-runner remote execution, typed event/output relay, cancellation, and one bounded replacement-agent attempt with clean terminal failure pass; durable restart recovery, exactly-once semantics, and richer retry policy remain |
 | Container execution | 4 | partial | validated container declarations and bounded Docker command assembly pass; Docker runtime cleanup, timeout/cancellation, image policy, and artifact extraction remain unverified |
 | Artifacts | 4 | partial | local and remote workspace collection, upload/download, bounded checksum-verified transfer, metadata, and a storage boundary pass; retention and remote object backends remain |
 | CI cache | 3 | partial | validated exact project-scoped keys, safe relative paths, atomic local archive save/restore, and corrupt-entry recovery pass; fallback keys, eviction, and remote cache backends remain |
-| Secrets and credentials | 6 | partial | secret parameters require explicit runtime values, persisted values/API responses are redacted, logs are masked, and retries require fresh secret input; encryption/access control and a credential store remain |
+| Secrets and credentials | 6 | partial | secret parameters require explicit runtime values, persisted values/API responses are redacted, logs are masked, retries require fresh secret input, and a passphrase-encrypted local credential vault with private-file CLI setup passes; credential ownership, rotation, keychain integration, and project access control remain |
 | Authentication and authorization | 4 | partial | protected remote transport with private Bearer tokens passes; users, sessions, roles, and project permissions remain |
 | Extension protocol | 4 | planned | versioned WASM/subprocess/protocol boundary and frontend extension model |
 | Jenkins migration analyzer | 3 | partial | bounded Jenkinsfile analysis, headless API delivery, rendered desktop report, and valid drafts for deterministic quoted shell steps pass; full Groovy parsing, plugin semantics, and broad generated Rivetfile conversion remain |
@@ -40,9 +40,9 @@ scaffold, passing unrelated test, or interface alone does not complete a gate.
 
 The next gates are the final Tauri-window flow inside the packaged app, API
 deployment hardening, durable remote recovery across server restart and richer
-retry policy, the SCM
-credential/provider boundary, provider webhook adapters/repository-event
-mapping, an encrypted credential store, full Groovy/plugin migration semantics,
-and generated Rivetfile conversion with fixture-backed migration regressions.
+retry policy, credential ownership/rotation/keychain integration and project
+access control, provider webhook adapters/repository-event mapping, full
+Groovy/plugin migration semantics, and generated Rivetfile conversion with
+fixture-backed migration regressions.
 Test clean checkout behavior
 without exposing credentials to logs or persisted state.

@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**75% verified** · `███████████████░░░░░`<br>
-Weighted evidence score: **75.92 / 100** · displayed conservatively as the
+**77% verified** · `███████████████▌░░░░`<br>
+Weighted evidence score: **77.52 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -22,7 +22,8 @@ transport, build retry, pre-execution queue cancellation, build artifact
 downloads, and a light-default desktop theme with an accessible dark-mode
 toggle, persistent UTC cron schedules, server dispatch, desktop schedule
 controls, signed generic webhook delivery with idempotent redelivery,
-secret-parameter redaction/masking, and a packaged desktop launch with an
+secret-parameter redaction/masking, a passphrase-encrypted SCM credential vault
+with non-secret credential references, and a packaged desktop launch with an
 ephemeral loopback engine origin, project-scoped local CI cache restore and
 save, explicit Docker container command assembly with bounded workspace mounts,
 and a bounded Jenkinsfile migration analyzer with line-level support findings
@@ -50,11 +51,13 @@ readiness yet.
 
 ```text
 crates/
-  rivet-core/       domain model, pipeline format, and event schema
-  rivet-runner/     process execution, queue, and pipeline orchestration
-  rivet-server/     headless REST/WebSocket transport
-  rivet-storage/    SQLite persistence, migrations, and event projection
-  rivet-cli/        local operator interface and first runnable slice
+  rivet-core/        domain model, pipeline format, and event schema
+  rivet-runner/      process execution, queue, and pipeline orchestration
+  rivet-server/      headless REST/WebSocket transport
+  rivet-storage/     SQLite persistence, migrations, and event projection
+  rivet-credentials/ encrypted local provider credentials
+  rivet-scm/         direct Git adapter and SCM boundary
+  rivet-cli/         local operator interface and first runnable slice
 apps/desktop/       Tauri client (next vertical slice)
 compat/             measured Jenkins/Rivet compatibility data
 ```
@@ -155,6 +158,40 @@ The same `event_id` can be retried safely: the first request queues one build,
 and later deliveries return a deduplicated response without creating another
 build. A non-loopback server still requires the separate Bearer token.
 
+SCM credentials use a local passphrase-encrypted vault. The CLI reads the
+passphrase and provider secret from private files, so neither value is placed
+in shell history or command-line arguments:
+
+```sh
+chmod 600 /secure/path/rivet.credentials.passphrase
+chmod 600 /secure/path/github.token
+cargo run -p rivet -- credential set github \
+  --username oauth2 \
+  --secret-file /secure/path/github.token \
+  --passphrase-file /secure/path/rivet.credentials.passphrase \
+  --vault-file /secure/path/rivet.credentials.vault
+cargo run -p rivet -- credential list \
+  --passphrase-file /secure/path/rivet.credentials.passphrase \
+  --vault-file /secure/path/rivet.credentials.vault
+```
+
+Start the server with the same vault and a private passphrase file:
+
+```sh
+cargo run -p rivet -- --data-dir .rivet server \
+  --credentials-file /secure/path/rivet.credentials.vault \
+  --credentials-passphrase-file /secure/path/rivet.credentials.passphrase
+```
+
+Build admission and explicit SCM preparation accept only the non-secret
+credential ID, for example `{ "remote": "origin", "fetch": true,
+"credential_id": "github" }`. Rivet resolves the ID locally, passes HTTP
+Basic auth to the Git child process through ephemeral configuration, and
+redacts the secret and encoded header from command errors. The vault stores
+authenticated ciphertext only; provider-specific repository-event adapters,
+credential rotation, keychain integration, and project-level access control
+remain future gates.
+
 Remote agents use a versioned WebSocket contract at
 `GET /api/v1/agents/connect`. Agents register capabilities such as operating
 system, architecture, Docker availability, labels, and executor capacity,
@@ -199,7 +236,8 @@ Completed builds can be retried without losing their original history. The
 retry creates a new build number and reuses the original non-secret resolved
 parameters unless the API caller supplies replacements. Secret parameters must
 be supplied again explicitly with `--param NAME=VALUE` on the CLI or in the
-API request body.
+API request body. SCM credential IDs are references only; their secret values
+are not persisted in build data or API responses.
 
 Schedules can also be managed from the CLI. Expressions use UTC and accept
 the familiar five-field form:
