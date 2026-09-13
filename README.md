@@ -5,7 +5,7 @@ from Jenkins.
 
 ## Delivery progress
 
-**71% verified** · `██████████████▏░░░░░`<br>
+**73% verified** · `██████████████▋░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -29,8 +29,10 @@ API and rendered in the desktop control room. The server also exposes a
 versioned agent handshake/heartbeat registry with online/stale state, capacity-aware
 matching, a reconnecting heartbeat CLI client, and a rendered fleet view. Pipeline
 steps can declare exact remote requirements; the local runner refuses those steps
-until assignment exists. Remote build assignment remains intentionally
-unimplemented until its transport and failure semantics are complete.
+until assignment exists. A matching agent can now reserve capacity, receive a
+bounded workspace archive, execute the assigned pipeline through the shared Rust
+runner, and relay typed events, output, and cancellation. Lost-job recovery and
+remote artifact collection remain future gates.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -153,8 +155,11 @@ system, architecture, Docker availability, labels, and executor capacity,
 then send monotone heartbeats. `GET /api/v1/agents` reports the current
 ephemeral registry; silent agents become `stale` after the heartbeat window.
 `POST /api/v1/agents/match` accepts exact capability requirements and excludes
-stale or saturated agents. Build assignment, remote logs, artifacts, and
-lost-job recovery remain future gates.
+stale or saturated agents. A build with a remote step reserves a matching online
+agent, transfers the repository workspace in bounded chunks, executes it with
+the shared Rust runner, and persists the agent's typed build events and output.
+Cancellation is propagated to the agent; lost-job recovery and remote artifact
+collection remain future gates.
 
 Connect a worker for heartbeat and capability discovery:
 
@@ -166,9 +171,11 @@ cargo run -p rivet -- agent \
 ```
 
 The command keeps its stable agent ID and reconnects with bounded backoff after a
-transport interruption. It is intentionally heartbeat-only until workspace
-transfer, remote process execution, cancellation, logs, artifacts, and lost-job
-recovery have their verified protocol paths.
+transport interruption. It accepts assignments, stages each workspace under an
+isolated build-specific directory, and uses the same Rust process runner as local
+execution. `--workspace-root` can select the local parent directory; the default
+is a temporary agent workspace. The transport is currently bounded to a 512 MiB
+workspace archive and rejects unsafe archive entries.
 
 The CLI exposes the same explicit SCM boundary, for example:
 

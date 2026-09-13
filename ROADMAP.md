@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **71 / 100 points**.
+The current verified total is **73 / 100 points**.
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
@@ -19,7 +19,7 @@ The current verified total is **71 / 100 points**.
 | Tauri desktop control room | 10 | partial | native bundle, embedded engine health, rendered light-default/dark-toggle UX, artifact/retry views, schedule controls, online/offline recovery, real client build flow, and an ephemeral loopback engine origin in the packaged launch pass; final Tauri-window interaction and release QA remain |
 | Git/SCM integration | 8 | partial | direct Git inspect/checkout/fetch/clean operations, REST/CLI surfaces, explicit build-admission preparation, and persisted build source identity pass; credentials and provider hooks remain |
 | Triggers and scheduling | 5 | partial | manual/API entry points, validated persistent UTC cron schedules/server dispatch, and signed generic webhook delivery pass; provider repository events and upstream triggers remain |
-| Remote agents | 10 | partial | authenticated versioned registration/heartbeat contract, explicit pipeline requirements with local safety refusal, reconnecting heartbeat CLI client, reconnect-safe sessions, stale detection, capacity-aware online matching, and a rendered fleet view pass; assignment, remote execution, transfer, and lost-job recovery remain |
+| Remote agents | 10 | partial | authenticated versioned registration/heartbeat contract, explicit pipeline requirements with local safety refusal, reconnecting agent CLI, reconnect-safe sessions, stale detection, capacity-aware online matching, rendered fleet view, matching capacity reservation, bounded workspace transfer, shared-runner remote execution, typed event/output relay, and cancellation pass; lost-job recovery and remote artifact collection remain |
 | Container execution | 4 | partial | validated container declarations and bounded Docker command assembly pass; Docker runtime cleanup, timeout/cancellation, image policy, and artifact extraction remain unverified |
 | Artifacts | 4 | partial | local workspace collection, upload/download, checksums, metadata, and a storage boundary pass; retention and remote backends remain |
 | CI cache | 3 | partial | validated exact project-scoped keys, safe relative paths, atomic local archive save/restore, and corrupt-entry recovery pass; fallback keys, eviction, and remote cache backends remain |
@@ -38,7 +38,7 @@ by evidence, and “verified” receives the full workstream weight. A local bui
 scaffold, passing unrelated test, or interface alone does not complete a gate.
 
 The next gates are the final Tauri-window flow inside the packaged app, API
-deployment hardening, remote assignment/failure handling, the SCM
+deployment hardening, remote lost-job/artifact recovery, the SCM
 credential/provider boundary, provider webhook adapters/repository-event
 mapping, an encrypted credential store, full Groovy/plugin migration semantics,
 and generated Rivetfile conversion with fixture-backed migration regressions.

@@ -107,10 +107,10 @@
     },
     {
       "category": "Agents",
-      "feature": "Versioned agent registration and heartbeat",
+      "feature": "Versioned agent registration, assignment, and remote execution",
       "status": "partial",
-      "evidence": ["crates/rivet-agent-protocol/src/lib.rs", "crates/rivet-server/src/agent_registry.rs", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs", "apps/desktop/src/App.tsx"],
-      "notes": "Agents can negotiate protocol version, advertise capabilities, connect through the rivet agent CLI, reconnect with bounded backoff and session fencing, appear online or stale, and match only when capability and available executor requirements pass through POST /api/v1/agents/match. Rivetfile steps can declare the same requirements and the local runner refuses those steps explicitly until assignment exists; the desktop exposes the live fleet registry, while remote assignment, execution, transfer, and lost-job handling remain planned."
+      "evidence": ["crates/rivet-agent-protocol/src/lib.rs", "crates/rivet-server/src/agent_registry.rs", "crates/rivet-server/src/workspace_archive.rs", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs", "apps/desktop/src/App.tsx"],
+      "notes": "Agents negotiate a versioned protocol, advertise capabilities, reconnect with bounded backoff and session fencing, appear online or stale, and match only when capability and available executor requirements pass through POST /api/v1/agents/match. Remote builds reserve matching capacity, transfer bounded workspaces, execute through the shared Rust runner, relay typed events and output, and propagate cancellation. Rivetfile steps still require identical requirements within one remote build; lost-job recovery and remote artifact collection remain planned."
     },
     {
       "category": "Security",
