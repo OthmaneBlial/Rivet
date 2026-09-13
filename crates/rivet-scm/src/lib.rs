@@ -674,7 +674,16 @@ fn validate_refspec(refspec: &str) -> Result<(), ScmError> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Stdio;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
+
+    const HTTP_USERNAME: &str = "rivet-fixture-user";
+    const HTTP_SECRET: &str = "rivet-fixture-secret-not-persisted";
 
     async fn git(dir: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
@@ -690,6 +699,244 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[derive(Clone, Default)]
+    struct GitHttpStats {
+        authorized_requests: Arc<AtomicUsize>,
+        unauthorized_requests: Arc<AtomicUsize>,
+    }
+
+    struct GitHttpServer {
+        address: std::net::SocketAddr,
+        shutdown: Option<oneshot::Sender<()>>,
+        task: tokio::task::JoinHandle<()>,
+        stats: GitHttpStats,
+    }
+
+    impl GitHttpServer {
+        async fn start(project_root: PathBuf) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("HTTP listener");
+            let address = listener.local_addr().expect("HTTP address");
+            let exec_path = std::process::Command::new("git")
+                .arg("--exec-path")
+                .output()
+                .expect("git exec path")
+                .stdout;
+            let backend = PathBuf::from(
+                String::from_utf8(exec_path)
+                    .expect("git exec path UTF-8")
+                    .trim(),
+            )
+            .join("git-http-backend");
+            let stats = GitHttpStats::default();
+            let expected_authorization = format!(
+                "Basic {}",
+                STANDARD.encode(format!("{HTTP_USERNAME}:{HTTP_SECRET}"))
+            );
+            let (shutdown_sender, mut shutdown_receiver) = oneshot::channel();
+            let task_stats = stats.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_receiver => break,
+                        result = listener.accept() => {
+                            let Ok((stream, _)) = result else { break };
+                            let project_root = project_root.clone();
+                            let backend = backend.clone();
+                            let expected_authorization = expected_authorization.clone();
+                            let task_stats = task_stats.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) = serve_git_http(
+                                    stream,
+                                    &project_root,
+                                    &backend,
+                                    &expected_authorization,
+                                    &task_stats,
+                                ).await {
+                                    let _ = error;
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+            Self {
+                address,
+                shutdown: Some(shutdown_sender),
+                task,
+                stats,
+            }
+        }
+
+        fn url(&self, repository_name: &str) -> String {
+            format!("http://{}/{repository_name}", self.address)
+        }
+
+        async fn stop(mut self) {
+            let _ = self.shutdown.take().expect("shutdown sender").send(());
+            self.task.await.expect("HTTP server task");
+        }
+    }
+
+    async fn serve_git_http(
+        mut stream: TcpStream,
+        project_root: &Path,
+        backend: &Path,
+        expected_authorization: &str,
+        stats: &GitHttpStats,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (method, target, headers, body) = read_http_request(&mut stream).await?;
+        let authorization = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.as_str());
+        if authorization != Some(expected_authorization) {
+            stats.unauthorized_requests.fetch_add(1, Ordering::SeqCst);
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"rivet-test\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await?;
+            return Ok(());
+        }
+        stats.authorized_requests.fetch_add(1, Ordering::SeqCst);
+
+        let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+        let mut command = tokio::process::Command::new(backend);
+        command
+            .env("GIT_PROJECT_ROOT", project_root)
+            .env("GIT_HTTP_EXPORT_ALL", "1")
+            .env("PATH_INFO", path)
+            .env("REQUEST_METHOD", method)
+            .env("QUERY_STRING", query)
+            .env("SERVER_PROTOCOL", "HTTP/1.1")
+            .env("SERVER_NAME", "127.0.0.1")
+            .env("SERVER_PORT", "0")
+            .env("REMOTE_ADDR", "127.0.0.1")
+            .env("REMOTE_USER", HTTP_USERNAME)
+            .env("CONTENT_LENGTH", body.len().to_string())
+            .envs(headers.iter().filter_map(|(name, value)| {
+                let key = name.to_ascii_uppercase().replace('-', "_");
+                if key == "CONTENT_TYPE" || key == "CONTENT_LENGTH" {
+                    Some((key, value.clone()))
+                } else {
+                    None
+                }
+            }))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(&body).await?;
+        }
+        let output = child.wait_with_output().await?;
+        if !output.status.success() {
+            return Err(format!(
+                "git-http-backend failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        let (cgi_headers, response_body) = output
+            .stdout
+            .split_once_bytes(b"\r\n\r\n")
+            .ok_or("git-http-backend returned malformed CGI output")?;
+        let mut cgi_response_headers = Vec::new();
+        let mut status = "200 OK";
+        for line in cgi_headers.split(|byte| *byte == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.starts_with(b"Status:") {
+                status = std::str::from_utf8(&line[7..])?.trim();
+            } else if !line.is_empty() {
+                cgi_response_headers.extend_from_slice(line);
+                cgi_response_headers.extend_from_slice(b"\r\n");
+            }
+        }
+        let mut wire = format!("HTTP/1.1 {status}\r\n").into_bytes();
+        wire.extend_from_slice(&cgi_response_headers);
+        wire.extend_from_slice(
+            format!(
+                "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            )
+            .as_bytes(),
+        );
+        wire.extend_from_slice(response_body);
+        stream.write_all(&wire).await?;
+        Ok(())
+    }
+
+    async fn read_http_request(
+        stream: &mut TcpStream,
+    ) -> Result<
+        (String, String, Vec<(String, String)>, Vec<u8>),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 4096];
+            let count = stream.read(&mut chunk).await?;
+            if count == 0 {
+                return Err("client closed before HTTP headers".into());
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+            if bytes.len() > 256 * 1024 {
+                return Err("HTTP headers too large".into());
+            }
+            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let header_text = std::str::from_utf8(&bytes[..header_end])?;
+        let mut lines = header_text.split("\r\n");
+        let request_line = lines.next().ok_or("missing HTTP request line")?;
+        let mut request_parts = request_line.split_whitespace();
+        let method = request_parts
+            .next()
+            .ok_or("missing HTTP method")?
+            .to_owned();
+        let target = request_parts
+            .next()
+            .ok_or("missing HTTP target")?
+            .to_owned();
+        let headers = lines
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+            .collect::<Vec<_>>();
+        let content_length = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(0);
+        let mut body = bytes[header_end..].to_vec();
+        while body.len() < content_length {
+            let mut chunk = vec![0_u8; content_length - body.len()];
+            let count = stream.read(&mut chunk).await?;
+            if count == 0 {
+                return Err("client closed before HTTP body".into());
+            }
+            body.extend_from_slice(&chunk[..count]);
+        }
+        body.truncate(content_length);
+        Ok((method, target, headers, body))
+    }
+
+    trait SplitOnceBytes {
+        fn split_once_bytes(&self, delimiter: &[u8]) -> Option<(&[u8], &[u8])>;
+    }
+
+    impl SplitOnceBytes for [u8] {
+        fn split_once_bytes(&self, delimiter: &[u8]) -> Option<(&[u8], &[u8])> {
+            self.windows(delimiter.len())
+                .position(|window| window == delimiter)
+                .map(|index| (&self[..index], &self[index + delimiter.len()..]))
+        }
     }
 
     async fn repository() -> TempDir {
@@ -785,6 +1032,108 @@ mod tests {
             .await
             .expect("prepare refspec");
         assert_eq!(snapshot.revision, revision);
+    }
+
+    #[tokio::test]
+    async fn authenticated_fetch_checkout_and_clean_keep_credentials_ephemeral() {
+        let source_dir = repository().await;
+        let remote_parent = tempfile::tempdir().expect("remote parent");
+        let remote_dir = remote_parent.path().join("fixture.git");
+        fs::create_dir(&remote_dir).expect("remote directory");
+        git(&remote_dir, &["init", "--bare", "-q"]).await;
+        let remote = remote_dir.to_str().expect("remote path");
+        git(source_dir.path(), &["remote", "add", "origin", remote]).await;
+        git(
+            source_dir.path(),
+            &["push", "-q", "origin", "HEAD:refs/heads/main"],
+        )
+        .await;
+        git(&remote_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]).await;
+
+        let checkout_parent = tempfile::tempdir().expect("checkout parent");
+        let checkout_dir = checkout_parent.path().join("checkout");
+        let checkout = checkout_dir.to_str().expect("checkout path");
+        git(checkout_parent.path(), &["clone", "-q", remote, checkout]).await;
+
+        fs::write(source_dir.path().join("README.md"), "second\n").expect("second commit");
+        git(source_dir.path(), &["add", "README.md"]).await;
+        git(source_dir.path(), &["commit", "-qm", "second"]).await;
+        let revision = git(source_dir.path(), &["rev-parse", "HEAD"]).await;
+        git(
+            source_dir.path(),
+            &["push", "-q", "origin", "HEAD:refs/heads/main"],
+        )
+        .await;
+
+        let server = GitHttpServer::start(remote_parent.path().to_path_buf()).await;
+        let remote_url = server.url("fixture.git");
+        git(&checkout_dir, &["remote", "set-url", "origin", &remote_url]).await;
+        fs::write(checkout_dir.join("throwaway.txt"), "remove me\n").expect("untracked file");
+
+        let mut unauthenticated = TcpStream::connect(server.address)
+            .await
+            .expect("unauthenticated connection");
+        unauthenticated
+            .write_all(
+                b"GET /fixture.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("unauthenticated request");
+        let mut unauthenticated_response = Vec::new();
+        unauthenticated
+            .read_to_end(&mut unauthenticated_response)
+            .await
+            .expect("unauthenticated response");
+        assert!(
+            String::from_utf8_lossy(&unauthenticated_response)
+                .starts_with("HTTP/1.1 401 Unauthorized")
+        );
+
+        let repository = GitRepository::open(&checkout_dir)
+            .await
+            .expect("open checkout");
+        let credential = GitHttpCredential::new(HTTP_USERNAME, HTTP_SECRET).expect("credential");
+        let auth = GitCredential::HttpBasic(credential.clone());
+        let snapshot = repository
+            .prepare_with_auth(
+                &GitPrepareOptions {
+                    fetch: true,
+                    revision: Some(revision.clone()),
+                    clean: true,
+                    ..GitPrepareOptions::default()
+                },
+                Some(&auth),
+            )
+            .await
+            .expect("authenticated prepare");
+
+        assert_eq!(snapshot.revision, revision);
+        assert!(!snapshot.dirty);
+        assert_eq!(
+            fs::read_to_string(checkout_dir.join("README.md")).unwrap(),
+            "second\n"
+        );
+        assert!(!checkout_dir.join("throwaway.txt").exists());
+        assert_eq!(
+            git(
+                &checkout_dir,
+                &["config", "--local", "--get", "remote.origin.url"]
+            )
+            .await,
+            remote_url
+        );
+        let config = fs::read_to_string(checkout_dir.join(".git/config")).expect("git config");
+        assert!(!config.contains(HTTP_SECRET));
+        assert!(!config.contains("Authorization"));
+        assert!(
+            !git(&checkout_dir, &["config", "--local", "--list"])
+                .await
+                .contains(HTTP_SECRET)
+        );
+        assert!(!format!("{snapshot:?}").contains(HTTP_SECRET));
+        assert_eq!(server.stats.unauthorized_requests.load(Ordering::SeqCst), 1);
+        assert!(server.stats.authorized_requests.load(Ordering::SeqCst) >= 1);
+        server.stop().await;
     }
 
     #[tokio::test]

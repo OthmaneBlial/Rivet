@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **93% verified** · `███████████████████░`<br>
-Weighted evidence score: **93.85 / 100** · displayed conservatively as the
+Weighted evidence score: **93.87 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -722,3 +722,8 @@ cargo run -p rivet -- scm prepare . --revision main --clean
 ```
 
 `prepare --clean` is intentionally opt-in because it removes untracked files.
+The SCM test suite also exercises a real authenticated local HTTP fetch followed
+by detached checkout and untracked-file cleanup. Authentication is injected
+only into the Git child process; the credential does not enter `.git/config`,
+the returned snapshot, or persisted checkout state. Tracked local edits remain
+protected and must be resolved before checkout.
