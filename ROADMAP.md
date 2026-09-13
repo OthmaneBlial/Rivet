@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **47 / 100 points**.
+The current verified total is **49 / 100 points**.
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
@@ -24,7 +24,7 @@ The current verified total is **47 / 100 points**.
 | Artifacts | 4 | partial | local workspace collection, upload/download, checksums, metadata, and a storage boundary pass; retention and remote backends remain |
 | CI cache | 3 | planned | safe keys, fallback behavior, corruption regression tests |
 | Secrets and credentials | 6 | planned | encryption/access boundary, masking, non-serialization, threat documentation |
-| Authentication and authorization | 4 | planned | users, sessions, tokens, roles, project permissions |
+| Authentication and authorization | 4 | partial | protected remote transport with private Bearer tokens passes; users, sessions, roles, and project permissions remain |
 | Extension protocol | 4 | planned | versioned WASM/subprocess/protocol boundary and frontend extension model |
 | Jenkins migration analyzer | 3 | planned | measured Jenkinsfile analysis with supported/partial/unsupported output |
 | Differential compatibility harness | 2 | planned | normalized behavioral fixtures and permanent regressions |
@@ -38,6 +38,6 @@ by evidence, and “verified” receives the full workstream weight. A local bui
 scaffold, passing unrelated test, or interface alone does not complete a gate.
 
 The next gates are the final Tauri-window flow inside the packaged app, API
-authentication/deployment hardening, and the SCM-to-build boundary: add
-credential/provider hooks and test clean checkout behavior without exposing
-credentials to logs or persisted state.
+deployment hardening, and the SCM credential/provider boundary: add provider
+hooks and test clean checkout behavior without exposing credentials to logs or
+persisted state.

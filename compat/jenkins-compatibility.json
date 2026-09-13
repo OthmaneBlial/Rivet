@@ -76,6 +76,13 @@
       "evidence": []
     },
     {
+      "category": "Security",
+      "feature": "Protected server API transport",
+      "status": "partial",
+      "evidence": ["crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
+      "notes": "Optional in-memory Bearer-token protection and mandatory authentication for non-loopback binds are supported; user identity, roles, and project permissions remain planned."
+    },
+    {
       "category": "Plugins",
       "feature": "Jenkins plugin ABI compatibility",
       "status": "intentionally-different",

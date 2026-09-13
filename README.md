@@ -5,7 +5,7 @@ from Jenkins.
 
 ## Delivery progress
 
-**47% verified** · `█████████░░░░░░░░░░░`<br>
+**49% verified** · `█████████░░░░░░░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -14,8 +14,9 @@ and unverified work remains at zero until it passes its gate.
 Last verified update: **2026-09-13** · native pipeline execution, FIFO queue,
 SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
 inspection, persisted build-source identity, live queue telemetry, durable
-event replay, quiet engine offline recovery, and explicit Git preparation at
-build admission, parameterized builds, and local artifact storage milestone.
+event replay, quiet engine offline recovery, explicit Git preparation at build
+admission, parameterized builds, local artifact storage, and protected server
+transport milestone.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -67,6 +68,19 @@ The same engine can run without the desktop client:
 ```sh
 cargo run -p rivet -- --data-dir .rivet server --bind 127.0.0.1:7878
 ```
+
+Loopback server mode is intended for the local desktop flow. A non-loopback
+bind requires a private token file:
+
+```sh
+chmod 600 /secure/path/rivet.token
+cargo run -p rivet -- --data-dir .rivet server \
+  --bind 0.0.0.0:7878 --token-file /secure/path/rivet.token
+```
+
+The token is held in memory, never printed, and never stored in the Rivet
+database. Health checks remain public; API and WebSocket routes require
+`Authorization: Bearer <token>` when authentication is enabled.
 
 The versioned API currently exposes health, projects, queued builds, build
 details, persisted logs, cancellation, a live queue snapshot, durable replay,
