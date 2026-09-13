@@ -10,6 +10,9 @@ import type {
 export const ENGINE_ORIGIN =
   import.meta.env.VITE_RIVET_ENGINE_URL ?? "http://127.0.0.1:7878";
 
+export const ENGINE_OFFLINE_MESSAGE =
+  "Engine offline — start the local engine to connect.";
+
 export interface HealthResponse {
   status: string;
   service: string;
@@ -17,13 +20,21 @@ export interface HealthResponse {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${ENGINE_ORIGIN}${path}`, {
-    ...init,
-    headers: {
-      "content-type": "application/json",
-      ...init?.headers,
-    },
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${ENGINE_ORIGIN}${path}`, {
+      ...init,
+      headers: {
+        "content-type": "application/json",
+        ...init?.headers,
+      },
+    });
+  } catch (cause) {
+    if (cause instanceof DOMException && cause.name === "AbortError") {
+      throw cause;
+    }
+    throw new Error(ENGINE_OFFLINE_MESSAGE);
+  }
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
     try {

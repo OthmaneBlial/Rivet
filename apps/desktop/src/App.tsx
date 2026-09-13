@@ -5,8 +5,8 @@ import {
   cancelBuild,
   createProject,
   ENGINE_ORIGIN,
+  ENGINE_OFFLINE_MESSAGE,
   eventUrl,
-  health,
   logs,
   projects,
   queueStats as fetchQueueStats,
@@ -107,7 +107,7 @@ function App() {
       setError(null);
     } catch (cause) {
       setEngineOnline(false);
-      setError(cause instanceof Error ? cause.message : "Engine unavailable");
+      setError(cause instanceof Error ? cause.message : ENGINE_OFFLINE_MESSAGE);
     }
   }, []);
 
@@ -143,11 +143,11 @@ function App() {
       setQueueStatus(await fetchQueueStats());
     } catch {
       setQueueStatus(null);
+      setEngineOnline(false);
     }
   }, []);
 
   useEffect(() => {
-    void health().then(() => setEngineOnline(true)).catch(() => setEngineOnline(false));
     void loadProjects();
   }, [loadProjects]);
 
@@ -162,15 +162,25 @@ function App() {
     socket.onmessage = () => {
       void Promise.all([loadBuildList(), loadBuildView()]);
     };
-    socket.onerror = () => socket.close();
+    socket.onerror = () => {
+      socket.close();
+      setEngineOnline(false);
+    };
     return () => socket.close();
   }, [loadBuildList, loadBuildView, projectName, selectedBuild]);
 
   useEffect(() => {
+    if (!engineOnline) return;
     void loadQueueStatus();
     const interval = window.setInterval(() => void loadQueueStatus(), 1000);
     return () => window.clearInterval(interval);
-  }, [loadQueueStatus]);
+  }, [engineOnline, loadQueueStatus]);
+
+  useEffect(() => {
+    if (engineOnline) return;
+    const retry = window.setTimeout(() => void loadProjects(), 5000);
+    return () => window.clearTimeout(retry);
+  }, [engineOnline, loadProjects]);
 
   async function runSelectedPipeline() {
     if (!projectName) return;
