@@ -783,6 +783,7 @@ enum ScmCommand {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let cli = Cli::parse();
     match cli.command {
         Command::Init { repository } => init_repository(&cli.data_dir, &repository)?,
@@ -878,6 +879,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Agent(args) => run_agent(args).await?,
     }
     Ok(())
+}
+
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("rivet=info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
 }
 
 fn analyze_file(command: AnalyzeCommand) -> Result<(), Box<dyn std::error::Error>> {

@@ -32,5 +32,6 @@ tar = "0.4"
 tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = "0.29"
+tracing-subscriber.workspace = true
 uuid.workspace = true
 walkdir.workspace = true

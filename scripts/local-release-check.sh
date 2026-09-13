@@ -10,22 +10,22 @@ fi
 
 cd "$repo_root"
 
-echo "[1/10] checking local progress and repository boundaries"
+echo "[1/11] checking local progress and repository boundaries"
 ./scripts/local-progress-check.sh
 
-echo "[2/10] checking Rust formatting"
+echo "[2/11] checking Rust formatting"
 cargo fmt --all -- --check
 
-echo "[3/10] running the local Rust workspace tests"
+echo "[3/11] running the local Rust workspace tests"
 cargo test --workspace
 
-echo "[4/10] building the release CLI"
+echo "[4/11] building the release CLI"
 cargo build --release -p rivet
 
-echo "[5/10] building the desktop client"
+echo "[5/11] building the desktop client"
 (cd apps/desktop && npm run build)
 
-echo "[6/10] checking the native Tauri host"
+echo "[6/11] checking the native Tauri host"
 cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
 
 mkdir -p "$release_output"
@@ -40,16 +40,19 @@ else
     exit 1
 fi
 
-echo "[7/10] exercising the real local CLI workflow"
+echo "[7/11] exercising the real local CLI workflow"
 ./scripts/local-e2e-smoke.sh
 
-echo "[8/10] exercising local user authentication"
+echo "[8/11] exercising local user authentication"
 ./scripts/local-auth-smoke.sh
 
-echo "[9/10] exercising live compatibility capture adapters"
+echo "[9/11] exercising live compatibility capture adapters"
 ./scripts/local-compat-capture-smoke.sh
 
-echo "[10/10] writing the local release manifest"
+echo "[10/11] exercising local deployment hardening"
+./scripts/local-deployment-smoke.sh
+
+echo "[11/11] writing the local release manifest"
 jq -n \
     --arg commit "$(git rev-parse HEAD)" \
     --arg generated_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
@@ -58,7 +61,8 @@ jq -n \
     '{schema_version: 1, source_commit: $commit, generated_at: $generated_at,
       github_actions: false, checks: {format: true, workspace_tests: true,
       cli_release_build: true, desktop_web_build: true, tauri_host_check: true,
-      local_e2e_smoke: true, local_auth_smoke: true, compat_capture_smoke: true},
+      local_e2e_smoke: true, local_auth_smoke: true, compat_capture_smoke: true,
+      local_deployment_smoke: true},
       artifacts: [{name: $binary, path: $binary, sha256: $sha256}]}' \
     > "$release_output/manifest.json"
 test -x "$release_output/rivet"
