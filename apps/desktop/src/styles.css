@@ -449,6 +449,18 @@ select:focus { border-color: var(--amber); }
 .extension-empty-card strong { color: var(--white); font-size: 13px; }
 .extension-empty-card p { max-width: 630px; color: var(--muted); font-size: 11px; line-height: 1.45; }
 .extension-gate { margin-left: auto; color: var(--amber); font: 9px "Azeret Mono", monospace; letter-spacing: .08em; white-space: nowrap; }
+.extension-runtime-card { margin-top: 10px; overflow: hidden; }
+.extension-runtime-list { display: grid; }
+.extension-runtime-row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto auto; align-items: center; gap: 12px; min-height: 64px; padding: 0 19px; border-bottom: 1px solid var(--row-line); }
+.extension-runtime-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+.extension-runtime-dot.active { background: var(--cyan); box-shadow: 0 0 10px var(--cyan); }
+.extension-runtime-copy { display: grid; min-width: 0; gap: 5px; }
+.extension-runtime-copy strong { overflow: hidden; color: var(--white); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.extension-runtime-copy small { overflow: hidden; color: var(--faint); font: 9px "Azeret Mono", monospace; text-overflow: ellipsis; white-space: nowrap; }
+.extension-runtime-state { color: var(--muted); font: 9px "Azeret Mono", monospace; text-transform: uppercase; }
+.extension-runtime-action { min-height: 30px; padding-inline: 11px; font-size: 10px; }
+.extension-runtime-boundary { display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 0 19px; color: var(--faint); font: 9px/1.45 "Azeret Mono", monospace; }
+.extension-runtime-boundary span { display: grid; width: 15px; height: 15px; place-items: center; border: 1px solid var(--amber); color: var(--amber); }
 
 .onboarding { position: relative; display: flex; flex-direction: column; align-items: flex-start; max-width: 670px; margin: 15vh auto; padding: 0 30px; }.onboarding::before { content: ""; position: absolute; top: -90px; left: -70px; width: 340px; height: 340px; border: 1px solid rgba(242,184,91,.18); border-radius: 50%; box-shadow: 0 0 0 30px rgba(242,184,91,.02), 0 0 0 62px rgba(242,184,91,.018); pointer-events: none; }.onboarding-mark { position: relative; display: grid; width: 86px; height: 86px; place-items: center; margin-bottom: 45px; color: var(--amber-bright); }.onboarding-mark .rivet-mark { width: 96px; height: 96px; }.onboarding h1 { position: relative; margin: 17px 0 20px; color: var(--white); font-size: clamp(38px, 6vw, 72px); letter-spacing: -.075em; line-height: .92; }.onboarding h1 em { color: var(--amber); font-style: normal; }.onboarding p { position: relative; max-width: 500px; color: var(--muted); font-size: 15px; line-height: 1.65; }.onboarding-button { position: relative; margin-top: 30px; min-height: 45px; padding: 0 18px; }.onboarding-button span { margin-left: 10px; font-size: 17px; }.onboarding-note { display: flex; align-items: center; gap: 10px; margin-top: 31px; color: var(--faint); font: 10px "Azeret Mono", monospace; }.note-rule { width: 27px; height: 1px; background: var(--line-strong); }
 
@@ -462,4 +474,5 @@ select:focus { border-color: var(--amber); }
 @media (max-width: 980px) { .scm-options-form { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 700px) { .scm-options-form { grid-template-columns: 1fr; }.scm-checks, .scm-notice { grid-column: auto; }.scm-checks { display: grid; gap: 11px; }.scm-collapsed { align-items: start; flex-wrap: wrap; padding-block: 16px; }.scm-collapsed-status { margin-left: 31px; } }
 @media (max-width: 700px) { .parameter-form { grid-template-columns: 1fr; padding-inline: 14px; }.parameter-notice { align-items: start; padding: 12px 14px; }.parameter-notice span { flex: 0 0 15px; margin-top: 2px; } }
+@media (max-width: 700px) { .extension-runtime-row { grid-template-columns: 8px minmax(0, 1fr) auto; gap: 9px; min-height: 73px; padding-inline: 14px; }.extension-runtime-state { display: none; }.extension-runtime-action { grid-column: 3; grid-row: 1; }.extension-runtime-boundary { align-items: start; padding: 12px 14px; }.extension-runtime-boundary span { flex: 0 0 15px; margin-top: 2px; } }
 @media (max-width: 700px) { .queue-status { min-width: 0; }.queue-empty { align-items: start; }.queue-list-head { display: none; }.queue-row { grid-template-columns: 30px minmax(0, 1fr) auto; gap: 6px 10px; min-height: 70px; padding-block: 13px; }.queue-row code { grid-column: 2; }.queue-priority { grid-column: 3; grid-row: 1 / span 2; } }

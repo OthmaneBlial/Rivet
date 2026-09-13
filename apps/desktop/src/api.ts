@@ -13,7 +13,7 @@ import type {
   QueueStats,
   ScheduleRecord,
 } from "./types";
-import type { ExtensionManifest } from "./extensionModel";
+import type { ExtensionManifest, ExtensionRuntimeStatus } from "./extensionModel";
 import { invoke } from "@tauri-apps/api/core";
 
 export const ENGINE_ORIGIN =
@@ -188,6 +188,24 @@ export function agents(): Promise<AgentSummary[]> {
 
 export function extensions(): Promise<ExtensionManifest[]> {
   return request<ExtensionManifest[]>("/api/v1/extensions");
+}
+
+export function extensionStatuses(): Promise<ExtensionRuntimeStatus[]> {
+  return request<ExtensionRuntimeStatus[]>("/api/v1/extensions/status");
+}
+
+export function startExtension(id: string): Promise<ExtensionRuntimeStatus> {
+  return request<ExtensionRuntimeStatus>(
+    `/api/v1/extensions/${encodeURIComponent(id)}/start`,
+    { method: "POST" },
+  );
+}
+
+export function stopExtension(id: string): Promise<ExtensionRuntimeStatus> {
+  return request<ExtensionRuntimeStatus>(
+    `/api/v1/extensions/${encodeURIComponent(id)}/stop`,
+    { method: "POST" },
+  );
 }
 
 export function credentials(): Promise<CredentialSummary[]> {

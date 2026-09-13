@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **88% verified** · `███████████████████░`<br>
-Weighted evidence score: **88.43 / 100** · displayed conservatively as the
+Weighted evidence score: **88.55 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -33,7 +33,10 @@ ephemeral loopback engine origin, project-scoped local CI cache restore and
 save, explicit Docker container command assembly with bounded workspace mounts,
 and a bounded Jenkinsfile migration analyzer with line-level support findings
 plus safe drafts for deterministic shell steps, exposed through the headless
-API and rendered in the desktop control room. The server also exposes a
+API and rendered in the desktop control room. The server also exposes
+administrator-only subprocess extension lifecycle status and start/stop
+controls, reflected in the desktop view; WASM execution remains gated. The
+server also exposes a
 versioned agent handshake/heartbeat registry with online/stale state, capacity-aware
 matching, a reconnecting heartbeat CLI client, and a rendered fleet view. Pipeline
 steps can declare exact remote requirements; the local runner refuses those steps
@@ -78,9 +81,10 @@ file checks and duplicate-ID rejection, then exposed through
 reports the validated catalog. The extension crate also provides a bounded
 subprocess lifecycle manager: it resolves only regular executables below an
 explicit root, rejects symlink/path escapes, permits one session per ID, and
-checks the declared permission on every host request. WASM execution and
-server/desktop lifecycle controls remain gated until their sandbox and UX are
-implemented.
+checks the declared permission on every host request. The server exposes
+administrator-only runtime status and subprocess start/stop actions, and the
+desktop view reflects that state. WASM execution remains gated until its
+sandboxed runtime and host ABI are implemented.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument

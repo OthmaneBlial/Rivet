@@ -13,6 +13,7 @@ import {
   agents as fetchAgents,
   artifacts,
   extensions as fetchExtensions,
+  extensionStatuses as fetchExtensionStatuses,
   ENGINE_OFFLINE_MESSAGE,
   eventUrl,
   getEngineOrigin,
@@ -26,6 +27,8 @@ import {
   queueBuild,
   retryBuild,
   resumeQueue,
+  startExtension,
+  stopExtension,
   setCredential,
   schedules,
   updateSchedule,
@@ -51,7 +54,7 @@ import {
   EXTENSION_PERMISSION_LABELS,
   type ExtensionPermission,
 } from "./extensionModel";
-import type { ExtensionManifest } from "./extensionModel";
+import type { ExtensionManifest, ExtensionRuntimeStatus } from "./extensionModel";
 
 const NAV_ITEMS = [
   { label: "Pipelines", mark: "↳", active: true },
@@ -153,6 +156,8 @@ function App() {
   const [queueItemList, setQueueItemList] = useState<QueueItem[]>([]);
   const [agentList, setAgentList] = useState<AgentSummary[]>([]);
   const [extensionList, setExtensionList] = useState<ExtensionManifest[]>([]);
+  const [extensionStatusList, setExtensionStatusList] = useState<ExtensionRuntimeStatus[]>([]);
+  const [extensionBusyId, setExtensionBusyId] = useState<string | null>(null);
   const [credentialList, setCredentialList] = useState<CredentialSummary[]>([]);
   const [credentialsReady, setCredentialsReady] = useState<boolean | null>(null);
   const [credentialError, setCredentialError] = useState<string | null>(null);
@@ -275,9 +280,15 @@ function App() {
 
   const loadExtensionList = useCallback(async () => {
     try {
-      setExtensionList(await fetchExtensions());
+      const [manifests, statuses] = await Promise.all([
+        fetchExtensions(),
+        fetchExtensionStatuses(),
+      ]);
+      setExtensionList(manifests);
+      setExtensionStatusList(statuses);
     } catch {
       setExtensionList([]);
+      setExtensionStatusList([]);
     }
   }, []);
 
@@ -378,12 +389,15 @@ function App() {
   }, [activeNav, engineOnline, loadQueueItemList]);
 
   useEffect(() => {
-    if (!engineOnline) {
+    if (!engineOnline || activeNav !== "Extensions") {
       setExtensionList([]);
+      setExtensionStatusList([]);
       return;
     }
     void loadExtensionList();
-  }, [engineOnline, loadExtensionList]);
+    const interval = window.setInterval(() => void loadExtensionList(), 3000);
+    return () => window.clearInterval(interval);
+  }, [activeNav, engineOnline, loadExtensionList]);
 
   useEffect(() => {
     if (!engineOnline || activeNav !== "Credentials") {
@@ -608,6 +622,19 @@ function App() {
     }
   }
 
+  async function toggleExtension(manifest: ExtensionManifest, active: boolean) {
+    setExtensionBusyId(manifest.id);
+    setError(null);
+    try {
+      await (active ? stopExtension(manifest.id) : startExtension(manifest.id));
+      await loadExtensionList();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not change extension state");
+    } finally {
+      setExtensionBusyId(null);
+    }
+  }
+
   function editCredential(credential: CredentialSummary) {
     setCredentialId(credential.id);
     setCredentialUsername(credential.username);
@@ -762,7 +789,13 @@ function App() {
             onAnalyze={() => void runMigrationAnalysis()}
           />
         ) : activeNav === "Extensions" ? (
-          <ExtensionsPanel extensions={extensionList} />
+          <ExtensionsPanel
+            extensions={extensionList}
+            statuses={extensionStatusList}
+            online={engineOnline}
+            busyId={extensionBusyId}
+            onToggle={toggleExtension}
+          />
         ) : activeNav === "Agents" ? (
           <AgentsPanel agents={agentList} online={engineOnline} />
         ) : activeNav === "Queue" ? (
@@ -1379,7 +1412,19 @@ function AgentsPanel({ agents, online }: { agents: AgentSummary[]; online: boole
   );
 }
 
-function ExtensionsPanel({ extensions }: { extensions: ExtensionManifest[] }) {
+function ExtensionsPanel({
+  extensions,
+  statuses,
+  online,
+  busyId,
+  onToggle,
+}: {
+  extensions: ExtensionManifest[];
+  statuses: ExtensionRuntimeStatus[];
+  online: boolean;
+  busyId: string | null;
+  onToggle: (manifest: ExtensionManifest, active: boolean) => void;
+}) {
   const permissionEntries = Object.entries(EXTENSION_PERMISSION_LABELS) as [
     ExtensionPermission,
     string,
@@ -1439,10 +1484,37 @@ function ExtensionsPanel({ extensions }: { extensions: ExtensionManifest[] }) {
         </section>
       </div>
 
+      <section className="panel extension-runtime-card">
+        <div className="panel-heading">
+          <div><span className="overline">Runtime control</span><h2>Lifecycle</h2></div>
+          <span className="panel-count">{String(statuses.filter((status) => status.active).length).padStart(2, "0")}</span>
+        </div>
+        {extensions.length === 0 ? (
+          <EmptyState text={online ? "No validated extensions are available." : "Reconnect the local engine to inspect extensions."} />
+        ) : (
+          <div className="extension-runtime-list">
+            {extensions.map((extension) => {
+              const status = statuses.find((candidate) => candidate.id === extension.id);
+              const active = status?.active ?? false;
+              const canControl = extension.kind === "subprocess" && status?.runtime_available === true;
+              return (
+                <div className="extension-runtime-row" key={extension.id}>
+                  <span className={`extension-runtime-dot ${active ? "active" : ""}`} />
+                  <div className="extension-runtime-copy"><strong>{extension.name}</strong><small>{extension.id} · {extension.kind}</small></div>
+                  <span className="extension-runtime-state">{active ? "active" : extension.kind === "wasm" ? "WASM gated" : "stopped"}</span>
+                  <button className="button button-quiet extension-runtime-action" type="button" disabled={!canControl || busyId === extension.id} onClick={() => onToggle(extension, active)}>{busyId === extension.id ? "Working…" : active ? "Stop" : "Start"}</button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        <p className="extension-runtime-boundary"><span>!</span>Starting an extension is an administrator action. WASM remains unavailable until a sandboxed host ABI is configured.</p>
+      </section>
+
       <section className="panel extension-empty-card">
         <span className="extension-empty-mark">◇</span>
-        <div><span className="overline">Catalog status</span><strong>{extensions.length ? `${extensions.length} extension${extensions.length === 1 ? "" : "s"} loaded` : "No extensions loaded"}</strong><p>{extensions.length ? "These manifests were validated by the local engine. Runtime permissions are still reviewed at the host boundary." : "The protocol and desktop model are ready for a future catalog manager. Nothing is installed, executed, or granted by this empty view."}</p></div>
-        <span className="extension-gate">{extensions.length ? "MANIFESTS VALIDATED" : "MANAGER GATED"}</span>
+        <div><span className="overline">Catalog status</span><strong>{extensions.length ? `${extensions.length} extension${extensions.length === 1 ? "" : "s"} loaded` : "No extensions loaded"}</strong><p>{extensions.length ? "These manifests were validated by the local engine. Subprocess lifecycle actions stay behind the administrator boundary; WASM remains gated." : "Nothing is installed, executed, or granted by this empty view. Add validated manifests to expose the lifecycle surface."}</p></div>
+        <span className="extension-gate">{extensions.length ? "MANIFESTS VALIDATED" : "CATALOG EMPTY"}</span>
       </section>
     </div>
   );

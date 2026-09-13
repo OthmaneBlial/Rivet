@@ -24,7 +24,10 @@ use rivet_core::{
     SourceSnapshot,
 };
 use rivet_credentials::{CredentialError, CredentialSummary, CredentialVault};
-use rivet_extension_protocol::{ExtensionCatalog, ExtensionCatalogError, ExtensionManifest};
+use rivet_extension_protocol::{
+    ExtensionCatalog, ExtensionCatalogError, ExtensionKind, ExtensionManager,
+    ExtensionManagerError, ExtensionManifest,
+};
 use rivet_runner::{MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHandle, QueueStats, Scheduler};
 use rivet_scm::{GitHttpCredential, GitPrepareOptions, GitRepository, GitSnapshot, ScmError};
 use rivet_storage::{
@@ -77,6 +80,7 @@ pub struct AppState {
     gitlab_webhook_credential_id: Option<String>,
     credentials: Option<Arc<Mutex<CredentialVault>>>,
     extensions: Arc<ExtensionCatalog>,
+    extension_manager: Option<Arc<ExtensionManager>>,
     agents: AgentRegistry,
     remote_messages: Arc<Mutex<HashMap<BuildId, RemoteBuildRoute>>>,
 }
@@ -129,6 +133,8 @@ pub enum ServerError {
     Credentials(#[from] CredentialError),
     #[error("could not load extension catalog: {0}")]
     Extensions(#[from] ExtensionCatalogError),
+    #[error("could not initialize extension manager: {0}")]
+    ExtensionManager(#[from] ExtensionManagerError),
     #[error("invalid allowed origin: {0}")]
     InvalidAllowedOrigin(String),
 }
@@ -154,6 +160,10 @@ enum ApiError {
     ArtifactRead(#[source] std::io::Error),
     #[error("credential vault is not configured")]
     CredentialsUnavailable,
+    #[error("extension runtime is not configured")]
+    ExtensionsUnavailable,
+    #[error(transparent)]
+    ExtensionManager(#[from] ExtensionManagerError),
     #[error(transparent)]
     Credentials(#[from] CredentialError),
     #[error("{0}")]
@@ -211,6 +221,8 @@ impl IntoResponse for ApiError {
             Self::ArtifactNotFound(_) => StatusCode::NOT_FOUND,
             Self::ArtifactRead(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::CredentialsUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ExtensionsUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ExtensionManager(_) => StatusCode::BAD_REQUEST,
             Self::Credentials(error) => match error {
                 CredentialError::CredentialNotFound(_) => StatusCode::NOT_FOUND,
                 CredentialError::InvalidId(_)
@@ -379,6 +391,13 @@ struct PipelineParameterResponse {
     required: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct ExtensionRuntimeStatusResponse {
+    id: String,
+    active: bool,
+    runtime_available: bool,
+}
+
 pub fn router(state: AppState) -> Router {
     router_with_origins(state, &default_allowed_origins())
         .expect("default Rivet origins must be valid")
@@ -396,6 +415,9 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
             put(set_credential).delete(delete_credential),
         )
         .route("/api/v1/extensions", get(list_extensions))
+        .route("/api/v1/extensions/status", get(extension_status))
+        .route("/api/v1/extensions/{id}/start", post(start_extension))
+        .route("/api/v1/extensions/{id}/stop", post(stop_extension))
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/agents/match", post(match_agents))
         .route("/api/v1/agents/connect", get(connect_agent))
@@ -641,6 +663,12 @@ pub async fn serve_with_listener(
         _ => return Err(ServerError::IncompleteCredentialVaultConfig),
     };
     let extensions = ExtensionCatalog::from_directory(config.extension_manifest_dir.as_deref())?;
+    let extension_manager = config
+        .extension_manifest_dir
+        .as_deref()
+        .map(|root| ExtensionManager::new(root, &extensions))
+        .transpose()?
+        .map(Arc::new);
     let storage = Storage::open(storage_path)?;
     let recovered_builds = storage.recover_incomplete_builds(Utc::now())?;
     for build_id in &recovered_builds {
@@ -657,6 +685,7 @@ pub async fn serve_with_listener(
     );
     state.auth_policy = auth_policy;
     state.extensions = Arc::new(extensions);
+    state.extension_manager = extension_manager;
     state.github_webhook_secret = config
         .github_webhook_secret
         .as_deref()
@@ -800,6 +829,7 @@ impl AppState {
             gitlab_webhook_credential_id: None,
             credentials: None,
             extensions: Arc::new(ExtensionCatalog::empty()),
+            extension_manager: None,
             agents: AgentRegistry::default(),
             remote_messages: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1205,6 +1235,96 @@ async fn list_extensions(
 ) -> Result<Json<Vec<ExtensionManifest>>, ApiError> {
     require_global(&principal, Permission::Read)?;
     Ok(Json(state.extensions.manifests().to_vec()))
+}
+
+async fn extension_status(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<ExtensionRuntimeStatusResponse>>, ApiError> {
+    require_global(&principal, Permission::Read)?;
+    let active = match state.extension_manager.as_ref() {
+        Some(manager) => manager
+            .active_extensions()
+            .await
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        None => HashSet::new(),
+    };
+    Ok(Json(
+        state
+            .extensions
+            .manifests()
+            .iter()
+            .map(|manifest| ExtensionRuntimeStatusResponse {
+                id: manifest.id.clone(),
+                active: active.contains(&manifest.id),
+                runtime_available: state.extension_manager.is_some()
+                    && matches!(&manifest.kind, ExtensionKind::Subprocess),
+            })
+            .collect(),
+    ))
+}
+
+async fn start_extension(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<ExtensionRuntimeStatusResponse>, ApiError> {
+    require_global(&principal, Permission::Administer)?;
+    let manager = state
+        .extension_manager
+        .as_ref()
+        .ok_or(ApiError::ExtensionsUnavailable)?;
+    manager
+        .launch(&id, std::iter::empty::<String>())
+        .await
+        .map_err(ApiError::ExtensionManager)?;
+    extension_status_for(&state, &id).await
+}
+
+async fn stop_extension(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<ExtensionRuntimeStatusResponse>, ApiError> {
+    require_global(&principal, Permission::Administer)?;
+    let manager = state
+        .extension_manager
+        .as_ref()
+        .ok_or(ApiError::ExtensionsUnavailable)?;
+    manager
+        .terminate(&id)
+        .await
+        .map_err(ApiError::ExtensionManager)?;
+    extension_status_for(&state, &id).await
+}
+
+async fn extension_status_for(
+    state: &AppState,
+    id: &str,
+) -> Result<Json<ExtensionRuntimeStatusResponse>, ApiError> {
+    let manifest = state
+        .extensions
+        .manifests()
+        .iter()
+        .find(|manifest| manifest.id == id)
+        .ok_or_else(|| {
+            ApiError::ExtensionManager(ExtensionManagerError::UnknownExtension(id.into()))
+        })?;
+    let active = match state.extension_manager.as_ref() {
+        Some(manager) => manager
+            .active_extensions()
+            .await
+            .iter()
+            .any(|active| active == id),
+        None => false,
+    };
+    Ok(Json(ExtensionRuntimeStatusResponse {
+        id: id.to_owned(),
+        active,
+        runtime_available: state.extension_manager.is_some()
+            && matches!(&manifest.kind, ExtensionKind::Subprocess),
+    }))
 }
 
 async fn list_agents(
@@ -3627,7 +3747,9 @@ mod tests {
         AgentCapabilities, AgentHeartbeat, AgentRegistration, AgentRequirements, PROTOCOL_VERSION,
     };
     use rivet_auth::{ApiTokenRecord, AuthPolicyDocument, Role};
-    use rivet_extension_protocol::{ExtensionKind, ExtensionPermission};
+    use rivet_extension_protocol::{
+        ExtensionKind, ExtensionMessage, ExtensionPermission, encode_message,
+    };
     use std::fs;
     use tempfile::tempdir;
     use tokio::time::sleep;
@@ -3939,6 +4061,177 @@ mod tests {
         let manifests: Vec<ExtensionManifest> =
             serde_json::from_slice(&body).expect("manifests JSON");
         assert_eq!(manifests, vec![manifest]);
+    }
+
+    #[tokio::test]
+    async fn extension_status_reports_runtime_capability_without_launching_code() {
+        let directory = tempdir().expect("catalog directory");
+        let manifest = ExtensionManifest {
+            protocol_version: rivet_extension_protocol::PROTOCOL_VERSION,
+            id: "coverage.reporter".into(),
+            name: "Coverage reporter".into(),
+            version: "1.0.0".into(),
+            kind: ExtensionKind::Wasm,
+            entrypoint: "coverage.wasm".into(),
+            permissions: vec![ExtensionPermission::ReadBuilds],
+        };
+        fs::write(
+            directory.path().join("coverage.json"),
+            serde_json::to_vec(&manifest).expect("manifest JSON"),
+        )
+        .expect("manifest");
+        let catalog = ExtensionCatalog::from_directory(Some(directory.path())).expect("catalog");
+        let manager = ExtensionManager::new(directory.path(), &catalog).expect("manager");
+        let mut state = AppState::new(Storage::open_in_memory().expect("storage"));
+        state.extensions = Arc::new(catalog);
+        state.extension_manager = Some(Arc::new(manager));
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/extensions/status")
+                    .body(Body::empty())
+                    .expect("status request"),
+            )
+            .await
+            .expect("status response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("status body");
+        assert_eq!(
+            &body[..],
+            br#"[{"id":"coverage.reporter","active":false,"runtime_available":false}]"#
+        );
+    }
+
+    #[tokio::test]
+    async fn wasm_extension_start_is_explicitly_gated() {
+        let directory = tempdir().expect("catalog directory");
+        let manifest = ExtensionManifest {
+            protocol_version: rivet_extension_protocol::PROTOCOL_VERSION,
+            id: "coverage.reporter".into(),
+            name: "Coverage reporter".into(),
+            version: "1.0.0".into(),
+            kind: ExtensionKind::Wasm,
+            entrypoint: "coverage.wasm".into(),
+            permissions: vec![ExtensionPermission::ReadBuilds],
+        };
+        fs::write(
+            directory.path().join("coverage.json"),
+            serde_json::to_vec(&manifest).expect("manifest JSON"),
+        )
+        .expect("manifest");
+        let catalog = ExtensionCatalog::from_directory(Some(directory.path())).expect("catalog");
+        let manager = ExtensionManager::new(directory.path(), &catalog).expect("manager");
+        let mut state = AppState::new(Storage::open_in_memory().expect("storage"));
+        state.extensions = Arc::new(catalog);
+        state.extension_manager = Some(Arc::new(manager));
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/extensions/coverage.reporter/start")
+                    .body(Body::empty())
+                    .expect("start request"),
+            )
+            .await
+            .expect("start response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("start body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("start JSON");
+        assert_eq!(
+            payload["error"],
+            "WASM extension \"coverage.reporter\" cannot run before a sandboxed runtime is configured"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subprocess_extension_routes_start_and_stop_a_validated_process() {
+        let directory = tempdir().expect("catalog directory");
+        let manifest = ExtensionManifest {
+            protocol_version: rivet_extension_protocol::PROTOCOL_VERSION,
+            id: "coverage.reporter".into(),
+            name: "Coverage reporter".into(),
+            version: "1.0.0".into(),
+            kind: ExtensionKind::Subprocess,
+            entrypoint: "runner".into(),
+            permissions: vec![ExtensionPermission::ReadBuilds],
+        };
+        fs::write(
+            directory.path().join("coverage.json"),
+            serde_json::to_vec(&manifest).expect("manifest JSON"),
+        )
+        .expect("manifest");
+        let ready = encode_message(&ExtensionMessage::Ready {
+            protocol_version: rivet_extension_protocol::PROTOCOL_VERSION,
+            extension_id: manifest.id.clone(),
+        })
+        .expect("ready frame");
+        let escaped = ready
+            .iter()
+            .map(|byte| format!("\\{byte:03o}"))
+            .collect::<String>();
+        let runner = directory.path().join("runner");
+        fs::write(
+            &runner,
+            format!("#!/bin/sh\nprintf '{escaped}'\nsleep 60\n"),
+        )
+        .expect("runner");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&runner)
+            .expect("runner metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&runner, permissions).expect("runner permissions");
+
+        let catalog = ExtensionCatalog::from_directory(Some(directory.path())).expect("catalog");
+        let manager = ExtensionManager::new(directory.path(), &catalog).expect("manager");
+        let mut state = AppState::new(Storage::open_in_memory().expect("storage"));
+        state.extensions = Arc::new(catalog);
+        state.extension_manager = Some(Arc::new(manager));
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/extensions/coverage.reporter/start")
+                    .body(Body::empty())
+                    .expect("start request"),
+            )
+            .await
+            .expect("start response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("start body");
+        assert_eq!(
+            &body[..],
+            br#"{"id":"coverage.reporter","active":true,"runtime_available":true}"#
+        );
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/extensions/coverage.reporter/stop")
+                    .body(Body::empty())
+                    .expect("stop request"),
+            )
+            .await
+            .expect("stop response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("stop body");
+        assert_eq!(
+            &body[..],
+            br#"{"id":"coverage.reporter","active":false,"runtime_available":true}"#
+        );
     }
 
     #[tokio::test]

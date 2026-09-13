@@ -1143,6 +1143,54 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manager_launches_and_terminates_a_validated_subprocess() {
+        let directory = tempfile::tempdir().expect("extension root");
+        let mut subprocess = manifest(ExtensionKind::Subprocess);
+        subprocess.entrypoint = "runner".into();
+        std::fs::write(
+            directory.path().join("manifest.json"),
+            serde_json::to_vec(&subprocess).expect("manifest JSON"),
+        )
+        .expect("write manifest");
+
+        let ready = encode_message(&ExtensionMessage::Ready {
+            protocol_version: PROTOCOL_VERSION,
+            extension_id: subprocess.id.clone(),
+        })
+        .expect("ready frame");
+        let escaped = ready
+            .iter()
+            .map(|byte| format!("\\{byte:03o}"))
+            .collect::<String>();
+        let runner = directory.path().join("runner");
+        std::fs::write(
+            &runner,
+            format!("#!/bin/sh\nprintf '{escaped}'\nsleep 60\n"),
+        )
+        .expect("write runner");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&runner)
+            .expect("runner metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&runner, permissions).expect("runner permissions");
+
+        let catalog = ExtensionCatalog::from_directory(Some(directory.path())).expect("catalog");
+        let manager = ExtensionManager::new(directory.path(), &catalog).expect("manager");
+        manager
+            .launch("coverage.reporter", std::iter::empty::<&str>())
+            .await
+            .expect("launch");
+        assert_eq!(manager.active_extensions().await, ["coverage.reporter"]);
+        manager
+            .terminate("coverage.reporter")
+            .await
+            .expect("terminate");
+        assert!(manager.active_extensions().await.is_empty());
+    }
+
     #[tokio::test]
     async fn subprocess_host_rejects_wasm_manifests_before_spawning() {
         let result = SubprocessExtension::spawn(

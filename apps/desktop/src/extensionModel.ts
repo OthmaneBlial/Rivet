@@ -17,6 +17,12 @@ export interface ExtensionManifest {
   permissions: ExtensionPermission[];
 }
 
+export interface ExtensionRuntimeStatus {
+  id: string;
+  active: boolean;
+  runtime_available: boolean;
+}
+
 export interface ExtensionCatalogModel {
   protocol_name: string;
   protocol_version: number;
