@@ -68,7 +68,7 @@ export function getEngineOrigin(): string {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const engineOrigin = await initializeEngineOrigin();
   let response: Response | undefined;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
     try {
       response = await fetch(`${engineOrigin}${path}`, {
         ...init,
@@ -82,8 +82,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       if (cause instanceof DOMException && cause.name === "AbortError") {
         throw cause;
       }
-      if (attempt === 2) throw new Error(ENGINE_OFFLINE_MESSAGE);
-      await new Promise((resolve) => window.setTimeout(resolve, 150 * (attempt + 1)));
+      if (attempt === 7) throw new Error(ENGINE_OFFLINE_MESSAGE);
+      await new Promise((resolve) =>
+        window.setTimeout(resolve, Math.min(150 * 2 ** attempt, 1_000)),
+      );
     }
   }
   if (!response) throw new Error(ENGINE_OFFLINE_MESSAGE);
