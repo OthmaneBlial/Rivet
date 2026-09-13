@@ -34,6 +34,11 @@ import type {
   ScheduleRecord,
   StageDetails,
 } from "./types";
+import {
+  EXTENSION_CATALOG,
+  EXTENSION_PERMISSION_LABELS,
+  type ExtensionPermission,
+} from "./extensionModel";
 
 const NAV_ITEMS = [
   { label: "Pipelines", mark: "↳", active: true },
@@ -42,6 +47,7 @@ const NAV_ITEMS = [
   { label: "Artifacts", mark: "□", active: false },
   { label: "Credentials", mark: "◈", active: false },
   { label: "Migration", mark: "⇄", active: true },
+  { label: "Extensions", mark: "◇", active: true },
 ];
 
 const STATUS_LABEL: Record<BuildStatus, string> = {
@@ -512,6 +518,8 @@ function App() {
             onChange={setMigrationSource}
             onAnalyze={() => void runMigrationAnalysis()}
           />
+        ) : activeNav === "Extensions" ? (
+          <ExtensionsPanel />
         ) : activeNav === "Agents" ? (
           <AgentsPanel agents={agentList} online={engineOnline} />
         ) : projectsList.length === 0 ? (
@@ -778,6 +786,75 @@ function AgentsPanel({ agents, online }: { agents: AgentSummary[]; online: boole
         )}
       </section>
       <p className="agent-boundary"><span />Capacity discovery, assignment, remote execution, artifact transfer, and one bounded replacement attempt are verified locally. Durable restart recovery and richer retry policy remain separately gated.</p>
+    </div>
+  );
+}
+
+function ExtensionsPanel() {
+  const permissionEntries = Object.entries(EXTENSION_PERMISSION_LABELS) as [
+    ExtensionPermission,
+    string,
+  ][];
+  return (
+    <div className="content-wrap extensions-page">
+      <section className="page-heading extensions-heading">
+        <div>
+          <span className="eyebrow"><span className="eyebrow-line" />Extension surface</span>
+          <h1>Make the boundary useful.</h1>
+          <p>Small, explicit capabilities for teams that want to extend the signal without inheriting a plugin runtime.</p>
+        </div>
+        <div className="extensions-protocol">
+          <span className="overline">Wire contract</span>
+          <strong>{EXTENSION_CATALOG.protocol_name} / v{EXTENSION_CATALOG.protocol_version}</strong>
+          <small>bounded JSON frames · no shell dispatch</small>
+        </div>
+      </section>
+
+      <section className="metric-grid extensions-metrics" aria-label="Extension protocol metrics">
+        <MetricCard label="Protocol" value={`v${EXTENSION_CATALOG.protocol_version}`} detail="versioned contract" accent="cyan" />
+        <MetricCard label="Runtimes" value={String(EXTENSION_CATALOG.supported_kinds.length).padStart(2, "0")} detail="WASM / subprocess" accent="amber" />
+        <MetricCard label="Loaded" value={String(EXTENSION_CATALOG.loaded.length).padStart(2, "0")} detail="local catalog" accent="neutral" />
+        <MetricCard label="Permissions" value={String(permissionEntries.length).padStart(2, "0")} detail="declared capabilities" accent="neutral" />
+      </section>
+
+      <div className="extensions-grid">
+        <section className="panel extension-boundary-card">
+          <div className="panel-heading">
+            <div><span className="overline">Design principle</span><h2>Capabilities before code.</h2></div>
+            <span className="extension-seal">R / 01</span>
+          </div>
+          <div className="extension-flow" aria-label="Extension message flow">
+            <div className="extension-flow-node"><span>01</span><strong>Manifest</strong><small>identity + permissions</small></div>
+            <span className="extension-flow-line" aria-hidden="true">→</span>
+            <div className="extension-flow-node active"><span>02</span><strong>Host</strong><small>bounded framing</small></div>
+            <span className="extension-flow-line" aria-hidden="true">→</span>
+            <div className="extension-flow-node"><span>03</span><strong>Signal</strong><small>request / result / event</small></div>
+          </div>
+          <p className="extension-card-copy">Every message carries the protocol version. Frames are length-prefixed and capped before JSON decoding; subprocess programs receive direct argument arrays, never a shell command string.</p>
+        </section>
+
+        <section className="panel extension-permissions-card">
+          <div className="panel-heading">
+            <div><span className="overline">Permission vocabulary</span><h2>Ask for less.</h2></div>
+            <span className="panel-count">{String(permissionEntries.length).padStart(2, "0")}</span>
+          </div>
+          <div className="extension-permission-list">
+            {permissionEntries.map(([permission, label], index) => (
+              <div className="extension-permission-row" key={permission}>
+                <span>{String(index + 1).padStart(2, "0")}</span>
+                <strong>{label}</strong>
+                <code>{permission}</code>
+              </div>
+            ))}
+          </div>
+        </section>
+      </div>
+
+      <section className="panel extension-empty-card">
+        <span className="extension-empty-mark">◇</span>
+        <div><span className="overline">Catalog status</span><strong>No extensions loaded</strong><p>The protocol and desktop model are ready for a future catalog manager. Nothing is installed, executed, or granted by this view.</p></div>
+        <span className="extension-gate">MANAGER GATED</span>
+      </section>
     </div>
   );
 }

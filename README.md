@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**79% verified** · `███████████████▊░░░░`<br>
-Weighted evidence score: **79.97 / 100** · displayed conservatively as the
+**82% verified** · `████████████████▍░░░░`<br>
+Weighted evidence score: **82.97 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -44,6 +44,13 @@ idempotently so a crashed server cannot leave history stuck forever; resuming
 the same remote attempt after restart and richer retry policy remain future
 gates.
 
+Rivet's extension surface is intentionally a separate, versioned contract.
+`rivet-extension-protocol` validates WASM or direct-subprocess manifests,
+declared permissions, relative entrypoints, and bounded length-prefixed JSON
+frames. The desktop control room mirrors that model and shows the protocol
+boundary without pretending that an extension manager or third-party catalog
+already exists.
+
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
 arrays, validated repository-scoped workspaces, persisted domain-safe IDs, and
@@ -58,6 +65,7 @@ crates/
   rivet-runner/      process execution, queue, and pipeline orchestration
   rivet-server/      headless REST/WebSocket transport
   rivet-storage/     SQLite persistence, migrations, and event projection
+  rivet-extension-protocol/ bounded WASM/subprocess extension contract
   rivet-credentials/ encrypted local provider credentials
   rivet-scm/         direct Git adapter and SCM boundary
   rivet-cli/         local operator interface and first runnable slice
