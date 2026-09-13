@@ -12,7 +12,7 @@ points**, displayed conservatively as 92%).
 | --- | ---: | --- | --- |
 | Foundation and domain contracts | 4 | verified | Rust workspace, IDs, explicit state transitions, tests |
 | Pipeline definition and validation | 4 | verified | Versioned `Rivetfile.toml`, direct command arrays, validation tests, dependency-checked DAGs, and deterministic parameter-gated stages with explicit skipped outcomes |
-| Native process runner | 6 | verified | stdout/stderr streaming, timeout, cancellation, process-group cleanup tests |
+| Native process runner | 6 | verified | stdout/stderr streaming with bounded 64 KiB line retention, timeout, cancellation, process-group cleanup tests |
 | Queue and scheduler | 6 | partial | FIFO tie ordering, bounded priorities, global/per-project limits, live telemetry, priority-ordered queue snapshots with a rendered queue control room, pre-execution cancellation, authenticated pause/resume administration, executor/CPU/memory-aware remote resource reservations, dependency-ordered stage graph admission, and parallel independent stage execution pass; richer local resource dimensions remain |
 | SQLite persistence | 6 | verified | Migration, build graph projection, reopen/history test |
 | API and live transport | 6 | partial | REST/loopback WebSocket, public liveness/readiness probes with a read-only SQLite check, durable event replay, queue telemetry, build retry, schedule endpoints/dispatch, graceful SIGINT/SIGTERM shutdown, safe request IDs with structured method/route/status tracing, exact CORS allow-list, body limits, security headers, and policy-backed identity/project authorization pass; deployment operations remain |

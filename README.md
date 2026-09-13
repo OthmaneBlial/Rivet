@@ -178,6 +178,11 @@ command sends one authenticated request to a running server; pass
 `--token-file` for a private Bearer token. Mutations are not retried after a
 network interruption, avoiding duplicate operator actions.
 
+The process runner streams stdout and stderr independently while retaining at
+most 64 KiB of any single line. An unterminated line that exceeds the bound is
+emitted with an explicit truncation marker, so a noisy tool cannot grow one
+in-memory buffer without limit.
+
 Administrators can stop new admissions without interrupting running builds with
 `POST /api/v1/queue/pause`, inspect the `paused` field from `GET
 /api/v1/queue`, and reopen admissions with `POST /api/v1/queue/resume`.

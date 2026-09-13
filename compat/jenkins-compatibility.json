@@ -38,9 +38,10 @@
     },
     {
       "category": "Logs",
-      "feature": "Timestamped stdout and stderr streaming",
+      "feature": "Timestamped bounded stdout and stderr streaming",
       "status": "supported",
-      "evidence": ["crates/rivet-runner/src/process.rs"]
+      "evidence": ["crates/rivet-runner/src/process.rs"],
+      "notes": "Direct child output is streamed separately and one unterminated line is capped at 64 KiB with an explicit truncation marker, preventing unbounded memory growth."
     },
     {
       "category": "Queue",

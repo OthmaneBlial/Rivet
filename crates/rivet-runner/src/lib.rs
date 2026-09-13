@@ -13,7 +13,10 @@ pub use pipeline::{
     RunnerError, execute_pipeline, execute_pipeline_with_parameters,
     execute_pipeline_with_parameters_and_cache,
 };
-pub use process::{LogLine, ProcessError, ProcessOutcome, ProcessResult, ProcessSpec, run_process};
+pub use process::{
+    LogLine, MAX_LOG_LINE_BYTES, ProcessError, ProcessOutcome, ProcessResult, ProcessSpec,
+    run_process,
+};
 pub use scheduler::{
     MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueEntry, QueueHandle, QueueStats, Scheduler,
     SchedulerError,

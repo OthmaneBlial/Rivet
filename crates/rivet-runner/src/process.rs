@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
@@ -19,6 +19,10 @@ pub struct ProcessSpec {
     pub working_dir: PathBuf,
     pub timeout: Option<Duration>,
 }
+
+/// Maximum number of bytes retained for one streamed log line.
+pub const MAX_LOG_LINE_BYTES: usize = 64 * 1024;
+const LOG_READ_CHUNK_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct LogLine {
@@ -154,38 +158,70 @@ impl Drop for ProcessGroupGuard {
 }
 
 async fn forward_lines<R>(
-    reader: R,
+    mut reader: R,
     stream: LogStream,
     output: mpsc::Sender<LogLine>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
 {
-    let mut reader = BufReader::new(reader);
+    let mut read_buffer = [0_u8; LOG_READ_CHUNK_BYTES];
     let mut bytes = Vec::with_capacity(1024);
+    let mut line_started = false;
+    let mut truncated = false;
     loop {
-        bytes.clear();
-        let count = reader.read_until(b'\n', &mut bytes).await?;
+        let count = reader.read(&mut read_buffer).await?;
         if count == 0 {
+            if line_started {
+                emit_line(&mut bytes, truncated, stream, &output).await;
+            }
             break;
         }
-        while matches!(bytes.last(), Some(b'\n' | b'\r')) {
-            bytes.pop();
-        }
-        let line = String::from_utf8_lossy(&bytes).into_owned();
-        if output
-            .send(LogLine {
-                stream,
-                line,
-                timestamp: Utc::now(),
-            })
-            .await
-            .is_err()
-        {
-            break;
+
+        for &byte in &read_buffer[..count] {
+            if byte == b'\n' {
+                if !emit_line(&mut bytes, truncated, stream, &output).await {
+                    return Ok(());
+                }
+                line_started = false;
+                truncated = false;
+                continue;
+            }
+            line_started = true;
+            if bytes.len() < MAX_LOG_LINE_BYTES {
+                bytes.push(byte);
+            } else {
+                truncated = true;
+            }
         }
     }
     Ok(())
+}
+
+async fn emit_line(
+    bytes: &mut Vec<u8>,
+    truncated: bool,
+    stream: LogStream,
+    output: &mpsc::Sender<LogLine>,
+) -> bool {
+    while bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    let mut line = String::from_utf8_lossy(bytes).into_owned();
+    if truncated {
+        line.push_str(&format!(
+            " … [line truncated after {MAX_LOG_LINE_BYTES} bytes]"
+        ));
+    }
+    bytes.clear();
+    output
+        .send(LogLine {
+            stream,
+            line,
+            timestamp: Utc::now(),
+        })
+        .await
+        .is_ok()
 }
 
 async fn wait_for_process(
@@ -338,6 +374,25 @@ mod tests {
         }
         assert!(lines.contains(&(LogStream::Stdout, "out".into())));
         assert!(lines.contains(&(LogStream::Stderr, "err".into())));
+    }
+
+    #[tokio::test]
+    async fn bounds_a_single_unterminated_log_line() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let result = run_process(
+            shell("awk 'BEGIN { for (i = 0; i < 131072; i++) printf \"X\" }'"),
+            CancellationToken::new(),
+            tx,
+        )
+        .await
+        .expect("process succeeds");
+
+        assert_eq!(result.outcome, ProcessOutcome::Passed);
+        let line = rx.recv().await.expect("bounded output line");
+        assert_eq!(line.stream, LogStream::Stdout);
+        assert!(line.line.ends_with(" [line truncated after 65536 bytes]"));
+        assert!(line.line.len() < MAX_LOG_LINE_BYTES + 64);
+        assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]
