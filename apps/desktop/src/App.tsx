@@ -742,7 +742,7 @@ function AgentsPanel({ agents, online }: { agents: AgentSummary[]; online: boole
           <h1>Machines with a pulse.</h1>
           <p>See which workers are reachable, what they can run, and how much executor capacity is free.</p>
         </div>
-        <div className="agents-protocol"><span className="overline">Protocol</span><strong>rivet-agent / v1</strong><small>{online ? "registry connected" : "engine unavailable"}</small></div>
+        <div className="agents-protocol"><span className="overline">Protocol</span><strong>rivet-agent / v2</strong><small>{online ? "registry connected" : "engine unavailable"}</small></div>
       </section>
 
       <section className="metric-grid agents-metrics" aria-label="Agent metrics">
@@ -769,7 +769,7 @@ function AgentsPanel({ agents, online }: { agents: AgentSummary[]; online: boole
                   <div className="agent-identity"><strong>{agent.name}</strong><small>{agent.agent_id.slice(0, 8)} · heartbeat #{agent.last_sequence}</small></div>
                   <div className="agent-capability"><span className="overline">Platform</span><strong>{agent.capabilities.os} · {agent.capabilities.arch}</strong></div>
                   <div className="agent-capability agent-labels"><span className="overline">Labels</span><strong>{agent.capabilities.labels.length ? agent.capabilities.labels.join(" · ") : "none"}</strong></div>
-                  <div className="agent-capacity"><span className="overline">Capacity</span><strong>{agent.available_executors} / {agent.capabilities.executors}</strong><small>{agent.running.length} running · {agent.capabilities.docker ? "Docker" : "Native"}</small></div>
+                  <div className="agent-capacity"><span className="overline">Capacity</span><strong>{agent.available_executors} / {agent.capabilities.executors}</strong><small>{agent.running.length} running · {agent.reserved?.length ?? 0} reserved · {agent.capabilities.docker ? "Docker" : "Native"}</small></div>
                   <span className="agent-state">{statusLabel}</span>
                 </article>
               );

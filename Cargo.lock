@@ -1004,6 +1004,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subtle",
+ "tar",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1013,6 +1014,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

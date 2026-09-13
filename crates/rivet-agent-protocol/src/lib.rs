@@ -16,7 +16,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const PROTOCOL_NAME: &str = "rivet-agent";
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub type AgentId = Uuid;
 
 const MAX_AGENT_NAME_BYTES: usize = 128;
@@ -456,6 +456,55 @@ mod tests {
         assert!(encoded.contains(r#""type":"register""#));
         let decoded: AgentMessage = serde_json::from_str(&encoded).expect("decode");
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn assignment_round_trips_with_a_bounded_workspace_transfer() {
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "remote-build"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+        let build_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let message = AgentMessage::Assign {
+            protocol_version: PROTOCOL_VERSION,
+            build_id,
+            project_id,
+            plan: ExecutionPlan::from_pipeline(&pipeline, build_id, project_id),
+            pipeline,
+            parameters: BTreeMap::new(),
+            workspace: WorkspaceTransfer {
+                total_bytes: 4096,
+                file_count: 2,
+                sha256: "a".repeat(64),
+            },
+        };
+        message.validate().expect("valid assignment");
+        let encoded = serde_json::to_string(&message).expect("encode");
+        let decoded: AgentMessage = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn workspace_chunks_are_bounded_before_transport() {
+        let message = AgentMessage::WorkspaceChunk {
+            protocol_version: PROTOCOL_VERSION,
+            build_id: Uuid::new_v4(),
+            sequence: 1,
+            data: vec![0; MAX_WORKSPACE_CHUNK_BYTES + 1],
+        };
+        assert_eq!(
+            message.validate(),
+            Err(ProtocolError::WorkspaceChunkTooLarge)
+        );
     }
 
     #[test]

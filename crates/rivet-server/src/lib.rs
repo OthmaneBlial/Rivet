@@ -40,8 +40,10 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 mod agent_registry;
+mod workspace_archive;
 
-use agent_registry::{AgentRegistry, AgentSummary};
+use agent_registry::{AgentLease, AgentRegistry, AgentSummary};
+use workspace_archive::archive_workspace;
 
 const DEFAULT_ALLOWED_ORIGINS: [&str; 4] = [
     "http://127.0.0.1:1420",
@@ -59,6 +61,7 @@ pub struct AppState {
     auth_digest: Option<[u8; 32]>,
     webhook_secret: Option<Vec<u8>>,
     agents: AgentRegistry,
+    remote_messages: Arc<Mutex<HashMap<BuildId, mpsc::Sender<AgentMessage>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -500,6 +503,7 @@ impl AppState {
             auth_digest: None,
             webhook_secret: None,
             agents: AgentRegistry::default(),
+            remote_messages: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -639,10 +643,10 @@ async fn connect_agent(
     State(state): State<AppState>,
     websocket: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    websocket.on_upgrade(move |socket| handle_agent_socket(socket, state.agents.clone()))
+    websocket.on_upgrade(move |socket| handle_agent_socket(socket, state))
 }
 
-async fn handle_agent_socket(mut socket: WebSocket, agents: AgentRegistry) {
+async fn handle_agent_socket(mut socket: WebSocket, state: AppState) {
     let first_message = match tokio::time::timeout(Duration::from_secs(10), socket.recv()).await {
         Ok(Some(Ok(message))) => message,
         Ok(Some(Err(error))) => {
@@ -670,7 +674,12 @@ async fn handle_agent_socket(mut socket: WebSocket, agents: AgentRegistry) {
             return;
         }
     };
-    let lease = match agents.register(registration, Utc::now()).await {
+    let (outbound, mut outbound_rx) = mpsc::channel(256);
+    let lease = match state
+        .agents
+        .register_with_sender(registration, Utc::now(), outbound)
+        .await
+    {
         Ok(lease) => lease,
         Err(error) => {
             let _ =
@@ -684,90 +693,165 @@ async fn handle_agent_socket(mut socket: WebSocket, agents: AgentRegistry) {
         session_id: lease.session_id,
     };
     if !send_agent_message(&mut socket, registered).await {
-        agents.unregister(lease.agent_id, lease.session_id).await;
+        state
+            .agents
+            .unregister(lease.agent_id, lease.session_id)
+            .await;
         return;
     }
 
-    while let Some(result) = socket.recv().await {
-        let message = match result {
-            Ok(message) => message,
-            Err(error) => {
-                tracing::debug!(agent_id = %lease.agent_id, ?error, "agent websocket failed");
-                break;
-            }
-        };
-        match message {
-            Message::Ping(payload) => {
-                if socket.send(Message::Pong(payload)).await.is_err() {
-                    break;
-                }
-            }
-            Message::Close(_) => break,
-            Message::Pong(_) => continue,
-            message => match decode_agent_message(message) {
-                Ok(AgentMessage::Heartbeat(heartbeat)) => {
-                    if heartbeat.agent_id != lease.agent_id {
-                        let _ = send_agent_error(
-                            &mut socket,
-                            "agent_identity_mismatch",
-                            "heartbeat agent_id does not match the registered session",
-                        )
-                        .await;
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                let Some(result) = incoming else { break; };
+                let message = match result {
+                    Ok(message) => message,
+                    Err(error) => {
+                        tracing::debug!(agent_id = %lease.agent_id, ?error, "agent websocket failed");
                         break;
                     }
-                    let sequence = heartbeat.sequence;
-                    match agents.heartbeat(heartbeat, Utc::now()).await {
-                        Ok(_) => {
-                            if !send_agent_message(
-                                &mut socket,
-                                AgentMessage::HeartbeatAck {
-                                    protocol_version: PROTOCOL_VERSION,
-                                    sequence,
-                                    server_time: Utc::now(),
-                                },
-                            )
-                            .await
-                            {
-                                break;
-                            }
-                        }
-                        Err(error) => {
-                            let _ = send_agent_error(
-                                &mut socket,
-                                "heartbeat_rejected",
-                                &error.to_string(),
-                            )
-                            .await;
+                };
+                match message {
+                    Message::Ping(payload) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
                             break;
                         }
                     }
+                    Message::Close(_) => break,
+                    Message::Pong(_) => continue,
+                    message => match decode_agent_message(message) {
+                        Ok(message) => match dispatch_agent_message(&state, &lease, message).await {
+                            Ok(Some(response)) => {
+                                if !send_agent_message(&mut socket, response).await {
+                                    break;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err((code, message)) => {
+                                let _ = send_agent_error(&mut socket, &code, &message).await;
+                                break;
+                            }
+                        },
+                        Err(error) => {
+                            let _ = send_agent_error(&mut socket, "invalid_message", &error).await;
+                            break;
+                        }
+                    },
                 }
-                Ok(AgentMessage::Register(_)) => {
-                    let _ = send_agent_error(
-                        &mut socket,
-                        "already_registered",
-                        "an agent can register only once per connection",
-                    )
-                    .await;
+            }
+            outgoing = outbound_rx.recv() => {
+                let Some(message) = outgoing else { break; };
+                if !send_agent_message(&mut socket, message).await {
                     break;
                 }
-                Ok(_) => {
-                    let _ = send_agent_error(
-                        &mut socket,
-                        "unsupported_message",
-                        "this server accepts heartbeat messages after registration",
-                    )
-                    .await;
-                    break;
-                }
-                Err(error) => {
-                    let _ = send_agent_error(&mut socket, "invalid_message", &error).await;
-                    break;
-                }
-            },
+            }
         }
     }
-    agents.unregister(lease.agent_id, lease.session_id).await;
+    state
+        .agents
+        .unregister(lease.agent_id, lease.session_id)
+        .await;
+}
+
+async fn dispatch_agent_message(
+    state: &AppState,
+    lease: &AgentLease,
+    message: AgentMessage,
+) -> Result<Option<AgentMessage>, (String, String)> {
+    match message {
+        AgentMessage::Heartbeat(heartbeat) => {
+            if heartbeat.agent_id != lease.agent_id {
+                return Err((
+                    "agent_identity_mismatch".into(),
+                    "heartbeat agent_id does not match the registered session".into(),
+                ));
+            }
+            let sequence = heartbeat.sequence;
+            state
+                .agents
+                .heartbeat(heartbeat, Utc::now())
+                .await
+                .map_err(|error| ("heartbeat_rejected".into(), error.to_string()))?;
+            Ok(Some(AgentMessage::HeartbeatAck {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                server_time: Utc::now(),
+            }))
+        }
+        AgentMessage::Register(_) => Err((
+            "already_registered".into(),
+            "an agent can register only once per connection".into(),
+        )),
+        AgentMessage::Event { event, .. } => {
+            route_agent_build_message(
+                state,
+                build_id_from_event(&event),
+                AgentMessage::Event {
+                    protocol_version: PROTOCOL_VERSION,
+                    event,
+                },
+            )
+            .await?;
+            Ok(None)
+        }
+        AgentMessage::AssignmentAccepted { build_id, .. }
+        | AgentMessage::WorkspaceReady { build_id, .. }
+        | AgentMessage::Log { build_id, .. }
+        | AgentMessage::Finished { build_id, .. } => {
+            route_agent_build_message(state, build_id, message).await?;
+            Ok(None)
+        }
+        AgentMessage::Error { code, message, .. } => Err((format!("agent_{code}"), message)),
+        AgentMessage::Cancel { .. }
+        | AgentMessage::Assign { .. }
+        | AgentMessage::WorkspaceChunk { .. } => Err((
+            "unsupported_message".into(),
+            "this message is server-originated and cannot be sent by an agent".into(),
+        )),
+        AgentMessage::Registered { .. } | AgentMessage::HeartbeatAck { .. } => Err((
+            "unsupported_message".into(),
+            "this message is server-originated and cannot be sent by an agent".into(),
+        )),
+    }
+}
+
+async fn route_agent_build_message(
+    state: &AppState,
+    build_id: BuildId,
+    message: AgentMessage,
+) -> Result<(), (String, String)> {
+    let sender = state
+        .remote_messages
+        .lock()
+        .await
+        .get(&build_id)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                "unknown_build".into(),
+                format!("agent message refers to unassigned build {build_id}"),
+            )
+        })?;
+    sender.send(message).await.map_err(|_| {
+        (
+            "build_channel_closed".into(),
+            format!("server is no longer listening for build {build_id}"),
+        )
+    })
+}
+
+fn build_id_from_event(event: &BuildEvent) -> BuildId {
+    match event {
+        BuildEvent::BuildQueued { build_id, .. }
+        | BuildEvent::BuildStarted { build_id, .. }
+        | BuildEvent::BuildFinished { build_id, .. }
+        | BuildEvent::BuildCancelled { build_id, .. }
+        | BuildEvent::StageStarted { build_id, .. }
+        | BuildEvent::StageFinished { build_id, .. }
+        | BuildEvent::StepStarted { build_id, .. }
+        | BuildEvent::StepOutput { build_id, .. }
+        | BuildEvent::StepFinished { build_id, .. } => *build_id,
+    }
 }
 
 fn decode_agent_message(message: Message) -> Result<AgentMessage, String> {
