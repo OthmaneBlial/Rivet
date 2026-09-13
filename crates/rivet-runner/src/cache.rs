@@ -37,38 +37,20 @@ impl CacheStore {
         spec: &CacheSpec,
         workspace: &Path,
     ) -> Result<bool, CacheError> {
-        let archive_path = self.archive_path(project_id, spec);
-        if !archive_path.is_file() {
-            return Ok(false);
-        }
-        let file = File::open(&archive_path)?;
-        let mut archive = tar::Archive::new(file);
-        let restore_result = (|| {
-            for entry in archive.entries()? {
-                let mut entry = entry?;
-                let path = entry.path()?.into_owned();
-                if path.is_absolute()
-                    || path.components().any(|component| {
-                        matches!(
-                            component,
-                            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                        )
-                    })
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("cache entry escapes workspace: {}", path.display()),
-                    ));
+        let mut first_error = None;
+        for key in
+            std::iter::once(spec.key.as_str()).chain(spec.fallback_keys.iter().map(String::as_str))
+        {
+            let archive_path = self.archive_path_for_key(project_id, key);
+            match self.restore_archive(&archive_path, workspace) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
                 }
-                entry.unpack_in(workspace)?;
             }
-            Ok(())
-        })();
-        if let Err(error) = restore_result {
-            let _ = fs::remove_file(&archive_path);
-            return Err(error.into());
         }
-        Ok(true)
+        first_error.map_or(Ok(false), Err)
     }
 
     /// Save the selected workspace paths under an exact cache key.
@@ -127,14 +109,64 @@ impl CacheStore {
     }
 
     fn archive_path(&self, project_id: ProjectId, spec: &CacheSpec) -> PathBuf {
+        self.archive_path_for_key(project_id, &spec.key)
+    }
+
+    fn archive_path_for_key(&self, project_id: ProjectId, key: &str) -> PathBuf {
         let mut digest = Sha256::new();
         digest.update(project_id.as_bytes());
         digest.update([0]);
-        digest.update(spec.key.as_bytes());
+        digest.update(key.as_bytes());
         self.root.join(format!(
             "{project_id}-{}.tar",
             hex::encode(digest.finalize())
         ))
+    }
+
+    fn restore_archive(&self, archive_path: &Path, workspace: &Path) -> Result<bool, CacheError> {
+        let metadata = match fs::symlink_metadata(archive_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cache archive is not a regular file: {}",
+                    archive_path.display()
+                ),
+            )
+            .into());
+        }
+        let file = File::open(archive_path)?;
+        let mut archive = tar::Archive::new(file);
+        let restore_result = (|| {
+            for entry in archive.entries()? {
+                let mut entry = entry?;
+                let path = entry.path()?.into_owned();
+                if path.is_absolute()
+                    || path.components().any(|component| {
+                        matches!(
+                            component,
+                            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                        )
+                    })
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("cache entry escapes workspace: {}", path.display()),
+                    ));
+                }
+                entry.unpack_in(workspace)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = restore_result {
+            let _ = fs::remove_file(archive_path);
+            return Err(error.into());
+        }
+        Ok(true)
     }
 
     fn ensure_root(&self) -> Result<(), CacheError> {
@@ -177,6 +209,7 @@ mod tests {
             name: "dependencies".into(),
             key: "deps-v1".into(),
             paths: vec!["target".into(), "lockfile".into()],
+            fallback_keys: vec![],
         }
     }
 
@@ -232,6 +265,42 @@ program = "true"
         )
         .expect("pipeline with cache");
         assert_eq!(pipeline.caches, vec![spec]);
+    }
+
+    #[test]
+    fn restore_uses_a_valid_fallback_after_a_corrupt_primary_entry() {
+        let directory = tempdir().expect("tempdir");
+        let workspace = directory.path().join("workspace");
+        let cache_root = directory.path().join("cache");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("lockfile"), "fallback").expect("lockfile");
+        let project_id = uuid::Uuid::new_v4();
+        let store = CacheStore::new(&cache_root);
+        let fallback = cache_spec();
+        let primary = CacheSpec {
+            key: "branch-feature".into(),
+            fallback_keys: vec![fallback.key.clone()],
+            ..fallback.clone()
+        };
+        assert!(
+            store
+                .save(project_id, &fallback, &workspace)
+                .expect("fallback save")
+        );
+        store.ensure_root().expect("cache root");
+        fs::write(store.archive_path(project_id, &primary), "not a tar").expect("corrupt primary");
+        fs::remove_file(workspace.join("lockfile")).expect("remove lockfile");
+
+        assert!(
+            store
+                .restore(project_id, &primary, &workspace)
+                .expect("fallback restore")
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("lockfile")).expect("restored lockfile"),
+            "fallback"
+        );
+        assert!(!store.archive_path(project_id, &primary).exists());
     }
 
     #[test]

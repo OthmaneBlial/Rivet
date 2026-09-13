@@ -46,6 +46,8 @@ pub struct CacheSpec {
     pub name: String,
     pub key: String,
     pub paths: Vec<String>,
+    #[serde(default)]
+    pub fallback_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -184,6 +186,18 @@ pub enum PipelineError {
     CacheKeyTooLong { name: String },
     #[error("cache key for {name:?} contains a control character")]
     InvalidCacheKey { name: String },
+    #[error("cache {name:?} declares too many fallback keys")]
+    TooManyCacheFallbackKeys { name: String },
+    #[error("cache fallback key for {name:?} cannot be empty")]
+    EmptyCacheFallbackKey { name: String },
+    #[error("cache fallback key for {name:?} is too long")]
+    CacheFallbackKeyTooLong { name: String },
+    #[error("cache fallback key for {name:?} contains a control character")]
+    InvalidCacheFallbackKey { name: String },
+    #[error("cache {name:?} repeats a fallback key")]
+    DuplicateCacheFallbackKey { name: String },
+    #[error("cache {name:?} repeats its primary key as a fallback")]
+    PrimaryCacheFallbackKey { name: String },
     #[error("cache {0:?} must declare at least one path")]
     EmptyCachePaths(String),
     #[error("cache {cache:?} has an invalid path {path:?}")]
@@ -295,6 +309,39 @@ impl Pipeline {
                 return Err(PipelineError::InvalidCacheKey {
                     name: cache.name.clone(),
                 });
+            }
+            if cache.fallback_keys.len() > 16 {
+                return Err(PipelineError::TooManyCacheFallbackKeys {
+                    name: cache.name.clone(),
+                });
+            }
+            let mut fallback_keys = HashSet::new();
+            for fallback_key in &cache.fallback_keys {
+                if fallback_key.trim().is_empty() {
+                    return Err(PipelineError::EmptyCacheFallbackKey {
+                        name: cache.name.clone(),
+                    });
+                }
+                if fallback_key.len() > 256 {
+                    return Err(PipelineError::CacheFallbackKeyTooLong {
+                        name: cache.name.clone(),
+                    });
+                }
+                if fallback_key.chars().any(char::is_control) {
+                    return Err(PipelineError::InvalidCacheFallbackKey {
+                        name: cache.name.clone(),
+                    });
+                }
+                if fallback_key == &cache.key {
+                    return Err(PipelineError::PrimaryCacheFallbackKey {
+                        name: cache.name.clone(),
+                    });
+                }
+                if !fallback_keys.insert(fallback_key.as_str()) {
+                    return Err(PipelineError::DuplicateCacheFallbackKey {
+                        name: cache.name.clone(),
+                    });
+                }
             }
             if cache.paths.is_empty() {
                 return Err(PipelineError::EmptyCachePaths(cache.name.clone()));
@@ -835,6 +882,7 @@ name = "cache"
 [[caches]]
 name = "dependencies-v1"
 key = "deps-v1"
+fallback_keys = ["deps-default"]
 paths = ["target", "node_modules"]
 [[stages]]
 name = "Test"
@@ -846,6 +894,28 @@ program = "true"
         .expect("cache pipeline");
         assert_eq!(pipeline.caches[0].name, "dependencies-v1");
         assert_eq!(pipeline.caches[0].paths, ["target", "node_modules"]);
+        assert_eq!(pipeline.caches[0].fallback_keys, ["deps-default"]);
+
+        let duplicate_fallback = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "duplicate-fallback"
+[[caches]]
+name = "dependencies"
+key = "deps-v1"
+fallback_keys = ["deps-default", "deps-default"]
+paths = ["target"]
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        );
+        assert!(matches!(
+            duplicate_fallback,
+            Err(PipelineError::DuplicateCacheFallbackKey { name }) if name == "dependencies"
+        ));
 
         let invalid = Pipeline::from_toml_str(
             r#"
