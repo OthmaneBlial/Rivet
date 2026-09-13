@@ -91,6 +91,15 @@ The token is held in memory, never printed, and never stored in the Rivet
 database. Health checks remain public; API and WebSocket routes require
 `Authorization: Bearer <token>` when authentication is enabled.
 
+Browser access uses an exact local/Tauri origin allow-list by default. Add an
+exact remote console origin explicitly when needed; wildcard origins are
+rejected:
+
+```sh
+cargo run -p rivet -- --data-dir .rivet server \
+  --allow-origin https://console.example
+```
+
 The versioned API currently exposes health, projects, queued builds, build
 details, persisted logs, cancellation, a live queue snapshot, durable replay,
 and a per-build WebSocket event stream under `/api/v1/`. It also exposes

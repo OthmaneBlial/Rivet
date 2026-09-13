@@ -102,7 +102,7 @@
       "feature": "Protected server API transport",
       "status": "partial",
       "evidence": ["crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
-      "notes": "Optional in-memory Bearer-token protection and mandatory authentication for non-loopback binds are supported; user identity, roles, and project permissions remain planned."
+      "notes": "Optional in-memory Bearer-token protection, mandatory authentication for non-loopback binds, exact CORS origins, request limits, and baseline security headers are supported; user identity, roles, and project permissions remain planned."
     },
     {
       "category": "Plugins",

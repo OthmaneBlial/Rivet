@@ -14,7 +14,7 @@ The current verified total is **60 / 100 points**.
 | Native process runner | 6 | verified | stdout/stderr streaming, timeout, cancellation, process-group cleanup tests |
 | Queue and scheduler | 6 | partial | FIFO, global/per-project limits, live telemetry, and pre-execution cancellation pass; priorities, resource requirements, and admin state remain |
 | SQLite persistence | 6 | verified | Migration, build graph projection, reopen/history test |
-| API and live transport | 6 | partial | REST/loopback WebSocket, durable event replay, queue telemetry, build retry, and schedule endpoints/dispatch pass; auth and deployment hardening remain |
+| API and live transport | 6 | partial | REST/loopback WebSocket, durable event replay, queue telemetry, build retry, schedule endpoints/dispatch, exact CORS allow-list, body limits, and security headers pass; full identity/authz and deployment operations remain |
 | CLI operator workflow | 3 | partial | project/run/history, parameterized builds, artifact listing, retry, and schedule management work; richer cancellation and inspection remain |
 | Tauri desktop control room | 10 | partial | native bundle, embedded engine health, rendered light-default/dark-toggle UX, artifact/retry views, schedule controls, online/offline recovery, and real client build flow pass; final Tauri-window flow remains |
 | Git/SCM integration | 8 | partial | direct Git inspect/checkout/fetch/clean operations, REST/CLI surfaces, explicit build-admission preparation, and persisted build source identity pass; credentials and provider hooks remain |
