@@ -115,6 +115,29 @@ export interface QueueStats {
   capacity: number;
 }
 
+export type AgentStatus = "online" | "stale";
+
+export interface AgentCapabilities {
+  os: string;
+  arch: string;
+  docker: boolean;
+  labels: string[];
+  executors: number;
+}
+
+export interface AgentSummary {
+  agent_id: string;
+  name: string;
+  protocol_version: number;
+  capabilities: AgentCapabilities;
+  connected_at: string;
+  last_heartbeat: string;
+  last_sequence: number;
+  running: string[];
+  available_executors: number;
+  status: AgentStatus;
+}
+
 export type MigrationSupportLevel = "supported" | "partial" | "unsupported";
 
 export interface MigrationFinding {

@@ -1,6 +1,7 @@
 import type {
   BuildDetails,
   BuildRecord,
+  AgentSummary,
   ArtifactRecord,
   LogRecord,
   MigrationResponse,
@@ -110,6 +111,10 @@ export function projects(): Promise<Project[]> {
 
 export function queueStats(): Promise<QueueStats> {
   return request<QueueStats>("/api/v1/queue");
+}
+
+export function agents(): Promise<AgentSummary[]> {
+  return request<AgentSummary[]>("/api/v1/agents");
 }
 
 export function analyzeJenkinsfile(

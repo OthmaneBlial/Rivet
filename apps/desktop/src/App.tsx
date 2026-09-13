@@ -8,6 +8,7 @@ import {
   deleteSchedule,
   artifactUrl,
   analyzeJenkinsfile,
+  agents as fetchAgents,
   artifacts,
   ENGINE_OFFLINE_MESSAGE,
   eventUrl,
@@ -22,6 +23,7 @@ import {
   updateSchedule,
 } from "./api";
 import type {
+  AgentSummary,
   ArtifactRecord,
   BuildDetails,
   BuildRecord,
@@ -36,7 +38,7 @@ import type {
 const NAV_ITEMS = [
   { label: "Pipelines", mark: "↳", active: true },
   { label: "Queue", mark: "≋", active: false },
-  { label: "Agents", mark: "⊙", active: false },
+  { label: "Agents", mark: "⊙", active: true },
   { label: "Artifacts", mark: "□", active: false },
   { label: "Credentials", mark: "◈", active: false },
   { label: "Migration", mark: "⇄", active: true },
@@ -128,6 +130,7 @@ function App() {
   const [projectName, setProjectName] = useState("");
   const [buildList, setBuildList] = useState<BuildRecord[]>([]);
   const [queueStatus, setQueueStatus] = useState<{ queued: number; running: number; capacity: number } | null>(null);
+  const [agentList, setAgentList] = useState<AgentSummary[]>([]);
   const [selectedBuild, setSelectedBuild] = useState<number | null>(null);
   const [details, setDetails] = useState<BuildDetails | null>(null);
   const [logLines, setLogLines] = useState<LogRecord[]>([]);
@@ -216,6 +219,14 @@ function App() {
     }
   }, []);
 
+  const loadAgentList = useCallback(async () => {
+    try {
+      setAgentList(await fetchAgents());
+    } catch {
+      setAgentList([]);
+    }
+  }, []);
+
   useEffect(() => {
     void initializeEngineOrigin();
     void loadProjects();
@@ -249,6 +260,16 @@ function App() {
     const interval = window.setInterval(() => void loadQueueStatus(), 1000);
     return () => window.clearInterval(interval);
   }, [engineOnline, loadQueueStatus]);
+
+  useEffect(() => {
+    if (!engineOnline) {
+      setAgentList([]);
+      return;
+    }
+    void loadAgentList();
+    const interval = window.setInterval(() => void loadAgentList(), 3000);
+    return () => window.clearInterval(interval);
+  }, [engineOnline, loadAgentList]);
 
   useEffect(() => {
     if (engineOnline) return;
@@ -491,6 +512,8 @@ function App() {
             onChange={setMigrationSource}
             onAnalyze={() => void runMigrationAnalysis()}
           />
+        ) : activeNav === "Agents" ? (
+          <AgentsPanel agents={agentList} online={engineOnline} />
         ) : projectsList.length === 0 ? (
           <Onboarding onCreate={() => setShowCreate(true)} online={engineOnline} />
         ) : (
@@ -703,6 +726,60 @@ function EmptyState({ text }: { text: string }) { return <div className="empty-s
 
 function Onboarding({ onCreate, online }: { onCreate: () => void; online: boolean }) {
   return <div className="onboarding"><div className="onboarding-mark"><RivetMark /></div><span className="eyebrow"><span className="eyebrow-line" />First connection</span><h1>Give the engine<br /><em>a pipeline to watch.</em></h1><p>Rivet keeps the execution signal close: a local repository, an explicit `Rivetfile.toml`, and a durable history you can trust.</p><button className="button button-primary onboarding-button" disabled={!online} onClick={onCreate}>＋ Connect a project <span>→</span></button><div className="onboarding-note"><span className="note-rule" />{online ? "The local engine is ready for a repository." : "Start `rivet server` to connect the local engine."}</div></div>;
+}
+
+function AgentsPanel({ agents, online }: { agents: AgentSummary[]; online: boolean }) {
+  const onlineAgents = agents.filter((agent) => agent.status === "online");
+  const staleAgents = agents.filter((agent) => agent.status === "stale");
+  const running = agents.reduce((total, agent) => total + agent.running.length, 0);
+  const capacity = agents.reduce((total, agent) => total + agent.capabilities.executors, 0);
+  const available = agents.reduce((total, agent) => total + agent.available_executors, 0);
+  return (
+    <div className="content-wrap agents-page">
+      <section className="page-heading agents-heading">
+        <div>
+          <span className="eyebrow"><span className="eyebrow-line" />Remote fleet</span>
+          <h1>Machines with a pulse.</h1>
+          <p>See which workers are reachable, what they can run, and how much executor capacity is free.</p>
+        </div>
+        <div className="agents-protocol"><span className="overline">Protocol</span><strong>rivet-agent / v1</strong><small>{online ? "registry connected" : "engine unavailable"}</small></div>
+      </section>
+
+      <section className="metric-grid agents-metrics" aria-label="Agent metrics">
+        <MetricCard label="Registered" value={String(agents.length).padStart(2, "0")} detail={`${onlineAgents.length} online / ${staleAgents.length} stale`} accent="cyan" />
+        <MetricCard label="Free capacity" value={`${available}/${capacity}`} detail="available executors" accent="amber" />
+        <MetricCard label="Running work" value={String(running).padStart(2, "0")} detail="agent-reported builds" accent="neutral" />
+        <MetricCard label="Assignment" value="GATED" detail="transport semantics in progress" accent="neutral" />
+      </section>
+
+      <section className="panel agents-panel" aria-label="Connected agents">
+        <div className="panel-heading">
+          <div><span className="overline">Fleet registry</span><h2>Connected agents</h2></div>
+          <span className="panel-count">{String(agents.length).padStart(2, "0")}</span>
+        </div>
+        {agents.length === 0 ? (
+          <div className="agents-empty"><span className="agents-empty-mark">⊙</span><strong>{online ? "No remote agents connected" : "Agent registry unavailable"}</strong><p>{online ? "Start a Rivet agent to see its capabilities and heartbeat here." : "Reconnect the local engine to inspect the remote fleet."}</p></div>
+        ) : (
+          <div className="agent-list">
+            {agents.map((agent) => {
+              const statusLabel = agent.status === "online" ? "Online" : "Stale";
+              return (
+                <article className={`agent-row agent-${agent.status}`} key={agent.agent_id}>
+                  <span className="agent-status-dot" aria-label={statusLabel} />
+                  <div className="agent-identity"><strong>{agent.name}</strong><small>{agent.agent_id.slice(0, 8)} · heartbeat #{agent.last_sequence}</small></div>
+                  <div className="agent-capability"><span className="overline">Platform</span><strong>{agent.capabilities.os} · {agent.capabilities.arch}</strong></div>
+                  <div className="agent-capability agent-labels"><span className="overline">Labels</span><strong>{agent.capabilities.labels.length ? agent.capabilities.labels.join(" · ") : "none"}</strong></div>
+                  <div className="agent-capacity"><span className="overline">Capacity</span><strong>{agent.available_executors} / {agent.capabilities.executors}</strong><small>{agent.running.length} running · {agent.capabilities.docker ? "Docker" : "Native"}</small></div>
+                  <span className="agent-state">{statusLabel}</span>
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </section>
+      <p className="agent-boundary"><span />Capacity discovery is live. Build assignment, remote execution, artifact transfer, and lost-job recovery remain separately gated until their transport semantics are verified.</p>
+    </div>
+  );
 }
 
 function MigrationPanel({
