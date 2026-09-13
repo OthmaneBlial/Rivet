@@ -16,10 +16,12 @@ import {
   getEngineOrigin,
   initializeEngineOrigin,
   logs,
+  pauseQueue,
   projects,
   queueStats as fetchQueueStats,
   queueBuild,
   retryBuild,
+  resumeQueue,
   schedules,
   updateSchedule,
 } from "./api";
@@ -32,6 +34,7 @@ import type {
   LogRecord,
   MigrationResponse,
   Project,
+  QueueStats,
   ScheduleRecord,
   StageDetails,
 } from "./types";
@@ -138,7 +141,7 @@ function App() {
   const [projectsList, setProjectsList] = useState<Project[]>([]);
   const [projectName, setProjectName] = useState("");
   const [buildList, setBuildList] = useState<BuildRecord[]>([]);
-  const [queueStatus, setQueueStatus] = useState<{ queued: number; running: number; capacity: number } | null>(null);
+  const [queueStatus, setQueueStatus] = useState<QueueStats | null>(null);
   const [agentList, setAgentList] = useState<AgentSummary[]>([]);
   const [extensionList, setExtensionList] = useState<ExtensionManifest[]>([]);
   const [selectedBuild, setSelectedBuild] = useState<number | null>(null);
@@ -342,6 +345,19 @@ function App() {
       await loadBuildView();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not retry build");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleQueue() {
+    if (!queueStatus) return;
+    setBusy(true);
+    setError(null);
+    try {
+      setQueueStatus(await (queueStatus.paused ? resumeQueue() : pauseQueue()));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not change queue state");
     } finally {
       setBusy(false);
     }
@@ -570,7 +586,7 @@ function App() {
             <section className="metric-grid" aria-label="Pipeline metrics">
               <MetricCard label="Latest run" value={latest ? `#${latest.number}` : "—"} detail={latest ? STATUS_LABEL[latest.status] : "No runs yet"} accent={latest?.status ?? "neutral"} />
               <MetricCard label="Success rate" value={`${successRate}%`} detail={`${buildList.length} recorded runs`} accent="cyan" />
-              <MetricCard label="Queue" value={(queueStatus?.queued ?? buildList.filter((build) => build.status === "queued").length).toString().padStart(2, "0")} detail={queueStatus ? `${queueStatus.running} running / ${queueStatus.capacity} slots` : "local capacity / 01"} accent="amber" />
+              <MetricCard label="Queue" value={(queueStatus?.queued ?? buildList.filter((build) => build.status === "queued").length).toString().padStart(2, "0")} detail={queueStatus ? `${queueStatus.paused ? "paused · " : ""}${queueStatus.running} running / ${queueStatus.capacity} slots` : "local capacity / 01"} accent="amber" />
               <MetricCard label="Last signal" value={latest ? formatTime(latest.finished_at ?? latest.started_at) : "—"} detail={latest ? duration(latest) : "Waiting for first run"} accent="neutral" />
             </section>
 
@@ -587,6 +603,7 @@ function App() {
             <section className="section-head">
               <div><span className="overline">Execution map</span><h2>{selectedProject?.name ?? "Pipeline"}</h2></div>
               <div className="section-actions">
+                {queueStatus && <button className="button button-quiet" disabled={busy || !engineOnline} onClick={() => void toggleQueue()}>{queueStatus.paused ? "Resume queue" : "Pause queue"}</button>}
                 {isRunning && <button className="button button-danger" disabled={busy} onClick={() => void stopSelectedBuild()}>Stop run</button>}
                 {details && details.build.status !== "running" && details.build.status !== "queued" && <button className="button button-quiet" disabled={busy || !engineOnline} onClick={() => void retrySelectedBuild()}>↻ Retry run</button>}
                 <button className="button button-primary" disabled={busy || !engineOnline} onClick={() => void runSelectedPipeline()}>

@@ -330,6 +330,7 @@ struct QueueStatusResponse {
     queued: usize,
     running: usize,
     capacity: usize,
+    paused: bool,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -352,6 +353,8 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
         .route("/api/v1/webhooks/github/{project}", post(github_webhook))
         .route("/api/v1/webhooks/gitlab/{project}", post(gitlab_webhook))
         .route("/api/v1/queue", get(queue_status))
+        .route("/api/v1/queue/pause", post(pause_queue))
+        .route("/api/v1/queue/resume", post(resume_queue))
         .route("/api/v1/projects", get(list_projects).post(create_project))
         .route(
             "/api/v1/projects/{name}/builds",
@@ -921,16 +924,40 @@ async fn queue_status(
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<QueueStatusResponse>, ApiError> {
     require_global(&principal, Permission::Read)?;
+    Ok(Json(queue_status_response(&state)))
+}
+
+async fn pause_queue(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<QueueStatusResponse>, ApiError> {
+    require_global(&principal, Permission::Administer)?;
+    state.scheduler.pause();
+    Ok(Json(queue_status_response(&state)))
+}
+
+async fn resume_queue(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<QueueStatusResponse>, ApiError> {
+    require_global(&principal, Permission::Administer)?;
+    state.scheduler.resume();
+    Ok(Json(queue_status_response(&state)))
+}
+
+fn queue_status_response(state: &AppState) -> QueueStatusResponse {
     let QueueStats {
         queued,
         running,
         capacity,
+        paused,
     } = state.scheduler.stats();
-    Ok(Json(QueueStatusResponse {
+    QueueStatusResponse {
         queued,
         running,
         capacity,
-    }))
+        paused,
+    }
 }
 
 async fn list_projects(
@@ -3306,7 +3333,52 @@ mod tests {
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 4096).await.expect("body");
-        assert_eq!(&body[..], br#"{"queued":0,"running":0,"capacity":2}"#);
+        assert_eq!(
+            &body[..],
+            br#"{"queued":0,"running":0,"capacity":2,"paused":false}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_admin_controls_pause_and_resume_state() {
+        let state = AppState::new(Storage::open_in_memory().expect("storage"));
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/queue/pause")
+                    .body(Body::empty())
+                    .expect("pause request"),
+            )
+            .await
+            .expect("pause response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("pause body");
+        assert_eq!(
+            &body[..],
+            br#"{"queued":0,"running":0,"capacity":2,"paused":true}"#
+        );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/queue/resume")
+                    .body(Body::empty())
+                    .expect("resume request"),
+            )
+            .await
+            .expect("resume response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("resume body");
+        assert_eq!(
+            &body[..],
+            br#"{"queued":0,"running":0,"capacity":2,"paused":false}"#
+        );
     }
 
     #[tokio::test]

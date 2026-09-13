@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **86% verified** · `██████████████████░░`<br>
-Weighted evidence score: **86.13 / 100** · displayed conservatively as the
+Weighted evidence score: **86.31 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -14,7 +14,7 @@ behavior backed by current tests or an exercised local workflow; incomplete
 and unverified work remains at zero until it passes its gate.
 
 Last verified update: **2026-09-13** · native pipeline execution, priority-aware
-FIFO queue,
+FIFO queue with pause/resume controls,
 SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
 inspection, persisted build-source identity, live queue telemetry, durable
 event replay, quiet engine offline recovery, explicit Git preparation at build
@@ -114,6 +114,10 @@ Use `--priority -100..100` to move urgent builds ahead of older queued work;
 equal priorities retain FIFO order and per-project/global capacity limits still
 apply. The HTTP build body accepts the same `priority` field. Press Ctrl-C
 during a running step to exercise the cancellation path.
+
+Administrators can stop new admissions without interrupting running builds with
+`POST /api/v1/queue/pause`, inspect the `paused` field from `GET
+/api/v1/queue`, and reopen admissions with `POST /api/v1/queue/resume`.
 
 ## Run headless
 

@@ -81,12 +81,14 @@ pub struct QueueStats {
     pub queued: usize,
     pub running: usize,
     pub capacity: usize,
+    pub paused: bool,
 }
 
 struct SchedulerMetrics {
     queued: AtomicUsize,
     running: AtomicUsize,
     capacity: usize,
+    paused: std::sync::atomic::AtomicBool,
 }
 
 struct RunningBuildGuard {
@@ -143,6 +145,7 @@ impl Scheduler {
             queued: AtomicUsize::new(0),
             running: AtomicUsize::new(0),
             capacity: global_concurrency,
+            paused: std::sync::atomic::AtomicBool::new(false),
         });
         let project_limit = per_project_concurrency.unwrap_or(global_concurrency);
         let project_slots = Arc::new(tokio::sync::Mutex::new(
@@ -176,6 +179,37 @@ impl Scheduler {
                     match receiver.recv().await {
                         Some(request) => pending.push(PendingRequest::new(request)),
                         None => queue_closed = true,
+                    }
+                    continue;
+                }
+
+                if worker_metrics.paused.load(Ordering::Relaxed) {
+                    let mut retained = Vec::with_capacity(pending.len());
+                    while let Some(entry) = pending.pop() {
+                        let request = entry.request;
+                        if request.cancellation.is_cancelled() {
+                            worker_metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                            tokio::spawn(finish_queued_cancellation(request));
+                        } else {
+                            retained.push(PendingRequest::new(request));
+                        }
+                    }
+                    pending.extend(retained);
+                    if pending.is_empty() || !worker_metrics.paused.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    if queue_closed {
+                        worker_wake.notified().await;
+                    } else {
+                        tokio::select! {
+                            request = receiver.recv() => {
+                                match request {
+                                    Some(request) => pending.push(PendingRequest::new(request)),
+                                    None => queue_closed = true,
+                                }
+                            }
+                            _ = worker_wake.notified() => {}
+                        }
                     }
                     continue;
                 }
@@ -294,7 +328,18 @@ impl Scheduler {
             queued: self.metrics.queued.load(Ordering::Relaxed),
             running: self.metrics.running.load(Ordering::Relaxed),
             capacity: self.metrics.capacity,
+            paused: self.metrics.paused.load(Ordering::Relaxed),
         }
+    }
+
+    pub fn pause(&self) {
+        self.metrics.paused.store(true, Ordering::Relaxed);
+        self.wake.notify_one();
+    }
+
+    pub fn resume(&self) {
+        self.metrics.paused.store(false, Ordering::Relaxed);
+        self.wake.notify_one();
     }
 
     pub async fn enqueue(
@@ -594,8 +639,60 @@ args = ["-c", "printf '%s' \"$LABEL\" >> priority.txt; sleep 0.35"]
                 queued: 0,
                 running: 0,
                 capacity: 3,
+                paused: false,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn pause_holds_queued_work_until_resume() {
+        let dir = tempdir().expect("tempdir");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "paused-queue"
+[[stages]]
+name = "run"
+[[stages.steps]]
+name = "write"
+program = "sh"
+args = ["-c", "printf passed > paused.txt"]
+"#,
+        )
+        .expect("pipeline");
+        let scheduler = Scheduler::new(1, Some(1));
+        scheduler.pause();
+        let (tx, rx) = mpsc::channel(64);
+        let handle = scheduler
+            .enqueue(
+                ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), uuid::Uuid::new_v4()),
+                pipeline,
+                dir.path().to_path_buf(),
+                CancellationToken::new(),
+                tx,
+            )
+            .await
+            .expect("enqueue");
+        sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            scheduler.stats(),
+            QueueStats {
+                queued: 1,
+                running: 0,
+                capacity: 1,
+                paused: true,
+            }
+        );
+        scheduler.resume();
+        assert_eq!(
+            handle.wait().await.expect("scheduler").expect("run"),
+            BuildStatus::Passed
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("paused.txt")).expect("output"),
+            "passed"
+        );
+        drop(rx);
     }
 
     #[tokio::test]

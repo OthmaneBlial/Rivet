@@ -116,6 +116,14 @@ export function queueStats(): Promise<QueueStats> {
   return request<QueueStats>("/api/v1/queue");
 }
 
+export function pauseQueue(): Promise<QueueStats> {
+  return request<QueueStats>("/api/v1/queue/pause", { method: "POST" });
+}
+
+export function resumeQueue(): Promise<QueueStats> {
+  return request<QueueStats>("/api/v1/queue/resume", { method: "POST" });
+}
+
 export function agents(): Promise<AgentSummary[]> {
   return request<AgentSummary[]>("/api/v1/agents");
 }

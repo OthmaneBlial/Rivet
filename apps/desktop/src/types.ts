@@ -113,6 +113,7 @@ export interface QueueStats {
   queued: number;
   running: number;
   capacity: number;
+  paused: boolean;
 }
 
 export type AgentStatus = "online" | "stale";
