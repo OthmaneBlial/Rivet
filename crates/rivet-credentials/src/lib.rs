@@ -171,7 +171,7 @@ impl CredentialVault {
         }
         let bytes = fs::read(&path)?;
         let encrypted: EncryptedVault = serde_json::from_slice(&bytes)?;
-        let plaintext = decrypt_vault(&encrypted, passphrase.as_ref())?;
+        let plaintext = Zeroizing::new(decrypt_vault(&encrypted, passphrase.as_ref())?);
         let payload: VaultPayload = serde_json::from_slice(&plaintext)?;
         if payload.version != VAULT_VERSION {
             return Err(CredentialError::InvalidFormat(format!(
@@ -316,7 +316,7 @@ impl CredentialVault {
                 })
                 .collect(),
         };
-        let plaintext = serde_json::to_vec(&payload)?;
+        let plaintext = Zeroizing::new(serde_json::to_vec(&payload)?);
         let encrypted = encrypt_vault(&plaintext, &self.passphrase)?;
         let bytes = serde_json::to_vec_pretty(&encrypted)?;
         write_atomic(&self.path, &bytes)
@@ -365,8 +365,8 @@ fn encrypt_vault(plaintext: &[u8], passphrase: &[u8]) -> Result<EncryptedVault, 
     let mut nonce = [0u8; NONCE_BYTES];
     getrandom::fill(&mut salt).map_err(|error| CredentialError::Randomness(error.to_string()))?;
     getrandom::fill(&mut nonce).map_err(|error| CredentialError::Randomness(error.to_string()))?;
-    let key = derive_key(passphrase, &salt)?;
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| CredentialError::Cryptography)?;
+    let key = Zeroizing::new(derive_key(passphrase, &salt)?);
+    let cipher = Aes256Gcm::new_from_slice(&key[..]).map_err(|_| CredentialError::Cryptography)?;
     let nonce = Nonce::try_from(&nonce[..]).map_err(|_| CredentialError::Cryptography)?;
     let ciphertext = cipher
         .encrypt(
@@ -409,8 +409,8 @@ fn decrypt_vault(
     if ciphertext.is_empty() {
         return Err(CredentialError::InvalidFormat("ciphertext is empty".into()));
     }
-    let key = derive_key(passphrase, &salt)?;
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| CredentialError::Cryptography)?;
+    let key = Zeroizing::new(derive_key(passphrase, &salt)?);
+    let cipher = Aes256Gcm::new_from_slice(&key[..]).map_err(|_| CredentialError::Cryptography)?;
     let nonce = Nonce::try_from(&nonce[..]).map_err(|_| CredentialError::Cryptography)?;
     cipher
         .decrypt(

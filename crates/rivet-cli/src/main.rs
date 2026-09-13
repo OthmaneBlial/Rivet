@@ -11,6 +11,7 @@ use rivet_core::{
     BuildEvent, BuildStatus, CronExpression, ExecutionPlan, LogStream, Pipeline, Project,
     ScheduleId, SourceSnapshot,
 };
+use rivet_credentials::CredentialVault;
 use rivet_migration::{analyze_jenkinsfile_file, generate_rivetfile_draft_file};
 use rivet_runner::execute_pipeline_with_parameters;
 use rivet_runner::{QueueHandle, Scheduler};
@@ -106,6 +107,12 @@ enum Command {
         /// Read the generic webhook HMAC secret from a private file.
         #[arg(long)]
         webhook_secret_file: Option<PathBuf>,
+        /// Open the passphrase-encrypted SCM credential vault.
+        #[arg(long)]
+        credentials_file: Option<PathBuf>,
+        /// Read the credential vault passphrase from a private file.
+        #[arg(long)]
+        credentials_passphrase_file: Option<PathBuf>,
         /// Allow an additional exact browser origin for the API.
         #[arg(long = "allow-origin", value_name = "ORIGIN")]
         allowed_origins: Vec<String>,
@@ -119,6 +126,11 @@ enum Command {
     Schedule {
         #[command(subcommand)]
         command: ScheduleCommand,
+    },
+    /// Manage passphrase-encrypted SCM credentials.
+    Credential {
+        #[command(subcommand)]
+        command: CredentialCommand,
     },
     /// Analyze a Jenkinsfile without executing Groovy or plugin code.
     Analyze {
@@ -155,6 +167,37 @@ enum ScheduleCommand {
     Disable { project: String, id: ScheduleId },
     /// Delete a schedule by UUID.
     Delete { project: String, id: ScheduleId },
+}
+
+#[derive(Debug, Subcommand)]
+enum CredentialCommand {
+    /// Store an HTTP basic credential without placing its secret in argv.
+    Set {
+        id: String,
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        secret_file: PathBuf,
+        #[arg(long)]
+        passphrase_file: PathBuf,
+        #[arg(long)]
+        vault_file: Option<PathBuf>,
+    },
+    /// List credential IDs and usernames without revealing secrets.
+    List {
+        #[arg(long)]
+        passphrase_file: PathBuf,
+        #[arg(long)]
+        vault_file: Option<PathBuf>,
+    },
+    /// Remove one credential from the encrypted vault.
+    Remove {
+        id: String,
+        #[arg(long)]
+        passphrase_file: PathBuf,
+        #[arg(long)]
+        vault_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -273,6 +316,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bind,
             token_file,
             webhook_secret_file,
+            credentials_file,
+            credentials_passphrase_file,
             allowed_origins,
         } => {
             let auth_token = token_file.as_deref().map(read_auth_token).transpose()?;
@@ -280,12 +325,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .as_deref()
                 .map(read_webhook_secret)
                 .transpose()?;
+            let credentials_passphrase = credentials_passphrase_file
+                .as_deref()
+                .map(|path| read_private_value(path, "credential vault passphrase"))
+                .transpose()?;
             rivet_server::serve_with_config(
                 cli.data_dir.join("rivet.db"),
                 rivet_server::ServerConfig {
                     bind,
                     auth_token,
                     webhook_secret,
+                    credentials_file,
+                    credentials_passphrase,
                     allowed_origins,
                 },
             )
@@ -293,6 +344,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Scm { command } => inspect_scm(command).await?,
         Command::Schedule { command } => manage_schedule(&cli.data_dir, command)?,
+        Command::Credential { command } => manage_credentials(&cli.data_dir, command)?,
         Command::Analyze { command } => analyze_file(command)?,
         Command::Agent(args) => run_agent(args).await?,
     }
@@ -1177,6 +1229,7 @@ async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Erro
                 revision,
                 clean,
                 clean_ignored,
+                credential_id: None,
             }),
         ),
     };
@@ -1306,8 +1359,63 @@ fn read_webhook_secret(path: &Path) -> Result<String, Box<dyn std::error::Error>
     read_private_value(path, "webhook secret")
 }
 
+fn manage_credentials(
+    data_dir: &Path,
+    command: CredentialCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        CredentialCommand::Set {
+            id,
+            username,
+            secret_file,
+            passphrase_file,
+            vault_file,
+        } => {
+            let vault_path = vault_file.unwrap_or_else(|| data_dir.join("credentials.vault"));
+            let passphrase = read_private_value(&passphrase_file, "credential vault passphrase")?;
+            let secret = read_private_value(&secret_file, "credential secret")?;
+            let mut vault = CredentialVault::open_or_create(&vault_path, passphrase)?;
+            vault.set_http_basic(id.clone(), username, secret)?;
+            println!("Stored credential {id} in {}", vault.path().display());
+        }
+        CredentialCommand::List {
+            passphrase_file,
+            vault_file,
+        } => {
+            let vault_path = vault_file.unwrap_or_else(|| data_dir.join("credentials.vault"));
+            let passphrase = read_private_value(&passphrase_file, "credential vault passphrase")?;
+            let vault = CredentialVault::open(&vault_path, passphrase)?;
+            for credential in vault.list() {
+                println!("{}\t{}", credential.id, credential.username);
+            }
+        }
+        CredentialCommand::Remove {
+            id,
+            passphrase_file,
+            vault_file,
+        } => {
+            let vault_path = vault_file.unwrap_or_else(|| data_dir.join("credentials.vault"));
+            let passphrase = read_private_value(&passphrase_file, "credential vault passphrase")?;
+            let mut vault = CredentialVault::open(&vault_path, passphrase)?;
+            vault.remove(&id)?;
+            println!("Removed credential {id}");
+        }
+    }
+    Ok(())
+}
+
 fn read_private_value(path: &Path, label: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let metadata = fs::metadata(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{label} file must not be a symbolic link: {}",
+            path.display()
+        )
+        .into());
+    }
+    if !metadata.is_file() {
+        return Err(format!("{label} path must be a regular file: {}", path.display()).into());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1382,6 +1490,7 @@ async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::
             revision: args.revision,
             clean: args.clean,
             clean_ignored: args.clean_ignored,
+            credential_id: None,
         })
     } else {
         None

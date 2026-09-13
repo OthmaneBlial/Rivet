@@ -11,6 +11,7 @@ rivet-core = { path = "../rivet-core" }
 serde.workspace = true
 thiserror.workspace = true
 tokio = { version = "1.47", features = ["io-util", "process"] }
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

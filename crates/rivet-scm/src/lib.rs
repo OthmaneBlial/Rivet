@@ -12,6 +12,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::process::Command;
+use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitSnapshot {
@@ -84,6 +85,12 @@ impl fmt::Debug for GitHttpCredential {
             .debug_struct("GitHttpCredential")
             .field("username", &self.username)
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for GitHttpCredential {
+    fn drop(&mut self) {
+        self.secret.zeroize();
     }
 }
 
