@@ -37,8 +37,9 @@ API and rendered in the desktop control room. The server also exposes
 administrator-only subprocess extension lifecycle status and start/stop
 controls, reflected in the desktop view. A capability-free WASM runtime now
 supports an explicit JSON ABI with no host imports, bounded linear memory,
-bounded output, and fuel metering; richer extension capability wiring remains
-gated. The
+bounded output, and fuel metering. Four bounded, read-only build, detail, log,
+and artifact host methods are available under explicit extension permissions.
+The
 server also exposes a
 versioned agent handshake/heartbeat registry with online/stale state, capacity-aware
 matching, a reconnecting heartbeat CLI client, and a rendered fleet view. Pipeline

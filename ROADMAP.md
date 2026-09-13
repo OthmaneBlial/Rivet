@@ -38,7 +38,7 @@ states. “Planned” is zero progress, “partial” receives only the portion 
 by evidence, and “verified” receives the full workstream weight. A local build,
 scaffold, passing unrelated test, or interface alone does not complete a gate.
 
-The next gates are richer extension capability wiring, the final Tauri-window
+The next gates are trigger and annotation extension capabilities, the final Tauri-window
 flow inside the packaged app, API
 deployment hardening, durable cross-restart exactly-once delivery and retry
 recovery, broader provider lifecycle and deployment-specific keychain policy coverage, user
