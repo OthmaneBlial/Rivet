@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "scope": "Rivet complete product roadmap",
-  "verified_percent": 67,
-  "verified_points": 67,
+  "verified_percent": 68,
+  "verified_points": 68,
   "total_points": 100,
   "last_verified": "2026-09-13",
   "policy": "Only tested or exercised behavior counts; partial work receives only its evidenced portion.",
@@ -24,7 +24,7 @@
     {"id": "secrets", "weight": 6, "completion": 0.35, "status": "partial"},
     {"id": "auth", "weight": 4, "completion": 0.5, "status": "partial"},
     {"id": "extensions", "weight": 4, "completion": 0.0, "status": "planned"},
-    {"id": "migration", "weight": 3, "completion": 0.7, "status": "partial"},
+    {"id": "migration", "weight": 3, "completion": 0.9, "status": "partial"},
     {"id": "differential", "weight": 2, "completion": 0.0, "status": "planned"},
     {"id": "release", "weight": 2, "completion": 0.0, "status": "planned"}
   ]

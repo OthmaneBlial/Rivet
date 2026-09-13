@@ -5,7 +5,7 @@ from Jenkins.
 
 ## Delivery progress
 
-**67% verified** · `█████████████▋░░░░░░`<br>
+**68% verified** · `█████████████▊░░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -23,8 +23,9 @@ controls, signed generic webhook delivery with idempotent redelivery,
 secret-parameter redaction/masking, and a packaged desktop launch with an
 ephemeral loopback engine origin, project-scoped local CI cache restore and
 save, explicit Docker container command assembly with bounded workspace mounts,
-and a bounded Jenkinsfile migration analyzer with line-level support findings.
-The server also exposes a versioned agent handshake/heartbeat registry
+and a bounded Jenkinsfile migration analyzer with line-level support findings
+plus safe drafts for deterministic shell steps. The server also exposes a
+versioned agent handshake/heartbeat registry
 with online and stale state, while remote build assignment remains
 intentionally unimplemented until its transport and failure semantics are
 complete.
@@ -231,16 +232,19 @@ the validated working directory, separated arguments, and automatic container
 cleanup. Docker runtime execution, image policy, and end-to-end artifact and
 cancellation behavior remain unverified on machines without Docker.
 
-Inspect a Jenkinsfile locally before attempting a migration:
+Inspect a Jenkinsfile locally before attempting a migration, or request a
+safe draft for simple quoted commands:
 
 ```sh
-cargo run -p rivet -- analyze jenkinsfile ./Jenkinsfile
+cargo run -p rivet -- analyze jenkinsfile --draft ./Jenkinsfile
 ```
 
 The analyzer emits versioned JSON with supported, partial, and unsupported
-constructs, source line numbers, and Rivet mapping guidance. It never executes
-Groovy or plugin code; full conversion and complex plugin semantics still need
-manual review.
+constructs, source line numbers, and Rivet mapping guidance. The optional
+draft emits a valid Rivetfile for simple, explicitly quoted `sh`/`bat` steps
+and leaves ambiguous commands, credentials, plugins, and lifecycle behavior in
+warnings. It never executes Groovy or plugin code; complex migration semantics
+still need manual review.
 
 Shell parsing is not implicit. A later pipeline feature may add an explicit
 shell step with a documented threat boundary; direct process execution is the

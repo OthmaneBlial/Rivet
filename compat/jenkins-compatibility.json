@@ -82,7 +82,7 @@
       "feature": "Jenkinsfile parsing",
       "status": "partial",
       "evidence": ["crates/rivet-migration/src/lib.rs", "crates/rivet-cli/src/main.rs"],
-      "notes": "A versioned, non-executing analyzer reports line-level supported, partial, and unsupported findings for common declarative constructs; full Groovy/plugin interpretation and generated Rivetfile conversion remain planned."
+      "notes": "A versioned, non-executing analyzer reports line-level supported, partial, and unsupported findings and can generate a valid draft for simple quoted sh/bat steps; full Groovy/plugin interpretation and broad generated Rivetfile conversion remain planned."
     },
     {
       "category": "SCM",

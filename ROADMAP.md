@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **67 / 100 points**.
+The current verified total is **68 / 100 points**.
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
@@ -26,7 +26,7 @@ The current verified total is **67 / 100 points**.
 | Secrets and credentials | 6 | partial | secret parameters require explicit runtime values, persisted values/API responses are redacted, logs are masked, and retries require fresh secret input; encryption/access control and a credential store remain |
 | Authentication and authorization | 4 | partial | protected remote transport with private Bearer tokens passes; users, sessions, roles, and project permissions remain |
 | Extension protocol | 4 | planned | versioned WASM/subprocess/protocol boundary and frontend extension model |
-| Jenkins migration analyzer | 3 | partial | bounded Jenkinsfile analysis with line-level supported/partial/unsupported findings passes; full Groovy parsing, plugin semantics, and generated Rivetfile conversion remain |
+| Jenkins migration analyzer | 3 | partial | bounded Jenkinsfile analysis and valid drafts for deterministic quoted shell steps pass; full Groovy parsing, plugin semantics, and broad generated Rivetfile conversion remain |
 | Differential compatibility harness | 2 | planned | normalized behavioral fixtures and permanent regressions |
 | Release and operations | 2 | planned | packaging, observability, upgrades, recovery, security and load gates |
 
@@ -40,6 +40,7 @@ scaffold, passing unrelated test, or interface alone does not complete a gate.
 The next gates are the final Tauri-window flow inside the packaged app, API
 deployment hardening, remote assignment/failure handling, the SCM
 credential/provider boundary, provider webhook adapters/repository-event
-mapping, an encrypted credential store, and generated Rivetfile conversion
-with fixture-backed migration regressions. Test clean checkout behavior
+mapping, an encrypted credential store, full Groovy/plugin migration semantics,
+and generated Rivetfile conversion with fixture-backed migration regressions.
+Test clean checkout behavior
 without exposing credentials to logs or persisted state.
