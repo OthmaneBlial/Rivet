@@ -7,6 +7,6 @@ mod pipeline;
 mod process;
 mod scheduler;
 
-pub use pipeline::{RunnerError, execute_pipeline};
+pub use pipeline::{RunnerError, execute_pipeline, execute_pipeline_with_parameters};
 pub use process::{LogLine, ProcessError, ProcessOutcome, ProcessResult, ProcessSpec, run_process};
 pub use scheduler::{QueueHandle, QueueStats, Scheduler, SchedulerError};

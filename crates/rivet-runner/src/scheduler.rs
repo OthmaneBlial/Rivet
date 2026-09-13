@@ -1,6 +1,7 @@
-use crate::{RunnerError, execute_pipeline};
+use crate::{RunnerError, execute_pipeline_with_parameters};
 use chrono::Utc;
 use rivet_core::{BuildEvent, BuildId, BuildStatus, ExecutionPlan, Pipeline};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,6 +14,7 @@ struct QueueRequest {
     plan: ExecutionPlan,
     pipeline: Pipeline,
     repository_root: PathBuf,
+    parameters: BTreeMap<String, String>,
     cancellation: CancellationToken,
     events: mpsc::Sender<BuildEvent>,
     completion: oneshot::Sender<Result<BuildStatus, RunnerError>>,
@@ -115,10 +117,11 @@ impl Scheduler {
                     };
                     metrics.queued.fetch_sub(1, Ordering::Relaxed);
                     metrics.running.fetch_add(1, Ordering::Relaxed);
-                    let result = execute_pipeline(
+                    let result = execute_pipeline_with_parameters(
                         &request.plan,
                         &request.pipeline,
                         request.repository_root,
+                        &request.parameters,
                         request.cancellation,
                         request.events,
                     )
@@ -153,6 +156,26 @@ impl Scheduler {
         cancellation: CancellationToken,
         events: mpsc::Sender<BuildEvent>,
     ) -> Result<QueueHandle, SchedulerError> {
+        self.enqueue_with_parameters(
+            plan,
+            pipeline,
+            repository_root,
+            BTreeMap::new(),
+            cancellation,
+            events,
+        )
+        .await
+    }
+
+    pub async fn enqueue_with_parameters(
+        &self,
+        plan: ExecutionPlan,
+        pipeline: Pipeline,
+        repository_root: PathBuf,
+        parameters: BTreeMap<String, String>,
+        cancellation: CancellationToken,
+        events: mpsc::Sender<BuildEvent>,
+    ) -> Result<QueueHandle, SchedulerError> {
         events
             .send(BuildEvent::BuildQueued {
                 build_id: plan.build_id,
@@ -169,6 +192,7 @@ impl Scheduler {
                 plan: plan.clone(),
                 pipeline,
                 repository_root,
+                parameters,
                 cancellation: cancellation.clone(),
                 events,
                 completion,

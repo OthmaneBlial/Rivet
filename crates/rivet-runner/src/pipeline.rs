@@ -4,6 +4,7 @@ use rivet_core::{
     BuildEvent, BuildStatus, ExecutionPlan, ExecutionStage, ExecutionStep, Pipeline, StageStatus,
     StepStatus,
 };
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -34,7 +35,27 @@ pub async fn execute_pipeline(
     cancellation: CancellationToken,
     events: mpsc::Sender<BuildEvent>,
 ) -> Result<BuildStatus, RunnerError> {
+    execute_pipeline_with_parameters(
+        plan,
+        pipeline,
+        repository_root,
+        &BTreeMap::new(),
+        cancellation,
+        events,
+    )
+    .await
+}
+
+pub async fn execute_pipeline_with_parameters(
+    plan: &ExecutionPlan,
+    pipeline: &Pipeline,
+    repository_root: impl AsRef<Path>,
+    parameters: &BTreeMap<String, String>,
+    cancellation: CancellationToken,
+    events: mpsc::Sender<BuildEvent>,
+) -> Result<BuildStatus, RunnerError> {
     pipeline.validate()?;
+    let parameters = pipeline.resolve_parameters(parameters)?;
     let workspace = pipeline.resolve_workspace(repository_root)?;
     send(
         &events,
@@ -65,7 +86,16 @@ pub async fn execute_pipeline(
                 send_stage_finished(plan, stage, StageStatus::Cancelled, &events).await?;
                 return finish_cancelled(plan, &events).await;
             }
-            let result = execute_step(plan, stage, step, &workspace, &cancellation, &events).await;
+            let result = execute_step(
+                plan,
+                stage,
+                step,
+                &workspace,
+                &parameters,
+                &cancellation,
+                &events,
+            )
+            .await;
             match result {
                 Ok(StepStatus::Passed) => {}
                 Ok(StepStatus::Cancelled) => {
@@ -97,6 +127,7 @@ async fn execute_step(
     stage: &ExecutionStage,
     step: &ExecutionStep,
     workspace: &Path,
+    parameters: &BTreeMap<String, String>,
     cancellation: &CancellationToken,
     events: &mpsc::Sender<BuildEvent>,
 ) -> Result<StepStatus, RunnerError> {
@@ -113,7 +144,8 @@ async fn execute_step(
     )
     .await?;
 
-    let mut env = step.definition.env.clone();
+    let mut env = parameters.clone();
+    env.extend(step.definition.env.clone());
     env.insert("CI".into(), "true".into());
     env.insert("RIVET_BUILD_ID".into(), plan.build_id.to_string());
     env.insert("RIVET_PROJECT_ID".into(), plan.project_id.to_string());
@@ -287,6 +319,7 @@ async fn finish_build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::fs;
     use tempfile::tempdir;
 
@@ -341,5 +374,44 @@ args = ["-c", "printf second; test \"$(cat order.txt)\" = first"]
             })
             .collect();
         assert_eq!(stage_starts, ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn exposes_resolved_build_parameters_to_direct_processes() {
+        let dir = tempdir().expect("tempdir");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "parameters"
+
+[[parameters]]
+name = "TARGET"
+default = "debug"
+
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "parameter-check"
+program = "sh"
+args = ["-c", "test \"$TARGET\" = release && test \"$CI\" = true"]
+"#,
+        )
+        .expect("pipeline");
+        let plan =
+            ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let (tx, mut rx) = mpsc::channel(64);
+        let status = execute_pipeline_with_parameters(
+            &plan,
+            &pipeline,
+            dir.path(),
+            &BTreeMap::from([(String::from("TARGET"), String::from("release"))]),
+            CancellationToken::new(),
+            tx,
+        )
+        .await
+        .expect("runner");
+
+        assert_eq!(status, BuildStatus::Passed);
+        while rx.recv().await.is_some() {}
     }
 }
