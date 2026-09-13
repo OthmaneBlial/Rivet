@@ -1397,14 +1397,14 @@ function AgentsPanel({ agents, online }: { agents: AgentSummary[]; online: boole
           <h1>Machines with a pulse.</h1>
           <p>See which workers are reachable, what they can run, and how much executor capacity is free.</p>
         </div>
-        <div className="agents-protocol"><span className="overline">Protocol</span><strong>rivet-agent / v2</strong><small>{online ? "registry connected" : "engine unavailable"}</small></div>
+        <div className="agents-protocol"><span className="overline">Protocol</span><strong>rivet-agent / v4</strong><small>{online ? "registry connected" : "engine unavailable"}</small></div>
       </section>
 
       <section className="metric-grid agents-metrics" aria-label="Agent metrics">
         <MetricCard label="Registered" value={String(agents.length).padStart(2, "0")} detail={`${onlineAgents.length} online / ${staleAgents.length} stale`} accent="cyan" />
         <MetricCard label="Free capacity" value={`${available}/${capacity}`} detail="available executors" accent="amber" />
         <MetricCard label="Running work" value={String(running).padStart(2, "0")} detail="agent-reported builds" accent="neutral" />
-        <MetricCard label="Assignment" value="GATED" detail="transport semantics in progress" accent="neutral" />
+        <MetricCard label="Assignment" value="READY" detail="durable event replay verified" accent="neutral" />
       </section>
 
       <section className="panel agents-panel" aria-label="Connected agents">
@@ -1432,7 +1432,7 @@ function AgentsPanel({ agents, online }: { agents: AgentSummary[]; online: boole
           </div>
         )}
       </section>
-      <p className="agent-boundary"><span />Capacity discovery, assignment, remote execution, artifact transfer, and one bounded replacement attempt are verified locally. Durable cross-session recovery remains separately gated.</p>
+      <p className="agent-boundary"><span />Capacity discovery, assignment, remote execution, artifact transfer, one bounded replacement attempt, and durable event replay are verified locally.</p>
     </div>
   );
 }
