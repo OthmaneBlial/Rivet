@@ -19,7 +19,7 @@ use rivet_scm::{GitPrepareOptions, GitRepository, GitSnapshot, ScmError};
 use rivet_storage::{BuildDetails, BuildRecord, LogRecord, Storage, StorageError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -402,25 +402,40 @@ async fn build_events(
     let project = project_by_name(&state.storage, &name)?;
     let build = build_by_number(&state.storage, project.id, &name, number)?;
     let receiver = state.events.subscribe();
-    Ok(websocket.on_upgrade(move |socket| stream_build_events(socket, receiver, build.id)))
+    let replay = state.storage.events(build.id)?;
+    Ok(websocket.on_upgrade(move |socket| stream_build_events(socket, receiver, build.id, replay)))
 }
 
 async fn stream_build_events(
     mut socket: WebSocket,
     mut receiver: broadcast::Receiver<BuildEvent>,
     build_id: BuildId,
+    replay: Vec<BuildEvent>,
 ) {
+    let mut replayed = HashSet::new();
+    for event in replay {
+        let Some(payload) = serialize_event(&event) else {
+            return;
+        };
+        replayed.insert(payload.clone());
+        if socket.send(Message::Text(payload.into())).await.is_err() {
+            return;
+        }
+        if matches!(event, BuildEvent::BuildFinished { .. }) {
+            return;
+        }
+    }
+
     while let Ok(event) = receiver.recv().await {
         if event_build_id(&event) != build_id {
             continue;
         }
-        let payload = match serde_json::to_string(&event) {
-            Ok(payload) => payload,
-            Err(error) => {
-                tracing::error!(?error, "could not serialize Rivet event");
-                break;
-            }
+        let Some(payload) = serialize_event(&event) else {
+            break;
         };
+        if replayed.remove(&payload) {
+            continue;
+        }
         if socket.send(Message::Text(payload.into())).await.is_err() {
             break;
         }
@@ -428,6 +443,14 @@ async fn stream_build_events(
             break;
         }
     }
+}
+
+fn serialize_event(event: &BuildEvent) -> Option<String> {
+    serde_json::to_string(event)
+        .map_err(|error| {
+            tracing::error!(?error, "could not serialize Rivet event");
+        })
+        .ok()
 }
 
 fn event_build_id(event: &BuildEvent) -> BuildId {

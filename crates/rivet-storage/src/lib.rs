@@ -150,6 +150,11 @@ impl Storage {
             2,
             Some(include_str!("../migrations/002_build_source.sql")),
         )?;
+        apply_migration(
+            &connection,
+            3,
+            Some(include_str!("../migrations/003_event_log.sql")),
+        )?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -302,6 +307,15 @@ impl Storage {
     pub fn apply_event(&self, event: &BuildEvent) -> Result<(), StorageError> {
         let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO build_events(build_id, timestamp, event_json)
+             VALUES (?1, ?2, ?3)",
+            params![
+                event_build_id(event).to_string(),
+                event.timestamp().to_rfc3339(),
+                serde_json::to_string(event)?,
+            ],
+        )?;
         match event {
             BuildEvent::BuildQueued {
                 build_id,
@@ -490,6 +504,21 @@ impl Storage {
         rows.map(|row| row.map_err(StorageError::from).and_then(parse_log))
             .collect()
     }
+
+    pub fn events(&self, build_id: BuildId) -> Result<Vec<BuildEvent>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT event_json FROM build_events
+             WHERE build_id = ?1 ORDER BY sequence ASC",
+        )?;
+        let rows =
+            statement.query_map(params![build_id.to_string()], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            let event_json = row?;
+            Ok(serde_json::from_str(&event_json)?)
+        })
+        .collect()
+    }
 }
 
 type RawProject = (String, String, String, String, String);
@@ -535,6 +564,20 @@ fn parse_project(raw: RawProject) -> Result<Project, StorageError> {
         pipeline_path: raw.3,
         created_at: parse_timestamp(&raw.4)?,
     })
+}
+
+fn event_build_id(event: &BuildEvent) -> BuildId {
+    match event {
+        BuildEvent::BuildQueued { build_id, .. }
+        | BuildEvent::BuildStarted { build_id, .. }
+        | BuildEvent::BuildFinished { build_id, .. }
+        | BuildEvent::BuildCancelled { build_id, .. }
+        | BuildEvent::StageStarted { build_id, .. }
+        | BuildEvent::StageFinished { build_id, .. }
+        | BuildEvent::StepStarted { build_id, .. }
+        | BuildEvent::StepOutput { build_id, .. }
+        | BuildEvent::StepFinished { build_id, .. } => *build_id,
+    }
 }
 
 fn raw_build(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawBuild> {
@@ -843,5 +886,9 @@ program = "true"
         assert_eq!(details.build.source, Some(source));
         assert_eq!(details.stages[0].steps[0].status, StepStatus::Passed);
         assert_eq!(reopened.logs(build.id).expect("logs")[0].line, "hello");
+        let events = reopened.events(build.id).expect("events");
+        assert_eq!(events.len(), 8);
+        assert!(matches!(events[0], BuildEvent::BuildQueued { .. }));
+        assert!(matches!(events[7], BuildEvent::BuildFinished { .. }));
     }
 }
