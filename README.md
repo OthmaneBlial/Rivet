@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.35 / 100** · displayed conservatively as the
+Weighted evidence score: **92.36 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -57,8 +57,9 @@ builds are reconciled idempotently so a crashed server cannot leave history
 stuck forever. Non-secret remote attempts additionally retain their plan and
 redacted parameters and are redispatched with the same build identity when a
 compatible agent returns; attempts that require secret values fail closed.
-Transport-level exactly-once delivery and cross-restart retry recovery remain
-future gates. Authenticated deployments persist bounded success/failure audit records
+Bounded session-scoped agent delivery now uses versioned delivery IDs, ACKs,
+duplicate suppression, and timed retransmission; durable cross-restart
+exactly-once delivery and retry recovery remain future gates. Authenticated deployments persist bounded success/failure audit records
 without request bodies or Bearer values and expose them only to administrators.
 Server deployments can exchange an authenticated API token for a twelve-hour
 opaque session token; only its SHA-256 digest and scoped principal snapshot are
@@ -469,8 +470,9 @@ the same bounded transfer with checksum verification before local storage.
 After an agent disconnect, the server makes one bounded replacement attempt and
 persists a terminal failed state when no replacement is available. Non-secret
 remote attempts can also be preserved and redispatched with the same build
-identity after a server restart; transport-level exactly-once guarantees and
-cross-restart retry recovery remain future gates.
+identity after a server restart; session-scoped delivery IDs, ACKs, duplicate
+suppression, and timed retransmission are covered locally, while durable
+cross-restart exactly-once guarantees and retry recovery remain future gates.
 
 Connect a worker for heartbeat and capability discovery:
 

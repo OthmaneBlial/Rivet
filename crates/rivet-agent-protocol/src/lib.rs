@@ -16,7 +16,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const PROTOCOL_NAME: &str = "rivet-agent";
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub type AgentId = Uuid;
 
 const MAX_AGENT_NAME_BYTES: usize = 128;
@@ -278,6 +278,69 @@ pub enum AgentMessage {
     },
 }
 
+/// Reliable application-message envelope used on an agent WebSocket.
+///
+/// Application messages are acknowledged only after the receiver accepts the
+/// message for processing. Receivers can therefore safely ignore a duplicate
+/// `Message` with the same delivery ID while still acknowledging it. The
+/// payload remains a separate versioned vocabulary so transport reliability
+/// does not leak into build-domain events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentTransportMessage {
+    Message {
+        protocol_version: u16,
+        delivery_id: Uuid,
+        payload: AgentMessage,
+    },
+    Ack {
+        protocol_version: u16,
+        delivery_id: Uuid,
+    },
+}
+
+impl AgentTransportMessage {
+    pub fn message(payload: AgentMessage) -> Self {
+        Self::Message {
+            protocol_version: PROTOCOL_VERSION,
+            delivery_id: Uuid::new_v4(),
+            payload,
+        }
+    }
+
+    pub fn ack(delivery_id: Uuid) -> Self {
+        Self::Ack {
+            protocol_version: PROTOCOL_VERSION,
+            delivery_id,
+        }
+    }
+
+    pub fn delivery_id(&self) -> Uuid {
+        match self {
+            Self::Message { delivery_id, .. } | Self::Ack { delivery_id, .. } => *delivery_id,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        let protocol_version = match self {
+            Self::Message {
+                protocol_version, ..
+            }
+            | Self::Ack {
+                protocol_version, ..
+            } => *protocol_version,
+        };
+        validate_version(protocol_version)?;
+        if self.delivery_id().is_nil() {
+            return Err(ProtocolError::EmptyDeliveryId);
+        }
+        if let Self::Message { payload, .. } = self {
+            payload.validate()?;
+        }
+        Ok(())
+    }
+}
+
 impl AgentMessage {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         match self {
@@ -418,6 +481,8 @@ pub enum ProtocolError {
     InvalidWorkspaceChecksum,
     #[error("workspace transfer chunk exceeds the protocol size limit")]
     WorkspaceChunkTooLarge,
+    #[error("agent transport delivery ID cannot be nil")]
+    EmptyDeliveryId,
 }
 
 fn validate_version(version: u16) -> Result<(), ProtocolError> {
@@ -626,5 +691,59 @@ program = "true"
             heartbeat.validate(),
             Err(ProtocolError::TooManyRunningBuilds)
         );
+    }
+
+    #[test]
+    fn transport_envelope_round_trips_messages_and_acknowledgements() {
+        let payload = AgentMessage::Heartbeat(AgentHeartbeat {
+            protocol_version: PROTOCOL_VERSION,
+            agent_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            sequence: 7,
+            running: vec![],
+            sent_at: Utc::now(),
+        });
+        let envelope = AgentTransportMessage::message(payload);
+        envelope.validate().expect("valid transport message");
+        let delivery_id = envelope.delivery_id();
+        let encoded = serde_json::to_string(&envelope).expect("encode message");
+        let decoded: AgentTransportMessage =
+            serde_json::from_str(&encoded).expect("decode message");
+        assert_eq!(decoded, envelope);
+        assert_eq!(decoded.delivery_id(), delivery_id);
+
+        let ack = AgentTransportMessage::ack(delivery_id);
+        ack.validate().expect("valid acknowledgement");
+        let encoded = serde_json::to_string(&ack).expect("encode acknowledgement");
+        let decoded: AgentTransportMessage =
+            serde_json::from_str(&encoded).expect("decode acknowledgement");
+        assert_eq!(decoded, ack);
+        assert!(matches!(decoded, AgentTransportMessage::Ack { .. }));
+    }
+
+    #[test]
+    fn transport_envelope_rejects_nil_delivery_ids_and_invalid_payloads() {
+        let ack = AgentTransportMessage::Ack {
+            protocol_version: PROTOCOL_VERSION,
+            delivery_id: Uuid::nil(),
+        };
+        assert_eq!(ack.validate(), Err(ProtocolError::EmptyDeliveryId));
+
+        let invalid = AgentTransportMessage::Message {
+            protocol_version: PROTOCOL_VERSION,
+            delivery_id: Uuid::new_v4(),
+            payload: AgentMessage::Heartbeat(AgentHeartbeat {
+                protocol_version: PROTOCOL_VERSION - 1,
+                agent_id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
+                sequence: 0,
+                running: vec![],
+                sent_at: Utc::now(),
+            }),
+        };
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProtocolError::UnsupportedVersion { .. })
+        ));
     }
 }

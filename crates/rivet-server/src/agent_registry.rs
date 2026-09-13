@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use rivet_agent_protocol::{
     AgentCapabilities, AgentHeartbeat, AgentId, AgentMessage, AgentRegistration, AgentRequirements,
-    ProtocolError,
+    AgentTransportMessage, ProtocolError,
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -93,7 +93,7 @@ struct AgentEntry {
     running: Vec<rivet_core::BuildId>,
     reserved: HashMap<rivet_core::BuildId, u16>,
     session_id: Uuid,
-    outbound: Option<mpsc::Sender<AgentMessage>>,
+    outbound: Option<mpsc::Sender<AgentTransportMessage>>,
 }
 
 impl Default for AgentRegistry {
@@ -126,7 +126,7 @@ impl AgentRegistry {
         &self,
         registration: AgentRegistration,
         now: DateTime<Utc>,
-        outbound: mpsc::Sender<AgentMessage>,
+        outbound: mpsc::Sender<AgentTransportMessage>,
     ) -> Result<AgentLease, AgentRegistryError> {
         self.register_inner(registration, now, Some(outbound)).await
     }
@@ -135,7 +135,7 @@ impl AgentRegistry {
         &self,
         registration: AgentRegistration,
         now: DateTime<Utc>,
-        outbound: Option<mpsc::Sender<AgentMessage>>,
+        outbound: Option<mpsc::Sender<AgentTransportMessage>>,
     ) -> Result<AgentLease, AgentRegistryError> {
         registration.validate()?;
         let session_id = Uuid::new_v4();
@@ -340,7 +340,7 @@ impl AgentRegistry {
                 .ok_or(AgentRegistryError::AgentNotConnected(reservation.agent_id))?
         };
         sender
-            .send(message)
+            .send(AgentTransportMessage::message(message))
             .await
             .map_err(|_| AgentRegistryError::AgentChannelClosed(reservation.agent_id))
     }
@@ -658,7 +658,10 @@ mod tests {
             .expect("send assignment");
         assert!(matches!(
             received.recv().await,
-            Some(AgentMessage::AssignmentAccepted { build_id, .. }) if build_id == first_build
+            Some(AgentTransportMessage::Message {
+                payload: AgentMessage::AssignmentAccepted { build_id, .. },
+                ..
+            }) if build_id == first_build
         ));
         assert!(registry.release(&first).await);
         let second = registry

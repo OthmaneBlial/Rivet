@@ -16,7 +16,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use rivet_agent_protocol::{
-    AgentMessage, AgentRequirements, MAX_WORKSPACE_CHUNK_BYTES, PROTOCOL_VERSION, WorkspaceTransfer,
+    AgentMessage, AgentRequirements, AgentTransportMessage, MAX_WORKSPACE_CHUNK_BYTES,
+    PROTOCOL_VERSION, WorkspaceTransfer,
 };
 use rivet_auth::{
     AuthError, AuthPolicy, Permission, Principal, Role, generate_token, token_digest,
@@ -48,6 +49,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
@@ -100,6 +102,100 @@ struct RemoteBuildRoute {
     agent_id: rivet_agent_protocol::AgentId,
     session_id: Uuid,
     messages: mpsc::Sender<AgentMessage>,
+}
+
+const MAX_AGENT_PENDING_DELIVERIES: usize = 8192;
+const MAX_AGENT_RECEIVED_DELIVERIES: usize = 8192;
+const AGENT_RETRANSMIT_AFTER: Duration = Duration::from_secs(2);
+const MAX_AGENT_RETRANSMITS: u8 = 5;
+
+struct PendingAgentDelivery {
+    envelope: AgentTransportMessage,
+    last_sent: Instant,
+    retransmits: u8,
+}
+
+#[derive(Default)]
+struct AgentWireState {
+    pending: HashMap<Uuid, PendingAgentDelivery>,
+    received: HashSet<Uuid>,
+}
+
+impl AgentWireState {
+    fn accept_incoming(&mut self, delivery_id: Uuid) -> Result<bool, ()> {
+        if self.received.contains(&delivery_id) {
+            return Ok(false);
+        }
+        if self.received.len() >= MAX_AGENT_RECEIVED_DELIVERIES {
+            return Err(());
+        }
+        self.received.insert(delivery_id);
+        Ok(true)
+    }
+
+    fn acknowledge(&mut self, delivery_id: Uuid) {
+        self.pending.remove(&delivery_id);
+    }
+
+    async fn send_message(&mut self, socket: &mut WebSocket, payload: AgentMessage) -> bool {
+        self.send_pending(socket, AgentTransportMessage::message(payload))
+            .await
+    }
+
+    async fn send_pending(
+        &mut self,
+        socket: &mut WebSocket,
+        envelope: AgentTransportMessage,
+    ) -> bool {
+        if self.pending.len() >= MAX_AGENT_PENDING_DELIVERIES {
+            return false;
+        }
+        let delivery_id = envelope.delivery_id();
+        if send_agent_transport(socket, &envelope).await.is_err() {
+            return false;
+        }
+        self.pending.insert(
+            delivery_id,
+            PendingAgentDelivery {
+                envelope,
+                last_sent: Instant::now(),
+                retransmits: 0,
+            },
+        );
+        true
+    }
+
+    async fn send_ack(&self, socket: &mut WebSocket, delivery_id: Uuid) -> bool {
+        send_agent_transport(socket, &AgentTransportMessage::ack(delivery_id))
+            .await
+            .is_ok()
+    }
+
+    async fn retransmit_due(&mut self, socket: &mut WebSocket) -> bool {
+        let due = self
+            .pending
+            .iter()
+            .filter(|(_, delivery)| delivery.last_sent.elapsed() >= AGENT_RETRANSMIT_AFTER)
+            .map(|(delivery_id, _)| *delivery_id)
+            .collect::<Vec<_>>();
+        for delivery_id in due {
+            let Some(delivery) = self.pending.get_mut(&delivery_id) else {
+                continue;
+            };
+            if delivery.retransmits >= MAX_AGENT_RETRANSMITS {
+                return false;
+            }
+            if send_agent_transport(socket, &delivery.envelope)
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            delivery.last_sent = Instant::now();
+            delivery.retransmits += 1;
+        }
+        true
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1603,8 +1699,16 @@ async fn handle_agent_socket(mut socket: WebSocket, state: AppState) {
             return;
         }
     };
-    let registration = match decode_agent_message(first_message) {
-        Ok(AgentMessage::Register(registration)) => registration,
+    let registration_delivery_id;
+    let registration = match decode_agent_transport_message(first_message) {
+        Ok(AgentTransportMessage::Message {
+            delivery_id,
+            payload: AgentMessage::Register(registration),
+            ..
+        }) => {
+            registration_delivery_id = delivery_id;
+            registration
+        }
         Ok(_) => {
             let _ = send_agent_error(
                 &mut socket,
@@ -1632,12 +1736,21 @@ async fn handle_agent_socket(mut socket: WebSocket, state: AppState) {
             return;
         }
     };
+    let mut wire = AgentWireState::default();
+    wire.received.insert(registration_delivery_id);
     let registered = AgentMessage::Registered {
         protocol_version: PROTOCOL_VERSION,
         agent_id: lease.agent_id,
         session_id: lease.session_id,
     };
-    if !send_agent_message(&mut socket, registered).await {
+    if !wire.send_message(&mut socket, registered).await {
+        state
+            .agents
+            .unregister(lease.agent_id, lease.session_id)
+            .await;
+        return;
+    }
+    if !wire.send_ack(&mut socket, registration_delivery_id).await {
         state
             .agents
             .unregister(lease.agent_id, lease.session_id)
@@ -1645,8 +1758,15 @@ async fn handle_agent_socket(mut socket: WebSocket, state: AppState) {
         return;
     }
 
+    let mut retransmit = tokio::time::interval(Duration::from_secs(1));
+    retransmit.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = retransmit.tick() => {
+                if !wire.retransmit_due(&mut socket).await {
+                    break;
+                }
+            }
             incoming = socket.recv() => {
                 let Some(result) = incoming else { break; };
                 let message = match result {
@@ -1664,10 +1784,34 @@ async fn handle_agent_socket(mut socket: WebSocket, state: AppState) {
                     }
                     Message::Close(_) => break,
                     Message::Pong(_) => continue,
-                    message => match decode_agent_message(message) {
-                        Ok(message) => match dispatch_agent_message(&state, &lease, message).await {
+                    message => match decode_agent_transport_message(message) {
+                        Ok(AgentTransportMessage::Ack { delivery_id, .. }) => {
+                            wire.acknowledge(delivery_id);
+                        }
+                        Ok(AgentTransportMessage::Message { delivery_id, payload, .. }) => {
+                            let is_new = match wire.accept_incoming(delivery_id) {
+                                Ok(is_new) => is_new,
+                                Err(()) => {
+                                    let _ = send_agent_error(
+                                        &mut socket,
+                                        "delivery_window_exhausted",
+                                        "agent delivery deduplication window is full",
+                                    ).await;
+                                    break;
+                                }
+                            };
+                            if !is_new {
+                                if !wire.send_ack(&mut socket, delivery_id).await {
+                                    break;
+                                }
+                                continue;
+                            }
+                            if !wire.send_ack(&mut socket, delivery_id).await {
+                                break;
+                            }
+                            match dispatch_agent_message(&state, &lease, payload).await {
                             Ok(Some(response)) => {
-                                if !send_agent_message(&mut socket, response).await {
+                                if !wire.send_message(&mut socket, response).await {
                                     break;
                                 }
                             }
@@ -1676,7 +1820,8 @@ async fn handle_agent_socket(mut socket: WebSocket, state: AppState) {
                                 let _ = send_agent_error(&mut socket, &code, &message).await;
                                 break;
                             }
-                        },
+                            }
+                        }
                         Err(error) => {
                             let _ = send_agent_error(&mut socket, "invalid_message", &error).await;
                             break;
@@ -1686,7 +1831,7 @@ async fn handle_agent_socket(mut socket: WebSocket, state: AppState) {
             }
             outgoing = outbound_rx.recv() => {
                 let Some(message) = outgoing else { break; };
-                if !send_agent_message(&mut socket, message).await {
+                if !wire.send_pending(&mut socket, message).await {
                     break;
                 }
             }
@@ -1859,7 +2004,7 @@ fn build_id_from_event(event: &BuildEvent) -> BuildId {
     }
 }
 
-fn decode_agent_message(message: Message) -> Result<AgentMessage, String> {
+fn decode_agent_transport_message(message: Message) -> Result<AgentTransportMessage, String> {
     let payload = match message {
         Message::Text(text) => text.to_string(),
         Message::Binary(bytes) => String::from_utf8(bytes.to_vec())
@@ -1869,32 +2014,35 @@ fn decode_agent_message(message: Message) -> Result<AgentMessage, String> {
         }
         Message::Close(_) => return Err("agent websocket closed".into()),
     };
-    let message: AgentMessage = serde_json::from_str(&payload)
-        .map_err(|error| format!("invalid agent message JSON: {error}"))?;
+    let message: AgentTransportMessage = serde_json::from_str(&payload)
+        .map_err(|error| format!("invalid agent transport JSON: {error}"))?;
     message
         .validate()
-        .map_err(|error| format!("invalid agent message: {error}"))?;
+        .map_err(|error| format!("invalid agent transport message: {error}"))?;
     Ok(message)
 }
 
-async fn send_agent_message(socket: &mut WebSocket, message: AgentMessage) -> bool {
-    let Ok(payload) = serde_json::to_string(&message) else {
-        return false;
+async fn send_agent_transport(
+    socket: &mut WebSocket,
+    message: &AgentTransportMessage,
+) -> Result<(), ()> {
+    let Ok(payload) = serde_json::to_string(message) else {
+        return Err(());
     };
-    socket.send(Message::Text(payload.into())).await.is_ok()
+    socket
+        .send(Message::Text(payload.into()))
+        .await
+        .map_err(|_| ())
 }
 
 async fn send_agent_error(socket: &mut WebSocket, code: &str, message: &str) -> bool {
-    send_agent_message(
-        socket,
-        AgentMessage::Error {
-            protocol_version: PROTOCOL_VERSION,
-            build_id: None,
-            code: code.to_owned(),
-            message: message.to_owned(),
-        },
-    )
-    .await
+    let message = AgentTransportMessage::message(AgentMessage::Error {
+        protocol_version: PROTOCOL_VERSION,
+        build_id: None,
+        code: code.to_owned(),
+        message: message.to_owned(),
+    });
+    send_agent_transport(socket, &message).await.is_ok()
 }
 
 async fn list_schedules(
@@ -4228,7 +4376,7 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use rivet_agent_protocol::{
         AgentCapabilities, AgentHeartbeat, AgentMessage, AgentRegistration, AgentRequirements,
-        PROTOCOL_VERSION,
+        AgentTransportMessage, PROTOCOL_VERSION,
     };
     use rivet_auth::{ApiTokenRecord, AuthPolicyDocument, Role};
     use rivet_extension_protocol::{
@@ -4933,7 +5081,7 @@ mod tests {
         });
         socket
             .send(ClientMessage::Text(
-                serde_json::to_string(&registration)
+                serde_json::to_string(&AgentTransportMessage::message(registration))
                     .expect("registration JSON")
                     .into(),
             ))
@@ -4947,20 +5095,32 @@ mod tests {
         let ClientMessage::Text(registered) = registered else {
             panic!("expected registered text frame");
         };
-        let AgentMessage::Registered { session_id, .. } =
-            serde_json::from_str(registered.as_ref()).expect("registered JSON")
+        let AgentTransportMessage::Message {
+            delivery_id: registered_delivery_id,
+            payload: AgentMessage::Registered { session_id, .. },
+            ..
+        } = serde_json::from_str(registered.as_ref()).expect("registered JSON")
         else {
             panic!("expected registered response");
         };
+        socket
+            .send(ClientMessage::Text(
+                serde_json::to_string(&AgentTransportMessage::ack(registered_delivery_id))
+                    .expect("registered ACK JSON")
+                    .into(),
+            ))
+            .await
+            .expect("ack registered response");
 
-        let heartbeat = AgentMessage::Heartbeat(AgentHeartbeat {
+        let heartbeat = AgentTransportMessage::message(AgentMessage::Heartbeat(AgentHeartbeat {
             protocol_version: PROTOCOL_VERSION,
             agent_id,
             session_id,
             sequence: 1,
             running: vec![],
             sent_at: Utc::now(),
-        });
+        }));
+        let heartbeat_delivery_id = heartbeat.delivery_id();
         socket
             .send(ClientMessage::Text(
                 serde_json::to_string(&heartbeat)
@@ -4969,20 +5129,142 @@ mod tests {
             ))
             .await
             .expect("send heartbeat");
-        let acknowledged = socket
-            .next()
-            .await
-            .expect("heartbeat ack")
-            .expect("heartbeat frame");
-        let ClientMessage::Text(acknowledged) = acknowledged else {
-            panic!("expected heartbeat ack text frame");
+        let heartbeat_ack_delivery_id = loop {
+            let acknowledged = socket
+                .next()
+                .await
+                .expect("heartbeat ack")
+                .expect("heartbeat frame");
+            let ClientMessage::Text(acknowledged) = acknowledged else {
+                panic!("expected heartbeat text frame");
+            };
+            match serde_json::from_str(acknowledged.as_ref()).expect("ack JSON") {
+                AgentTransportMessage::Ack { .. } => continue,
+                AgentTransportMessage::Message {
+                    delivery_id,
+                    payload: AgentMessage::HeartbeatAck { sequence: 1, .. },
+                    ..
+                } => break delivery_id,
+                _ => panic!("expected heartbeat ack response"),
+            }
         };
-        let acknowledged: AgentMessage =
-            serde_json::from_str(acknowledged.as_ref()).expect("ack JSON");
+        socket
+            .send(ClientMessage::Text(
+                serde_json::to_string(&AgentTransportMessage::ack(heartbeat_ack_delivery_id))
+                    .expect("heartbeat response ACK JSON")
+                    .into(),
+            ))
+            .await
+            .expect("ack heartbeat response");
+
+        socket
+            .send(ClientMessage::Text(
+                serde_json::to_string(&heartbeat)
+                    .expect("duplicate heartbeat JSON")
+                    .into(),
+            ))
+            .await
+            .expect("send duplicate heartbeat");
+        let duplicate_ack = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("duplicate heartbeat ACK timeout")
+            .expect("duplicate heartbeat frame")
+            .expect("duplicate heartbeat websocket message");
+        let ClientMessage::Text(duplicate_ack) = duplicate_ack else {
+            panic!("expected duplicate heartbeat ACK text frame");
+        };
+        assert_eq!(
+            serde_json::from_str::<AgentTransportMessage>(duplicate_ack.as_ref())
+                .expect("duplicate ACK JSON"),
+            AgentTransportMessage::ack(heartbeat_delivery_id)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), socket.next())
+                .await
+                .is_err()
+        );
+        socket.close(None).await.expect("close");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_websocket_retransmits_unacknowledged_server_messages() {
+        let state = AppState::new(Storage::open_in_memory().expect("storage"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(state.clone()))
+                .await
+                .expect("agent server");
+        });
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/api/v1/agents/connect"))
+                .await
+                .expect("connect");
+        let registration =
+            AgentTransportMessage::message(AgentMessage::Register(AgentRegistration {
+                protocol_version: PROTOCOL_VERSION,
+                agent_id: uuid::Uuid::new_v4(),
+                name: "retransmit-agent".into(),
+                capabilities: AgentCapabilities {
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                    docker: false,
+                    labels: vec![],
+                    executors: 1,
+                },
+            }));
+        socket
+            .send(ClientMessage::Text(
+                serde_json::to_string(&registration)
+                    .expect("registration JSON")
+                    .into(),
+            ))
+            .await
+            .expect("send registration");
+
+        let first = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("registered message timeout")
+            .expect("registered frame")
+            .expect("registered websocket message");
+        let ClientMessage::Text(first) = first else {
+            panic!("expected registered text frame");
+        };
+        let first: AgentTransportMessage = serde_json::from_str(first.as_ref()).expect("JSON");
+        let delivery_id = first.delivery_id();
         assert!(matches!(
-            acknowledged,
-            AgentMessage::HeartbeatAck { sequence: 1, .. }
+            first,
+            AgentTransportMessage::Message {
+                payload: AgentMessage::Registered { .. },
+                ..
+            }
         ));
+
+        let retransmitted = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let message = socket
+                    .next()
+                    .await
+                    .expect("retransmitted frame")
+                    .expect("websocket message");
+                let ClientMessage::Text(message) = message else {
+                    continue;
+                };
+                let envelope: AgentTransportMessage =
+                    serde_json::from_str(message.as_ref()).expect("retransmitted JSON");
+                if matches!(
+                    envelope,
+                    AgentTransportMessage::Message { delivery_id: candidate, .. }
+                        if candidate == delivery_id
+                ) {
+                    break envelope;
+                }
+            }
+        })
+        .await
+        .expect("server did not retransmit the unacknowledged message");
+        assert_eq!(retransmitted.delivery_id(), delivery_id);
         socket.close(None).await.expect("close");
         server.abort();
     }
@@ -5121,9 +5403,13 @@ agent = { os = "macos", arch = "aarch64", labels = ["recovery"] }
             .await
             .expect("recovery assignment timeout")
             .expect("recovery assignment");
-        let AgentMessage::Assign {
-            build_id: assigned_build,
-            plan: assigned_plan,
+        let AgentTransportMessage::Message {
+            payload:
+                AgentMessage::Assign {
+                    build_id: assigned_build,
+                    plan: assigned_plan,
+                    ..
+                },
             ..
         } = message
         else {

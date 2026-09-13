@@ -4,8 +4,8 @@ use futures_util::{SinkExt, StreamExt};
 use globset::{Glob, GlobSetBuilder};
 use rivet_agent_protocol::{
     AgentCapabilities, AgentHeartbeat, AgentId, AgentMessage, AgentRegistration,
-    MAX_WORKSPACE_BYTES, MAX_WORKSPACE_CHUNK_BYTES, MAX_WORKSPACE_FILES, PROTOCOL_VERSION,
-    WorkspaceTransfer,
+    AgentTransportMessage, MAX_WORKSPACE_BYTES, MAX_WORKSPACE_CHUNK_BYTES, MAX_WORKSPACE_FILES,
+    PROTOCOL_VERSION, WorkspaceTransfer,
 };
 use rivet_auth::{
     ApiTokenRecord, AuthPolicy, AuthPolicyDocument, Role as AuthRole, generate_token, token_digest,
@@ -24,13 +24,14 @@ use rivet_scm::{
 };
 use rivet_storage::Storage;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::time::Instant;
 use tar::Archive;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -43,6 +44,161 @@ use walkdir::{DirEntry, WalkDir};
 
 type AgentSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+const MAX_AGENT_PENDING_DELIVERIES: usize = 8192;
+const MAX_AGENT_RECEIVED_DELIVERIES: usize = 8192;
+const AGENT_RETRANSMIT_AFTER: Duration = Duration::from_secs(2);
+const MAX_AGENT_RETRANSMITS: u8 = 5;
+
+struct PendingAgentDelivery {
+    envelope: AgentTransportMessage,
+    last_sent: Instant,
+    retransmits: u8,
+}
+
+struct AgentWireState {
+    socket: AgentSocket,
+    pending: HashMap<uuid::Uuid, PendingAgentDelivery>,
+    received: HashSet<uuid::Uuid>,
+    retransmit: tokio::time::Interval,
+}
+
+struct AgentInboundMessage {
+    payload: AgentMessage,
+}
+
+impl AgentWireState {
+    fn new(socket: AgentSocket) -> Self {
+        Self {
+            socket,
+            pending: HashMap::new(),
+            received: HashSet::new(),
+            retransmit: tokio::time::interval(Duration::from_secs(1)),
+        }
+    }
+
+    async fn send_message(
+        &mut self,
+        payload: AgentMessage,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.send_pending(AgentTransportMessage::message(payload))
+            .await
+    }
+
+    async fn send_pending(
+        &mut self,
+        envelope: AgentTransportMessage,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.pending.len() >= MAX_AGENT_PENDING_DELIVERIES {
+            return Err("agent pending delivery window is full".into());
+        }
+        let payload = serde_json::to_string(&envelope)?;
+        self.socket
+            .send(AgentSocketMessage::Text(payload.into()))
+            .await?;
+        self.pending.insert(
+            envelope.delivery_id(),
+            PendingAgentDelivery {
+                envelope,
+                last_sent: Instant::now(),
+                retransmits: 0,
+            },
+        );
+        Ok(())
+    }
+
+    async fn send_ack(
+        &mut self,
+        delivery_id: uuid::Uuid,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let payload = serde_json::to_string(&AgentTransportMessage::ack(delivery_id))?;
+        self.socket
+            .send(AgentSocketMessage::Text(payload.into()))
+            .await?;
+        Ok(())
+    }
+
+    fn acknowledge(&mut self, delivery_id: uuid::Uuid) {
+        self.pending.remove(&delivery_id);
+    }
+
+    async fn retransmit_due(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let due = self
+            .pending
+            .iter()
+            .filter(|(_, delivery)| delivery.last_sent.elapsed() >= AGENT_RETRANSMIT_AFTER)
+            .map(|(delivery_id, _)| *delivery_id)
+            .collect::<Vec<_>>();
+        for delivery_id in due {
+            let Some(delivery) = self.pending.get_mut(&delivery_id) else {
+                continue;
+            };
+            if delivery.retransmits >= MAX_AGENT_RETRANSMITS {
+                return Err("agent delivery acknowledgement timed out".into());
+            }
+            let payload = serde_json::to_string(&delivery.envelope)?;
+            self.socket
+                .send(AgentSocketMessage::Text(payload.into()))
+                .await?;
+            delivery.last_sent = Instant::now();
+            delivery.retransmits += 1;
+        }
+        Ok(())
+    }
+
+    async fn next_message(
+        &mut self,
+    ) -> Result<Option<AgentInboundMessage>, Box<dyn std::error::Error>> {
+        loop {
+            tokio::select! {
+                message = self.socket.next() => {
+                    let Some(message) = message else {
+                        return Ok(None);
+                    };
+                    match message? {
+                        AgentSocketMessage::Ping(payload) => {
+                            self.socket.send(AgentSocketMessage::Pong(payload)).await?;
+                        }
+                        AgentSocketMessage::Pong(_) => {}
+                        AgentSocketMessage::Close(_) => return Ok(None),
+                        message => {
+                            let envelope = decode_agent_socket_message(message)?;
+                            match envelope {
+                                AgentTransportMessage::Ack { delivery_id, .. } => {
+                                    self.acknowledge(delivery_id);
+                                }
+                                AgentTransportMessage::Message {
+                                    delivery_id,
+                                    payload,
+                                    ..
+                                } => {
+                                    if self.received.contains(&delivery_id) {
+                                        self.send_ack(delivery_id).await?;
+                                        continue;
+                                    }
+                                    if self.received.len() >= MAX_AGENT_RECEIVED_DELIVERIES {
+                                        return Err("agent received delivery window is full".into());
+                                    }
+                                    self.received.insert(delivery_id);
+                                    self.send_ack(delivery_id).await?;
+                                    return Ok(Some(AgentInboundMessage { payload }));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ = self.retransmit.tick() => {
+                    self.retransmit_due().await?;
+                }
+            }
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.socket.close(None).await?;
+        Ok(())
+    }
+}
 
 const SAMPLE_PIPELINE: &str = r#"version = 1
 name = "sample"
@@ -726,13 +882,16 @@ async fn run_agent_session(
             HeaderValue::from_str(&format!("Bearer {token}"))?,
         );
     }
-    let (mut socket, _) = connect_async(request).await?;
-    send_agent_socket_message(&mut socket, AgentMessage::Register(registration.clone())).await?;
-    let registered = socket
-        .next()
-        .await
-        .ok_or("Rivet server closed the agent connection during registration")??;
-    let session_id = match decode_agent_socket_message(registered)? {
+    let (socket, _) = connect_async(request).await?;
+    let mut transport = AgentWireState::new(socket);
+    transport
+        .send_message(AgentMessage::Register(registration.clone()))
+        .await?;
+    let registered = transport
+        .next_message()
+        .await?
+        .ok_or("Rivet server closed the agent connection during registration")?;
+    let session_id = match registered.payload {
         AgentMessage::Registered {
             agent_id: registered_agent,
             session_id,
@@ -743,7 +902,6 @@ async fn run_agent_session(
         }
         _ => return Err("Rivet server did not acknowledge this agent registration".into()),
     };
-
     println!(
         "Connected agent {} ({}) with {} executor{}",
         registration.name,
@@ -769,8 +927,7 @@ async fn run_agent_session(
             }
             _ = heartbeat.tick() => {
                 sequence += 1;
-                send_agent_socket_message(
-                    &mut socket,
+                transport.send_message(
                     AgentMessage::Heartbeat(AgentHeartbeat {
                         protocol_version: PROTOCOL_VERSION,
                         agent_id: registration.agent_id,
@@ -779,70 +936,61 @@ async fn run_agent_session(
                         running: running.clone(),
                         sent_at: Utc::now(),
                     }),
-                ).await?;
+                )
+                .await?;
             }
-            message = socket.next() => {
-                let Some(message) = message else { break; };
-                match message? {
-                    AgentSocketMessage::Ping(payload) => {
-                        socket.send(AgentSocketMessage::Pong(payload)).await?;
+            message = transport.next_message() => {
+                let Some(message) = message? else { break; };
+                let AgentInboundMessage { payload } = message;
+                match payload {
+                    AgentMessage::HeartbeatAck { .. } => {}
+                    AgentMessage::Error { code, message, .. } => {
+                        return Err(format!("agent connection error ({code}): {message}").into());
                     }
-                    AgentSocketMessage::Pong(_) => {}
-                    AgentSocketMessage::Close(_) => break,
-                    message => {
-                        let decoded = decode_agent_socket_message(message)?;
-                        match &decoded {
-                            AgentMessage::HeartbeatAck { .. } => {}
-                            AgentMessage::Error { code, message, .. } => {
-                                return Err(format!("agent connection error ({code}): {message}").into());
+                    payload @ AgentMessage::Assign { build_id, .. } => {
+                        let assignment_build_id = build_id;
+                        running.push(assignment_build_id);
+                        let assignment = run_agent_assignment(
+                            &mut transport,
+                            registration,
+                            session_id,
+                            sequence,
+                            payload,
+                            &args.workspace_root,
+                        ).await;
+                        match assignment {
+                            Ok(AgentAssignmentResult::Complete { sequence: next }) => {
+                                sequence = next;
+                                running.retain(|running_build| *running_build != assignment_build_id);
                             }
-                            AgentMessage::Assign { build_id, .. } => {
-                                let build_id = *build_id;
-                                running.push(build_id);
-                                let assignment = run_agent_assignment(
-                                    &mut socket,
-                                    registration,
-                                    session_id,
-                                    sequence,
-                                    decoded,
-                                    &args.workspace_root,
-                                ).await;
-                                match assignment {
-                                    Ok(AgentAssignmentResult::Complete { sequence: next }) => {
-                                        sequence = next;
-                                        running.retain(|running_build| *running_build != build_id);
-                                    }
-                                    Ok(AgentAssignmentResult::Stopped) => {
-                                        session_result = AgentSessionResult::Stopped;
-                                        break;
-                                    }
-                                    Err(error) => {
-                                        running.retain(|running_build| *running_build != build_id);
-                                        send_agent_socket_message(
-                                            &mut socket,
-                                            AgentMessage::Error {
-                                                protocol_version: PROTOCOL_VERSION,
-                                                build_id: Some(build_id),
-                                                code: "assignment_failed".into(),
-                                                message: error.to_string(),
-                                            },
-                                        ).await?;
-                                    }
-                                }
+                            Ok(AgentAssignmentResult::Stopped) => {
+                                session_result = AgentSessionResult::Stopped;
+                                break;
                             }
-                            _ => {}
+                            Err(error) => {
+                                running.retain(|running_build| *running_build != assignment_build_id);
+                                transport.send_message(
+                                    AgentMessage::Error {
+                                        protocol_version: PROTOCOL_VERSION,
+                                        build_id: Some(assignment_build_id),
+                                        code: "assignment_failed".into(),
+                                        message: error.to_string(),
+                                    },
+                                ).await?;
+                            }
                         }
-                    },
+                    }
+                    _ => {}
                 }
             }
         }
     }
-    let _ = socket.close(None).await;
+    let _ = transport.close().await;
     Ok(session_result)
 }
 
 async fn run_agent_assignment(
-    socket: &mut AgentSocket,
+    transport: &mut AgentWireState,
     registration: &AgentRegistration,
     session_id: uuid::Uuid,
     mut sequence: u64,
@@ -868,17 +1016,15 @@ async fn run_agent_assignment(
     let archive_path = workspace_root.join(format!("{build_id}.tar"));
     remove_exact_agent_path(&archive_path)?;
 
-    send_agent_socket_message(
-        socket,
-        AgentMessage::AssignmentAccepted {
+    transport
+        .send_message(AgentMessage::AssignmentAccepted {
             protocol_version: PROTOCOL_VERSION,
             build_id,
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     let transfer_result = receive_workspace_archive(
-        socket,
+        transport,
         registration,
         session_id,
         &mut sequence,
@@ -894,14 +1040,12 @@ async fn run_agent_assignment(
     }
     extract_workspace_archive(&archive_path, &build_workspace, workspace.file_count)?;
     remove_exact_agent_path(&archive_path)?;
-    send_agent_socket_message(
-        socket,
-        AgentMessage::WorkspaceReady {
+    transport
+        .send_message(AgentMessage::WorkspaceReady {
             protocol_version: PROTOCOL_VERSION,
             build_id,
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     let mut execution_plan = plan;
     let mut execution_pipeline = pipeline;
@@ -933,8 +1077,8 @@ async fn run_agent_assignment(
             }
             _ = heartbeat.tick() => {
                 sequence += 1;
-                send_agent_socket_message(
-                    socket,
+                transport
+                    .send_message(
                     AgentMessage::Heartbeat(AgentHeartbeat {
                         protocol_version: PROTOCOL_VERSION,
                         agent_id: registration.agent_id,
@@ -943,12 +1087,13 @@ async fn run_agent_assignment(
                         running: vec![build_id],
                         sent_at: Utc::now(),
                     }),
-                ).await?;
+                    )
+                    .await?;
             }
             message = event_receiver.recv() => {
                 if let Some(event) = message {
                     terminal_event_sent |= send_execution_event(
-                        socket,
+                        transport,
                         event,
                         build_id,
                         &execution_pipeline,
@@ -956,7 +1101,7 @@ async fn run_agent_assignment(
                     ).await?;
                 }
             }
-            message = next_agent_message(socket) => {
+            message = transport.next_message() => {
                 let message = match message {
                     Ok(Some(message)) => message,
                     Ok(None) => {
@@ -978,7 +1123,8 @@ async fn run_agent_assignment(
                         return Err(error);
                     }
                 };
-                match message {
+                let AgentInboundMessage { payload } = message;
+                match payload {
                     AgentMessage::Cancel { build_id: cancelled, .. } if cancelled == build_id => {
                         cancellation.cancel();
                     }
@@ -1006,7 +1152,7 @@ async fn run_agent_assignment(
             result = &mut execution => {
                 while let Some(event) = event_receiver.recv().await {
                     terminal_event_sent |= send_execution_event(
-                        socket,
+                        transport,
                         event,
                         build_id,
                         &execution_pipeline,
@@ -1015,15 +1161,16 @@ async fn run_agent_assignment(
                 }
                 if let Err(error) = result {
                     if !terminal_event_sent {
-                        send_agent_socket_message(
-                            socket,
+                        transport
+                            .send_message(
                             AgentMessage::Error {
                                 protocol_version: PROTOCOL_VERSION,
                                 build_id: Some(build_id),
                                 code: "execution_failed".into(),
                                 message: error.to_string(),
                             },
-                        ).await?;
+                            )
+                            .await?;
                     }
                 }
                 remove_exact_agent_path(&build_workspace)?;
@@ -1034,7 +1181,7 @@ async fn run_agent_assignment(
 }
 
 async fn send_execution_event(
-    socket: &mut AgentSocket,
+    transport: &mut AgentWireState,
     event: BuildEvent,
     build_id: uuid::Uuid,
     pipeline: &Pipeline,
@@ -1048,34 +1195,30 @@ async fn send_execution_event(
         }
     ) && !pipeline.artifacts.is_empty()
     {
-        if let Err(error) = send_artifact_archive(socket, build_id, pipeline, workspace).await {
-            send_agent_socket_message(
-                socket,
-                AgentMessage::Error {
+        if let Err(error) = send_artifact_archive(transport, build_id, pipeline, workspace).await {
+            transport
+                .send_message(AgentMessage::Error {
                     protocol_version: PROTOCOL_VERSION,
                     build_id: Some(build_id),
                     code: "artifact_collection_failed".into(),
                     message: error.to_string(),
-                },
-            )
-            .await?;
+                })
+                .await?;
             return Ok(false);
         }
     }
     let terminal = matches!(event, BuildEvent::BuildFinished { .. });
-    send_agent_socket_message(
-        socket,
-        AgentMessage::Event {
+    transport
+        .send_message(AgentMessage::Event {
             protocol_version: PROTOCOL_VERSION,
             event,
-        },
-    )
-    .await?;
+        })
+        .await?;
     Ok(terminal)
 }
 
 async fn send_artifact_archive(
-    socket: &mut AgentSocket,
+    transport: &mut AgentWireState,
     build_id: uuid::Uuid,
     pipeline: &Pipeline,
     workspace: &Path,
@@ -1091,28 +1234,24 @@ async fn send_artifact_archive(
         Ok(Err(error)) => return Err(std::io::Error::other(error).into()),
         Err(error) => return Err(std::io::Error::other(error.to_string()).into()),
     };
-    send_agent_socket_message(
-        socket,
-        AgentMessage::ArtifactsReady {
+    transport
+        .send_message(AgentMessage::ArtifactsReady {
             protocol_version: PROTOCOL_VERSION,
             build_id,
             transfer: archive.transfer,
-        },
-    )
-    .await?;
+        })
+        .await?;
     for (sequence, data) in archive.bytes.chunks(MAX_WORKSPACE_CHUNK_BYTES).enumerate() {
         let sequence =
             u32::try_from(sequence).map_err(|_| "artifact archive has too many chunks")?;
-        send_agent_socket_message(
-            socket,
-            AgentMessage::ArtifactChunk {
+        transport
+            .send_message(AgentMessage::ArtifactChunk {
                 protocol_version: PROTOCOL_VERSION,
                 build_id,
                 sequence,
                 data: data.to_vec(),
-            },
-        )
-        .await?;
+            })
+            .await?;
     }
     Ok(())
 }
@@ -1204,7 +1343,7 @@ fn is_internal_artifact_entry(entry: &DirEntry, root: &Path) -> bool {
 }
 
 async fn receive_workspace_archive(
-    socket: &mut AgentSocket,
+    transport: &mut AgentWireState,
     registration: &AgentRegistration,
     session_id: uuid::Uuid,
     sequence: &mut u64,
@@ -1228,8 +1367,8 @@ async fn receive_workspace_archive(
             }
             _ = heartbeat.tick() => {
                 *sequence += 1;
-                send_agent_socket_message(
-                    socket,
+                transport
+                    .send_message(
                     AgentMessage::Heartbeat(AgentHeartbeat {
                         protocol_version: PROTOCOL_VERSION,
                         agent_id: registration.agent_id,
@@ -1238,13 +1377,15 @@ async fn receive_workspace_archive(
                         running: vec![build_id],
                         sent_at: Utc::now(),
                     }),
-                ).await?;
+                    )
+                    .await?;
             }
-            message = next_agent_message(socket) => {
+            message = transport.next_message() => {
                 let Some(message) = message? else {
                     return Err("Rivet server closed the agent connection during workspace transfer".into());
                 };
-                match message {
+                let AgentInboundMessage { payload } = message;
+                match payload {
                     AgentMessage::WorkspaceChunk { build_id: chunk_build, sequence: chunk_sequence, data, .. }
                         if chunk_build == build_id => {
                         if chunk_sequence != expected_sequence {
@@ -1270,7 +1411,9 @@ async fn receive_workspace_archive(
                     AgentMessage::Error { code, message, .. } => {
                         return Err(format!("Rivet server rejected workspace transfer ({code}): {message}").into());
                     }
-                    _ => return Err(format!("unexpected server message while receiving workspace {build_id}").into()),
+                    _ => {
+                        return Err(format!("unexpected server message while receiving workspace {build_id}").into());
+                    }
                 }
             }
         }
@@ -1379,38 +1522,9 @@ fn clear_remote_requirements(plan: &mut rivet_core::ExecutionPlan, pipeline: &mu
     }
 }
 
-async fn next_agent_message(
-    socket: &mut AgentSocket,
-) -> Result<Option<AgentMessage>, Box<dyn std::error::Error>> {
-    loop {
-        let Some(message) = socket.next().await else {
-            return Ok(None);
-        };
-        match message? {
-            AgentSocketMessage::Ping(payload) => {
-                socket.send(AgentSocketMessage::Pong(payload)).await?;
-            }
-            AgentSocketMessage::Pong(_) => {}
-            AgentSocketMessage::Close(_) => return Ok(None),
-            message => return decode_agent_socket_message(message).map(Some),
-        }
-    }
-}
-
-async fn send_agent_socket_message(
-    socket: &mut AgentSocket,
-    message: AgentMessage,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let payload = serde_json::to_string(&message)?;
-    socket
-        .send(AgentSocketMessage::Text(payload.into()))
-        .await?;
-    Ok(())
-}
-
 fn decode_agent_socket_message(
     message: AgentSocketMessage,
-) -> Result<AgentMessage, Box<dyn std::error::Error>> {
+) -> Result<AgentTransportMessage, Box<dyn std::error::Error>> {
     let payload = match message {
         AgentSocketMessage::Text(text) => text.to_string(),
         AgentSocketMessage::Binary(bytes) => String::from_utf8(bytes.to_vec())?,
@@ -1422,7 +1536,7 @@ fn decode_agent_socket_message(
             return Err("raw websocket frame is not an agent message".into());
         }
     };
-    let message: AgentMessage = serde_json::from_str(&payload)?;
+    let message: AgentTransportMessage = serde_json::from_str(&payload)?;
     message.validate()?;
     Ok(message)
 }
