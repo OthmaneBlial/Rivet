@@ -906,6 +906,8 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
+ "futures-util",
+ "rivet-agent-protocol",
  "rivet-core",
  "rivet-migration",
  "rivet-runner",
@@ -914,6 +916,7 @@ dependencies = [
  "rivet-storage",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "uuid",
 ]
