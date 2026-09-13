@@ -5,8 +5,8 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **78 / 100 points** (**78.52 weighted evidence
-points**, displayed conservatively as 78%).
+The current verified total is **79 / 100 points** (**79.27 weighted evidence
+points**, displayed conservatively as 79%).
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
@@ -18,8 +18,8 @@ points**, displayed conservatively as 78%).
 | API and live transport | 6 | partial | REST/loopback WebSocket, durable event replay, queue telemetry, build retry, schedule endpoints/dispatch, exact CORS allow-list, body limits, security headers, and policy-backed identity/project authorization pass; user sessions and deployment operations remain |
 | CLI operator workflow | 3 | partial | project/run/history, parameterized builds, artifact listing, retry, and schedule management work; richer cancellation and inspection remain |
 | Tauri desktop control room | 10 | partial | native bundle, embedded engine health, rendered light-default/dark-toggle UX, artifact/retry views, schedule controls, online/offline recovery, real client build flow, and an ephemeral loopback engine origin in the packaged launch pass; final Tauri-window interaction and release QA remain |
-| Git/SCM integration | 8 | partial | direct Git inspect/checkout/fetch/clean operations, REST/CLI surfaces, explicit build-admission preparation, persisted build source identity, provider-neutral credential IDs, and ephemeral Git auth handoff pass; provider hooks remain |
-| Triggers and scheduling | 5 | partial | manual/API entry points, validated persistent UTC cron schedules/server dispatch, and signed generic webhook delivery pass; provider repository events and upstream triggers remain |
+| Git/SCM integration | 8 | partial | direct Git inspect/checkout/fetch/clean operations, REST/CLI surfaces, explicit build-admission preparation, persisted build source identity, provider-neutral credential IDs, ephemeral Git auth handoff, and provider push adapters pass; credential/project lifecycle remains |
+| Triggers and scheduling | 5 | partial | manual/API entry points, validated persistent UTC cron schedules/server dispatch, signed generic webhook delivery, and signed GitHub/GitLab push adapters pass; pull-request, broader repository-event, and upstream triggers remain |
 | Remote agents | 10 | partial | authenticated versioned registration/heartbeat contract, explicit pipeline requirements with local safety refusal, reconnecting agent CLI, reconnect-safe sessions, stale detection, capacity-aware online matching, rendered fleet view, matching capacity reservation, bounded workspace and artifact transfer, shared-runner remote execution, typed event/output relay, cancellation, and one bounded replacement-agent attempt with clean terminal failure pass; durable restart recovery, exactly-once semantics, and richer retry policy remain |
 | Container execution | 4 | partial | validated container declarations and bounded Docker command assembly pass; Docker runtime cleanup, timeout/cancellation, image policy, and artifact extraction remain unverified |
 | Artifacts | 4 | partial | local and remote workspace collection, upload/download, bounded checksum-verified transfer, metadata, and a storage boundary pass; retention and remote object backends remain |
@@ -41,8 +41,9 @@ scaffold, passing unrelated test, or interface alone does not complete a gate.
 The next gates are the final Tauri-window flow inside the packaged app, API
 deployment hardening, durable remote recovery across server restart and richer
 retry policy, credential ownership/rotation/keychain integration, user
-sessions/token lifecycle and audit history, provider webhook adapters/repository-event mapping, full
-Groovy/plugin migration semantics, and generated Rivetfile conversion with
-fixture-backed migration regressions.
+sessions/token lifecycle and audit history, pull-request and broader
+repository-event mapping, upstream triggers, full Groovy/plugin migration
+semantics, and generated Rivetfile conversion with fixture-backed migration
+regressions.
 Test clean checkout behavior
 without exposing credentials to logs or persisted state.

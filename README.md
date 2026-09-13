@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**78% verified** · `███████████████▌░░░░`<br>
-Weighted evidence score: **78.52 / 100** · displayed conservatively as the
+**79% verified** · `███████████████▊░░░░`<br>
+Weighted evidence score: **79.27 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -184,6 +184,45 @@ The same `event_id` can be retried safely: the first request queues one build,
 and later deliveries return a deduplicated response without creating another
 build. A non-loopback server still requires the separate Bearer token.
 
+Provider webhook adapters are available when their provider secret is supplied.
+The project name is part of the route, so the receiver never guesses a Rivet
+project from an untrusted repository name:
+
+```text
+POST /api/v1/webhooks/github/<rivet-project>
+POST /api/v1/webhooks/gitlab/<rivet-project>
+```
+
+GitHub accepts signed `push` deliveries (and acknowledges `ping`) using
+`X-Hub-Signature-256`, `X-GitHub-Event`, and `X-GitHub-Delivery`. GitLab accepts
+`Push Hook` and `Tag Push Hook` deliveries using the signed
+`webhook-id`/`webhook-timestamp`/`webhook-signature` headers; the legacy
+`X-Gitlab-Token` form is also accepted for installations that have not enabled
+the newer signing headers. Both adapters validate the commit SHA, normalize to
+the same idempotent build admission path, and can attach a default non-secret
+Rivet credential ID for the fetch.
+
+Configure the provider keys through private files and, when needed, point each
+adapter at its vault credential ID:
+
+```sh
+chmod 600 /secure/path/rivet.github-webhook.secret
+chmod 600 /secure/path/rivet.gitlab-webhook.secret
+cargo run -p rivet -- --data-dir .rivet server \
+  --github-webhook-secret-file /secure/path/rivet.github-webhook.secret \
+  --gitlab-webhook-secret-file /secure/path/rivet.gitlab-webhook.secret \
+  --github-webhook-credential-id github \
+  --gitlab-webhook-credential-id gitlab \
+  --credentials-file /secure/path/rivet.credentials.vault \
+  --credentials-passphrase-file /secure/path/rivet.credentials.passphrase
+```
+
+The provider contracts are documented by [GitHub's webhook signature
+validation guide](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)
+and [GitLab's webhook integration documentation](https://docs.gitlab.com/user/project/integrations/webhooks/).
+Pull requests, upstream-trigger mapping, and broader provider event coverage
+remain future gates.
+
 SCM credentials use a local passphrase-encrypted vault. The CLI reads the
 passphrase and provider secret from private files, so neither value is placed
 in shell history or command-line arguments:
@@ -217,9 +256,8 @@ credential ID, for example `{ "remote": "origin", "fetch": true,
 "credential_id": "github" }`. Rivet resolves the ID locally, passes HTTP
 Basic auth to the Git child process through ephemeral configuration, and
 redacts the secret and encoded header from command errors. The vault stores
-authenticated ciphertext only; provider-specific repository-event adapters,
-credential rotation, keychain integration, and project-level access control
-remain future gates.
+authenticated ciphertext only; credential rotation, keychain integration, and
+project-level access control remain future gates.
 
 The same `--credential-id`, `--credentials-file`, and
 `--credentials-passphrase-file` flags can be passed to `rivet run` when a
