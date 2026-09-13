@@ -5,8 +5,8 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **83 / 100 points** (**83.93 weighted evidence
-points**, displayed conservatively as 83%).
+The current verified total is **84 / 100 points** (**84.13 weighted evidence
+points**, displayed conservatively as 84%).
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
@@ -25,7 +25,7 @@ points**, displayed conservatively as 83%).
 | Artifacts | 4 | partial | local and remote workspace collection, upload/download, bounded checksum-verified transfer, metadata, and a storage boundary pass; retention and remote object backends remain |
 | CI cache | 3 | partial | validated exact project-scoped keys, safe relative paths, atomic local archive save/restore, and corrupt-entry recovery pass; fallback keys, eviction, and remote cache backends remain |
 | Secrets and credentials | 6 | partial | secret parameters require explicit runtime values, persisted values/API responses are redacted, logs are masked, retries require fresh secret input, and a passphrase-encrypted local credential vault with private-file CLI setup passes; credential ownership, rotation, keychain integration, and project access control remain |
-| Authentication and authorization | 4 | partial | protected remote transport with private Bearer tokens, policy-file token digests, roles, project scopes, route authorization, agent-connect permission checks, local token creation/listing/revocation, and optional RFC3339 token expiration enforcement pass; users, sessions, audit history, and external identity providers remain |
+| Authentication and authorization | 4 | partial | protected remote transport with private Bearer tokens, policy-file token digests, roles, project scopes, route authorization, agent-connect permission checks, local token creation/listing/revocation, optional RFC3339 token expiration enforcement, and bounded admin-only authentication audit history pass; users, sessions, and external identity providers remain |
 | Extension protocol | 4 | partial | versioned manifest, WASM/subprocess kind model, declared permission vocabulary, bounded length-prefixed JSON framing, direct-argument subprocess host, bounded local catalog discovery/API, desktop extension model, and a root-confined subprocess lifecycle manager with per-request permission enforcement pass; WASM runtime and server/desktop lifecycle UI remain |
 | Jenkins migration analyzer | 3 | partial | bounded Jenkinsfile analysis, headless API delivery, rendered desktop report, and valid drafts for deterministic quoted shell steps pass; full Groovy parsing, plugin semantics, and broad generated Rivetfile conversion remain |
 | Differential compatibility harness | 2 | planned | normalized behavioral fixtures and permanent regressions |
@@ -38,11 +38,11 @@ states. “Planned” is zero progress, “partial” receives only the portion 
 by evidence, and “verified” receives the full workstream weight. A local build,
 scaffold, passing unrelated test, or interface alone does not complete a gate.
 
-The next gates are extension permission enforcement in a lifecycle manager, the
-WASM runtime and lifecycle UI, the final Tauri-window flow inside the packaged app, API
+The next gates are the WASM runtime and lifecycle UI, the final Tauri-window
+flow inside the packaged app, API
 deployment hardening, resuming remote attempts across server restart and
 richer retry policy, credential ownership/rotation/keychain integration, user
-sessions and audit history, pull-request and broader
+sessions and external identity providers, pull-request and broader
 repository-event mapping, upstream triggers, full Groovy/plugin migration
 semantics, and generated Rivetfile conversion with fixture-backed migration
 regressions.

@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**83% verified** · `████████████████▋░░░`<br>
-Weighted evidence score: **83.37 / 100** · displayed conservatively as the
+**84% verified** · `████████████████▊░░░`<br>
+Weighted evidence score: **84.13 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -42,7 +42,9 @@ closes unfinished steps, stages, and builds as failed when recovery is
 unavailable. On startup, persisted incomplete builds are reconciled
 idempotently so a crashed server cannot leave history stuck forever; resuming
 the same remote attempt after restart and richer retry policy remain future
-gates.
+gates. Authenticated deployments persist bounded success/failure audit records
+without request bodies or Bearer values and expose them only to administrators;
+user sessions and external identity providers remain future gates.
 
 Rivet's extension surface is intentionally a separate, versioned contract.
 `rivet-extension-protocol` validates WASM or direct-subprocess manifests,
@@ -178,8 +180,10 @@ cargo run -p rivet -- auth token revoke old-operator \
 
 The token value is not printed by the command and is not recoverable from the
 policy. The optional RFC3339 `expires_at` value is enforced at request time;
-legacy records without it remain non-expiring. User accounts, sessions, audit
-history, and external identity providers remain future gates.
+legacy records without it remain non-expiring. Authenticated requests also
+produce bounded audit records available to administrators at
+`GET /api/v1/audit`; request bodies and Bearer values are never recorded. User
+accounts, sessions, and external identity providers remain future gates.
 
 Extension manifests can be loaded by the headless server from an explicit
 local directory:
