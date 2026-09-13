@@ -4,6 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+const MAX_AGENT_REQUIREMENT_VALUE_BYTES: usize = 64;
+const MAX_AGENT_REQUIREMENT_LABELS: usize = 64;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Pipeline {
     pub version: u32,
@@ -67,11 +70,29 @@ pub struct Step {
     pub timeout_seconds: Option<u64>,
     #[serde(default)]
     pub container: Option<ContainerSpec>,
+    /// Optional remote-agent requirements. A local runner must reject this
+    /// explicitly until a server assigns the build to a matching worker.
+    #[serde(default)]
+    pub agent: Option<AgentRequirement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContainerSpec {
     pub image: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRequirement {
+    #[serde(default)]
+    pub os: Option<String>,
+    #[serde(default)]
+    pub arch: Option<String>,
+    #[serde(default)]
+    pub docker: bool,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub executors: Option<u16>,
 }
 
 #[derive(Debug, Error)]
@@ -105,6 +126,24 @@ pub enum PipelineError {
     EmptyContainerImage { stage: String, step: String },
     #[error("container image for step {step:?} in stage {stage:?} is invalid")]
     InvalidContainerImage { stage: String, step: String },
+    #[error("agent requirement {field} for step {step:?} in stage {stage:?} cannot be empty")]
+    EmptyAgentRequirement {
+        stage: String,
+        step: String,
+        field: &'static str,
+    },
+    #[error("agent requirement {field} for step {step:?} in stage {stage:?} is invalid")]
+    InvalidAgentRequirement {
+        stage: String,
+        step: String,
+        field: &'static str,
+    },
+    #[error("agent requirement labels for step {step:?} in stage {stage:?} are invalid")]
+    InvalidAgentLabels { stage: String, step: String },
+    #[error(
+        "agent requirement for step {step:?} in stage {stage:?} must request at least one executor"
+    )]
+    ZeroAgentExecutors { stage: String, step: String },
     #[error("workspace escapes the repository root: {0}")]
     WorkspaceOutsideRepository(PathBuf),
     #[error("workspace does not exist: {0}")]
@@ -335,6 +374,49 @@ impl Pipeline {
                         });
                     }
                 }
+                if let Some(agent) = &step.agent {
+                    for (field, value) in
+                        [("os", agent.os.as_deref()), ("arch", agent.arch.as_deref())]
+                    {
+                        let Some(value) = value else {
+                            continue;
+                        };
+                        if value.trim().is_empty() {
+                            return Err(PipelineError::EmptyAgentRequirement {
+                                stage: stage.name.clone(),
+                                step: step.name.clone(),
+                                field,
+                            });
+                        }
+                        if value.len() > MAX_AGENT_REQUIREMENT_VALUE_BYTES
+                            || value.chars().any(char::is_control)
+                        {
+                            return Err(PipelineError::InvalidAgentRequirement {
+                                stage: stage.name.clone(),
+                                step: step.name.clone(),
+                                field,
+                            });
+                        }
+                    }
+                    if agent.labels.len() > MAX_AGENT_REQUIREMENT_LABELS
+                        || agent.labels.iter().any(|label| {
+                            label.trim().is_empty()
+                                || label.len() > MAX_AGENT_REQUIREMENT_VALUE_BYTES
+                                || label.chars().any(char::is_control)
+                        })
+                    {
+                        return Err(PipelineError::InvalidAgentLabels {
+                            stage: stage.name.clone(),
+                            step: step.name.clone(),
+                        });
+                    }
+                    if agent.executors == Some(0) {
+                        return Err(PipelineError::ZeroAgentExecutors {
+                            stage: stage.name.clone(),
+                            step: step.name.clone(),
+                        });
+                    }
+                }
             }
         }
 
@@ -491,6 +573,51 @@ timeout_seconds = 60
         assert_eq!(pipeline.stages[0].steps[0].program, "cargo");
         assert_eq!(pipeline.stages[0].steps[0].args, ["test"]);
         assert_eq!(pipeline.workspace, None);
+    }
+
+    #[test]
+    fn validates_explicit_remote_agent_requirements() {
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "remote"
+[[stages]]
+name = "Build"
+[[stages.steps]]
+name = "compile"
+program = "cargo"
+args = ["build"]
+[stages.steps.agent]
+os = "linux"
+arch = "x86_64"
+docker = true
+labels = ["large-memory"]
+executors = 2
+"#,
+        )
+        .expect("remote requirement is valid");
+        let requirement = pipeline.stages[0].steps[0]
+            .agent
+            .as_ref()
+            .expect("agent requirement");
+        assert_eq!(requirement.os.as_deref(), Some("linux"));
+        assert_eq!(requirement.executors, Some(2));
+
+        let invalid = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "invalid-remote"
+[[stages]]
+name = "Build"
+[[stages.steps]]
+name = "compile"
+program = "true"
+[stages.steps.agent]
+executors = 0
+"#,
+        )
+        .expect_err("zero remote executors must be rejected");
+        assert!(matches!(invalid, PipelineError::ZeroAgentExecutors { .. }));
     }
 
     #[test]

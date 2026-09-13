@@ -21,6 +21,8 @@ pub enum RunnerError {
     EventChannelClosed,
     #[error("step working directory escapes the pipeline workspace: {0}")]
     WorkingDirectoryOutsideWorkspace(PathBuf),
+    #[error("step {step:?} requires a remote agent; local execution was refused")]
+    RemoteAgentRequired { step: String },
 }
 
 /// Execute all stages in a validated plan in declaration order.
@@ -190,6 +192,11 @@ async fn execute_step(
     cancellation: &CancellationToken,
     events: &mpsc::Sender<BuildEvent>,
 ) -> Result<StepStatus, RunnerError> {
+    if step.definition.agent.is_some() {
+        return Err(RunnerError::RemoteAgentRequired {
+            step: step.definition.name.clone(),
+        });
+    }
     let working_dir = resolve_working_dir(workspace, step.definition.working_dir.as_deref())?;
     send(
         events,
@@ -679,5 +686,59 @@ image = "rust:1.85"
             ["rust:1.85", "cargo", "test", "--workspace"]
         );
         assert_eq!(spec.env["TARGET"], "release");
+    }
+
+    #[tokio::test]
+    async fn refuses_remote_agent_steps_in_the_local_runner() {
+        let directory = tempdir().expect("tempdir");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "remote-only"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "linux-build"
+program = "true"
+[stages.steps.agent]
+os = "linux"
+labels = ["build"]
+"#,
+        )
+        .expect("pipeline");
+        let plan =
+            ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let (tx, mut rx) = mpsc::channel(64);
+        let error = execute_pipeline(
+            &plan,
+            &pipeline,
+            directory.path(),
+            CancellationToken::new(),
+            tx,
+        )
+        .await
+        .expect_err("local runner must not ignore remote requirements");
+        assert!(matches!(
+            error,
+            RunnerError::RemoteAgentRequired { ref step } if step == "linux-build"
+        ));
+        let events: Vec<_> = tokio::time::timeout(Duration::from_secs(1), async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        })
+        .await
+        .expect("event stream")
+        .into_iter()
+        .collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            BuildEvent::BuildFinished {
+                status: BuildStatus::Failed,
+                ..
+            }
+        )));
     }
 }

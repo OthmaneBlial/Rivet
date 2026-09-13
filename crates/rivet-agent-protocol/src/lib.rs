@@ -6,7 +6,7 @@
 //! against the same compatibility contract.
 
 use chrono::{DateTime, Utc};
-use rivet_core::{BuildId, BuildStatus, ExecutionPlan, LogStream, ProjectId};
+use rivet_core::{AgentRequirement, BuildId, BuildStatus, ExecutionPlan, LogStream, ProjectId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -114,6 +114,18 @@ impl AgentRequirements {
 
     pub fn requested_executors(&self) -> u16 {
         self.executors.unwrap_or(1)
+    }
+}
+
+impl From<&AgentRequirement> for AgentRequirements {
+    fn from(requirement: &AgentRequirement) -> Self {
+        Self {
+            os: requirement.os.clone(),
+            arch: requirement.arch.clone(),
+            docker: requirement.docker,
+            labels: requirement.labels.clone(),
+            executors: requirement.executors,
+        }
     }
 }
 
@@ -412,6 +424,23 @@ mod tests {
             Err(ProtocolError::ZeroRequiredExecutors)
         );
         assert_eq!(AgentRequirements::default().requested_executors(), 1);
+    }
+
+    #[test]
+    fn pipeline_agent_requirements_convert_to_wire_requirements() {
+        let pipeline_requirement = AgentRequirement {
+            os: Some("linux".into()),
+            arch: Some("x86_64".into()),
+            docker: true,
+            labels: vec!["build".into()],
+            executors: Some(2),
+        };
+        let wire = AgentRequirements::from(&pipeline_requirement);
+        assert_eq!(wire.os.as_deref(), Some("linux"));
+        assert_eq!(wire.arch.as_deref(), Some("x86_64"));
+        assert!(wire.docker);
+        assert_eq!(wire.labels, ["build"]);
+        assert_eq!(wire.executors, Some(2));
     }
 
     #[test]

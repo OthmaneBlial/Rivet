@@ -523,6 +523,7 @@ pub fn generate_rivetfile_draft(source: &str) -> Result<RivetfileDraft, Migratio
             working_dir: None,
             timeout_seconds: None,
             container: None,
+            agent: None,
         });
     }
 
