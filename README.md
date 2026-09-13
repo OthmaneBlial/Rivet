@@ -5,14 +5,14 @@ from Jenkins.
 
 ## Delivery progress
 
-**29% verified** · `██████░░░░░░░░░░░░`<br>
+**35% verified** · `███████░░░░░░░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
 and unverified work remains at zero until it passes its gate.
 
 Last verified update: **2026-09-13** · native pipeline execution, FIFO queue,
-SQLite history, CLI workflow, and headless API milestone.
+SQLite history, CLI workflow, headless API, and Tauri desktop/logo milestone.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument

@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **29 / 100 points**.
+The current verified total is **35 / 100 points**.
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
@@ -16,7 +16,7 @@ The current verified total is **29 / 100 points**.
 | SQLite persistence | 6 | verified | Migration, build graph projection, reopen/history test |
 | API and live transport | 6 | partial | REST/loopback WebSocket work; auth, replay, and deployment hardening remain |
 | CLI operator workflow | 3 | partial | project/run/history work; richer cancellation and inspection remain |
-| Tauri desktop control room | 10 | planned | native build, real API flow, rendered UX and runtime checks |
+| Tauri desktop control room | 10 | partial | native bundle, embedded engine health, rendered UX and real client build flow pass; final Tauri-window flow remains |
 | Git/SCM integration | 8 | planned | checkout, fetch, credentials, clean workspace, provider-neutral hooks |
 | Triggers and scheduling | 5 | planned | manual, webhook, API, cron, upstream triggers with deterministic tests |
 | Remote agents | 10 | planned | authenticated versioned protocol, heartbeat, assignment, reconnect, failure handling |
@@ -37,6 +37,6 @@ states. “Planned” is zero progress, “partial” receives only the portion 
 by evidence, and “verified” receives the full workstream weight. A local build,
 scaffold, passing unrelated test, or interface alone does not complete a gate.
 
-The next gate is the Tauri desktop slice: compile the native shell, start the
-embedded engine, exercise project creation and a real build through the UI,
-then inspect the rendered desktop layout and console state.
+The next desktop gate is the final Tauri-window flow: exercise project creation
+and a real build inside the packaged window, then recheck runtime console state
+and the platform release path.
