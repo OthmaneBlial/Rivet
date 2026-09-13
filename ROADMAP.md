@@ -5,14 +5,14 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **50 / 100 points**.
+The current verified total is **51 / 100 points**.
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
 | Foundation and domain contracts | 4 | verified | Rust workspace, IDs, explicit state transitions, tests |
 | Pipeline definition and validation | 4 | verified | Versioned `Rivetfile.toml`, direct command arrays, validation tests |
 | Native process runner | 6 | verified | stdout/stderr streaming, timeout, cancellation, process-group cleanup tests |
-| Queue and scheduler | 6 | partial | FIFO, global/per-project limits, and live queue telemetry pass; priorities, resource requirements, and admin state remain |
+| Queue and scheduler | 6 | partial | FIFO, global/per-project limits, live telemetry, and pre-execution cancellation pass; priorities, resource requirements, and admin state remain |
 | SQLite persistence | 6 | verified | Migration, build graph projection, reopen/history test |
 | API and live transport | 6 | partial | REST/loopback WebSocket, durable event replay, queue telemetry, and build retry pass; auth and deployment hardening remain |
 | CLI operator workflow | 3 | partial | project/run/history, parameterized builds, artifact listing, and retry work; richer cancellation and inspection remain |

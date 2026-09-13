@@ -47,7 +47,7 @@
       "feature": "FIFO queue with global and per-project limits",
       "status": "partial",
       "evidence": ["crates/rivet-runner/src/scheduler.rs"],
-      "notes": "Priority, resource requirements, and observable queue administration remain planned."
+      "notes": "Queued cancellation is handled before execution; priority, resource requirements, and observable queue administration remain planned."
     },
     {
       "category": "Artifacts",
