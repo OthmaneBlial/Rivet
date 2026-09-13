@@ -5,8 +5,8 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **87 / 100 points** (**87.83 weighted evidence
-points**, displayed conservatively as 87%).
+The current verified total is **88 / 100 points** (**88.43 weighted evidence
+points**, displayed conservatively as 88%).
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |

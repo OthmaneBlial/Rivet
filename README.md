@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**87% verified** · `███████████████████░`<br>
-Weighted evidence score: **87.83 / 100** · displayed conservatively as the
+**88% verified** · `███████████████████░`<br>
+Weighted evidence score: **88.43 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
