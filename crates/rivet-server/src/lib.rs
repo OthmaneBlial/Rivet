@@ -68,9 +68,11 @@ use agent_registry::{
 };
 use workspace_archive::archive_workspace;
 
-const DEFAULT_ALLOWED_ORIGINS: [&str; 5] = [
+const DEFAULT_ALLOWED_ORIGINS: [&str; 7] = [
     "http://127.0.0.1:1420",
     "http://localhost:1420",
+    "http://127.0.0.1:1421",
+    "http://localhost:1421",
     "tauri://localhost",
     "http://tauri.localhost",
     "https://tauri.localhost",
@@ -6178,6 +6180,25 @@ program = "true"
                 .get("access-control-allow-origin")
                 .and_then(|value| value.to_str().ok()),
             Some("http://tauri.localhost")
+        );
+
+        let response = router(AppState::new(Storage::open_in_memory().expect("storage")))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .header("origin", "http://127.0.0.1:1421")
+                    .body(Body::empty())
+                    .expect("Vite fallback request"),
+            )
+            .await
+            .expect("Vite fallback response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("http://127.0.0.1:1421")
         );
 
         let response = router(AppState::new(Storage::open_in_memory().expect("storage")))

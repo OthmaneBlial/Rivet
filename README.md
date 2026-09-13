@@ -92,6 +92,10 @@ that the README percentage matches the weighted evidence calculation, that
 repository hygiene checks pass, and that no GitHub Actions workflow has been
 added.
 
+The loopback API allow-list includes the normal Vite origin (`1420`) and its
+local fallback (`1421`) plus the Tauri origins. Remote deployments must provide
+their own exact `--allow-origin` values and authentication.
+
 The deployment smoke checks public health/readiness, token-protected API
 routes, exact security/request-ID headers, rejects an unauthenticated public
 bind, verifies graceful SIGTERM shutdown, and checks that the token is absent
