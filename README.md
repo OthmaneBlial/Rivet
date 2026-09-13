@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **79% verified** · `███████████████▊░░░░`<br>
-Weighted evidence score: **79.67 / 100** · displayed conservatively as the
+Weighted evidence score: **79.97 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -39,8 +39,10 @@ runner, and relay typed events, output, and cancellation. Remote artifact
 bundles now return through a bounded, checksum-verified channel. If the assigned
 agent disconnects, the server makes at most one replacement-agent attempt and
 closes unfinished steps, stages, and builds as failed when recovery is
-unavailable; durable recovery across a server restart and richer retry policy
-remain future gates.
+unavailable. On startup, persisted incomplete builds are reconciled
+idempotently so a crashed server cannot leave history stuck forever; resuming
+the same remote attempt after restart and richer retry policy remain future
+gates.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument

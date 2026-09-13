@@ -557,8 +557,16 @@ pub async fn serve_with_listener(
         (None, None) => None,
         _ => return Err(ServerError::IncompleteCredentialVaultConfig),
     };
+    let storage = Storage::open(storage_path)?;
+    let recovered_builds = storage.recover_incomplete_builds(Utc::now())?;
+    for build_id in &recovered_builds {
+        tracing::warn!(
+            %build_id,
+            "reconciled an incomplete build left by a previous server process"
+        );
+    }
     let mut state = AppState::with_security(
-        Storage::open(storage_path)?,
+        storage,
         config.auth_token.as_deref(),
         config.webhook_secret.as_deref(),
         credentials,

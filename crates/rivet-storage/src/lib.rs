@@ -774,6 +774,66 @@ impl Storage {
         Ok(())
     }
 
+    /// Reconcile work that was in flight when the owning process stopped.
+    ///
+    /// The event log remains the source of truth: unfinished steps and stages
+    /// receive terminal cancellation events first, then the build receives a
+    /// terminal event that is legal for its last persisted state. Running work
+    /// is marked failed because no process supervisor survived the restart;
+    /// pending and queued work is marked cancelled. Re-running this method is
+    /// safe because terminal builds are ignored.
+    pub fn recover_incomplete_builds(
+        &self,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Vec<BuildId>, StorageError> {
+        let builds = self.list_incomplete_builds()?;
+        let mut recovered = Vec::new();
+        for build in builds {
+            let Some(details) = self.get_build_details(build.id)? else {
+                continue;
+            };
+            for stage in &details.stages {
+                for step in &stage.steps {
+                    if !step.status.is_terminal() {
+                        self.apply_event(&BuildEvent::StepFinished {
+                            build_id: build.id,
+                            stage_id: stage.stage.id,
+                            step_id: step.id,
+                            step_name: step.name.clone(),
+                            status: StepStatus::Cancelled,
+                            exit_code: None,
+                            timestamp,
+                        })?;
+                    }
+                }
+                if !stage.stage.status.is_terminal() {
+                    self.apply_event(&BuildEvent::StageFinished {
+                        build_id: build.id,
+                        stage_id: stage.stage.id,
+                        stage_name: stage.stage.name.clone(),
+                        status: StageStatus::Cancelled,
+                        timestamp,
+                    })?;
+                }
+            }
+            let terminal = match build.status {
+                BuildStatus::Pending | BuildStatus::Queued => BuildEvent::BuildCancelled {
+                    build_id: build.id,
+                    timestamp,
+                },
+                BuildStatus::Running => BuildEvent::BuildFinished {
+                    build_id: build.id,
+                    status: BuildStatus::Failed,
+                    timestamp,
+                },
+                BuildStatus::Passed | BuildStatus::Failed | BuildStatus::Cancelled => continue,
+            };
+            self.apply_event(&terminal)?;
+            recovered.push(build.id);
+        }
+        Ok(recovered)
+    }
+
     pub fn list_builds(&self, project_id: ProjectId) -> Result<Vec<BuildRecord>, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
@@ -783,6 +843,21 @@ impl Storage {
              FROM builds WHERE project_id = ?1 ORDER BY number DESC",
         )?;
         let rows = statement.query_map(params![project_id.to_string()], raw_build)?;
+        rows.map(|row| row.map_err(StorageError::from).and_then(parse_build))
+            .collect()
+    }
+
+    pub fn list_incomplete_builds(&self) -> Result<Vec<BuildRecord>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT id, project_id, number, status, queued_at, started_at, finished_at,
+                    source_provider, source_revision, source_reference, source_remote, source_dirty,
+                    parameters_json
+             FROM builds
+             WHERE status IN ('pending', 'queued', 'running')
+             ORDER BY queued_at ASC, number ASC",
+        )?;
+        let rows = statement.query_map([], raw_build)?;
         rows.map(|row| row.map_err(StorageError::from).and_then(parse_build))
             .collect()
     }
@@ -1733,6 +1808,125 @@ program = "true"
                 .expect("reopened delivery")
                 .build_number,
             Some(build.number)
+        );
+    }
+
+    #[test]
+    fn restart_recovery_closes_incomplete_builds_and_is_idempotent() {
+        let directory = tempdir().expect("tempdir");
+        let database = directory.path().join("rivet.db");
+        let (project, pipeline, _) = fixture();
+        let storage = Storage::open(&database).expect("open");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+
+        let queued_plan = ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), project.id);
+        let queued = storage
+            .create_build(&project, &queued_plan, &pipeline, None)
+            .expect("queued build");
+        storage
+            .apply_event(&BuildEvent::BuildQueued {
+                build_id: queued.id,
+                project_id: project.id,
+                timestamp: Utc::now(),
+            })
+            .expect("queue build");
+
+        let running_plan = ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), project.id);
+        let running = storage
+            .create_build(&project, &running_plan, &pipeline, None)
+            .expect("running build");
+        let stage = &running_plan.stages[0];
+        let step = &stage.steps[0];
+        storage
+            .apply_event(&BuildEvent::BuildQueued {
+                build_id: running.id,
+                project_id: project.id,
+                timestamp: Utc::now(),
+            })
+            .expect("queue running build");
+        storage
+            .apply_event(&BuildEvent::BuildStarted {
+                build_id: running.id,
+                timestamp: Utc::now(),
+            })
+            .expect("start running build");
+        storage
+            .apply_event(&BuildEvent::StageStarted {
+                build_id: running.id,
+                stage_id: stage.id,
+                stage_name: stage.name.clone(),
+                timestamp: Utc::now(),
+            })
+            .expect("start stage");
+        storage
+            .apply_event(&BuildEvent::StepStarted {
+                build_id: running.id,
+                stage_id: stage.id,
+                step_id: step.id,
+                step_name: step.definition.name.clone(),
+                timestamp: Utc::now(),
+            })
+            .expect("start step");
+
+        let recovered_at = Utc::now();
+        assert_eq!(
+            storage
+                .recover_incomplete_builds(recovered_at)
+                .expect("recover")
+                .len(),
+            2
+        );
+        assert!(
+            storage
+                .recover_incomplete_builds(recovered_at)
+                .expect("idempotent recovery")
+                .is_empty()
+        );
+
+        let queued_details = storage
+            .get_build_details(queued.id)
+            .expect("queued details")
+            .expect("queued build exists");
+        assert_eq!(queued_details.build.status, BuildStatus::Cancelled);
+        assert!(queued_details.stages[0].stage.status.is_terminal());
+        assert!(queued_details.stages[0].steps[0].status.is_terminal());
+
+        let running_details = storage
+            .get_build_details(running.id)
+            .expect("running details")
+            .expect("running build exists");
+        assert_eq!(running_details.build.status, BuildStatus::Failed);
+        assert_eq!(
+            running_details.stages[0].steps[0].status,
+            StepStatus::Cancelled
+        );
+        assert_eq!(
+            running_details.stages[0].stage.status,
+            StageStatus::Cancelled
+        );
+
+        drop(storage);
+        let reopened = Storage::open(&database).expect("reopen");
+        assert!(
+            reopened
+                .list_incomplete_builds()
+                .expect("incomplete")
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .events(running.id)
+                .expect("replayed events")
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    BuildEvent::BuildFinished {
+                        status: BuildStatus::Failed,
+                        ..
+                    }
+                ))
         );
     }
 }
