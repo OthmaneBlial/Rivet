@@ -115,6 +115,8 @@ pub enum StorageError {
     InvalidSessionPrincipal,
     #[error("authentication session role is invalid")]
     InvalidSessionRole,
+    #[error("invalid remote recovery attempt count in database: {0}")]
+    InvalidRemoteRecoveryAttempts(i64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -261,6 +263,7 @@ pub struct RemoteAttemptRecord {
     pub pipeline: Pipeline,
     pub parameters: BTreeMap<String, String>,
     pub created_at: DateTime<Utc>,
+    pub recovery_attempts: usize,
 }
 
 impl Storage {
@@ -348,6 +351,13 @@ impl Storage {
             &connection,
             12,
             Some(include_str!("../migrations/012_build_annotations.sql")),
+        )?;
+        apply_migration(
+            &connection,
+            13,
+            Some(include_str!(
+                "../migrations/013_remote_attempt_recovery.sql"
+            )),
         )?;
         backfill_event_hashes(&connection)?;
         Ok(Self {
@@ -893,6 +903,7 @@ impl Storage {
             pipeline: pipeline.clone(),
             parameters: pipeline.redact_parameters(parameters),
             created_at: Utc::now(),
+            recovery_attempts: 0,
         };
         let plan_json = serde_json::to_string(&record.plan)?;
         let pipeline_json = serde_json::to_string(&record.pipeline)?;
@@ -902,7 +913,8 @@ impl Storage {
             "INSERT INTO remote_attempts(
                 build_id, project_id, agent_id, requirements_json,
                 plan_json, pipeline_json, parameters_json, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                , recovery_attempts
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 record.build_id.to_string(),
                 record.project_id.to_string(),
@@ -912,6 +924,7 @@ impl Storage {
                 pipeline_json,
                 parameters_json,
                 record.created_at.to_rfc3339(),
+                record.recovery_attempts as i64,
             ],
         )?;
         Ok(record)
@@ -921,7 +934,8 @@ impl Storage {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
             "SELECT build_id, project_id, agent_id, requirements_json,
-                    plan_json, pipeline_json, parameters_json, created_at
+                    plan_json, pipeline_json, parameters_json, created_at,
+                    recovery_attempts
              FROM remote_attempts ORDER BY created_at ASC, build_id ASC",
         )?;
         let rows = statement.query_map([], raw_remote_attempt)?;
@@ -938,6 +952,58 @@ impl Storage {
             "DELETE FROM remote_attempts WHERE build_id = ?1",
             params![build_id.to_string()],
         )? == 1)
+    }
+
+    /// Persist the agent selected for the current remote attempt without
+    /// consuming a recovery slot. This is used when the first post-restart
+    /// dispatch has to choose a compatible replacement before execution starts.
+    pub fn set_remote_attempt_agent(
+        &self,
+        build_id: BuildId,
+        agent_id: Uuid,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(connection.execute(
+            "UPDATE remote_attempts SET agent_id = ?1 WHERE build_id = ?2",
+            params![agent_id.to_string(), build_id.to_string()],
+        )? == 1)
+    }
+
+    /// Persist the agent selected for the next bounded recovery attempt.
+    ///
+    /// The update is conditional so two recovery dispatchers sharing the same
+    /// database cannot both consume the same retry budget. The returned count
+    /// is the durable number of replacements already committed.
+    pub fn advance_remote_attempt(
+        &self,
+        build_id: BuildId,
+        agent_id: Uuid,
+        max_recovery_attempts: usize,
+    ) -> Result<Option<usize>, StorageError> {
+        let max_recovery_attempts = i64::try_from(max_recovery_attempts)
+            .map_err(|_| StorageError::InvalidRemoteRecoveryAttempts(i64::MAX))?;
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "UPDATE remote_attempts
+             SET agent_id = ?1, recovery_attempts = recovery_attempts + 1
+             WHERE build_id = ?2 AND recovery_attempts < ?3",
+            params![
+                agent_id.to_string(),
+                build_id.to_string(),
+                max_recovery_attempts
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let attempts: i64 = connection.query_row(
+            "SELECT recovery_attempts FROM remote_attempts WHERE build_id = ?1",
+            params![build_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let attempts = usize::try_from(attempts)
+            .map_err(|_| StorageError::InvalidRemoteRecoveryAttempts(attempts))?;
+        Ok(Some(attempts))
     }
 
     pub fn apply_event(&self, event: &BuildEvent) -> Result<(), StorageError> {
@@ -1639,6 +1705,7 @@ type RawRemoteAttempt = (
     String,
     String,
     String,
+    i64,
 );
 
 fn validate_audit_field(value: &str, field: &'static str) -> Result<(), StorageError> {
@@ -1774,10 +1841,13 @@ fn raw_remote_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRemoteAtte
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
+        row.get(8)?,
     ))
 }
 
 fn parse_remote_attempt(raw: RawRemoteAttempt) -> Result<RemoteAttemptRecord, StorageError> {
+    let recovery_attempts =
+        usize::try_from(raw.8).map_err(|_| StorageError::InvalidRemoteRecoveryAttempts(raw.8))?;
     Ok(RemoteAttemptRecord {
         build_id: parse_uuid(&raw.0)?,
         project_id: parse_uuid(&raw.1)?,
@@ -1787,6 +1857,7 @@ fn parse_remote_attempt(raw: RawRemoteAttempt) -> Result<RemoteAttemptRecord, St
         pipeline: serde_json::from_str(&raw.5)?,
         parameters: serde_json::from_str(&raw.6)?,
         created_at: parse_timestamp(&raw.7)?,
+        recovery_attempts,
     })
 }
 
@@ -2834,7 +2905,24 @@ program = "true"
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].build_id, build.id);
         assert_eq!(attempts[0].agent_id, agent_id);
+        assert_eq!(attempts[0].recovery_attempts, 0);
         assert_eq!(attempts[0].parameters, parameters);
+        let replacement_agent = Uuid::new_v4();
+        assert_eq!(
+            reopened
+                .advance_remote_attempt(build.id, replacement_agent, 1)
+                .expect("advance remote attempt"),
+            Some(1)
+        );
+        assert_eq!(
+            reopened
+                .advance_remote_attempt(build.id, Uuid::new_v4(), 1)
+                .expect("bounded remote attempt"),
+            None
+        );
+        let advanced = reopened.list_remote_attempts().expect("advanced attempt");
+        assert_eq!(advanced[0].agent_id, replacement_agent);
+        assert_eq!(advanced[0].recovery_attempts, 1);
         assert!(
             reopened
                 .recover_incomplete_builds_except(Utc::now(), &BTreeSet::from([build.id]),)

@@ -2941,24 +2941,50 @@ fn spawn_remote_recovery_dispatcher(
                             .await
                         {
                             Ok(reservation) => reservation,
-                            Err(AgentRegistryError::NoMatchingAgent) => match state
-                                .agents
-                                .reserve(&requirements, build_id, Utc::now())
-                                .await
-                            {
-                                Ok(reservation) => reservation,
-                                Err(AgentRegistryError::NoMatchingAgent) => continue,
-                                Err(error) => {
-                                    tracing::debug!(?error, %build_id, "no replacement agent is ready for remote recovery");
-                                    continue;
-                                }
-                            },
+                            Err(AgentRegistryError::NoMatchingAgent)
+                                if attempt.recovery_attempts == 0 => match state
+                                    .agents
+                                    .reserve(&requirements, build_id, Utc::now())
+                                    .await
+                                {
+                                    Ok(reservation) => reservation,
+                                    Err(AgentRegistryError::NoMatchingAgent) => continue,
+                                    Err(error) => {
+                                        tracing::debug!(?error, %build_id, "no replacement agent is ready for remote recovery");
+                                        continue;
+                                    }
+                                },
+                            Err(AgentRegistryError::NoMatchingAgent) => {
+                                // Once a replacement has been committed, a
+                                // restart must resume that exact durable
+                                // attempt instead of silently consuming a
+                                // second replacement slot.
+                                continue;
+                            }
                             Err(AgentRegistryError::ReservationConflict(_)) => continue,
                             Err(error) => {
                                 tracing::debug!(?error, %build_id, "original agent is not ready for remote recovery");
                                 continue;
                             }
                         };
+                        if reservation.agent_id != attempt.agent_id {
+                            match state
+                                .storage
+                                .set_remote_attempt_agent(build_id, reservation.agent_id)
+                            {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    state.agents.release(&reservation).await;
+                                    tracing::debug!(%build_id, "remote recovery attempt disappeared before agent handoff");
+                                    continue;
+                                }
+                                Err(error) => {
+                                    state.agents.release(&reservation).await;
+                                    tracing::error!(?error, %build_id, "could not persist remote recovery agent handoff");
+                                    continue;
+                                }
+                            }
+                        }
                         let Some(project) = (match state.storage.get_project_by_id(attempt.project_id) {
                             Ok(project) => project,
                             Err(error) => {
@@ -3526,6 +3552,8 @@ fn remote_agent_requirements(pipeline: &Pipeline) -> Result<Option<AgentRequirem
 enum RemoteBuildError {
     #[error("remote agent transport failed: {0}")]
     Agent(#[from] AgentRegistryError),
+    #[error("remote recovery state could not be persisted: {0}")]
+    Storage(#[from] StorageError),
     #[error("workspace archive failed: {0}")]
     WorkspaceArchive(String),
     #[error("remote build event channel closed")]
@@ -3546,6 +3574,8 @@ enum RemoteBuildError {
     Cancelled,
     #[error("remote artifact transfer failed: {0}")]
     Artifact(String),
+    #[error("remote build {0} exhausted its durable recovery budget")]
+    RecoveryBudgetExhausted(BuildId),
 }
 
 struct RemoteArtifactReceiver {
@@ -3654,7 +3684,29 @@ async fn run_remote_build_with_recovery(
                     .reserve(&requirements, plan.build_id, Utc::now())
                     .await;
                 reservation = match replacement {
-                    Ok(reservation) => reservation,
+                    Ok(reservation) => {
+                        match state.storage.advance_remote_attempt(
+                            plan.build_id,
+                            reservation.agent_id,
+                            MAX_REMOTE_RECOVERY_ATTEMPTS,
+                        )? {
+                            Some(_) => reservation,
+                            None => {
+                                state.agents.release(&reservation).await;
+                                finish_remote_failed(
+                                    &plan,
+                                    &events,
+                                    &active_stages,
+                                    &active_steps,
+                                    build_started,
+                                )
+                                .await?;
+                                return Err(RemoteBuildError::RecoveryBudgetExhausted(
+                                    plan.build_id,
+                                ));
+                            }
+                        }
+                    }
                     Err(error) => {
                         finish_remote_failed(
                             &plan,
@@ -6094,7 +6146,7 @@ agent = { os = "macos", arch = "aarch64", labels = ["recovery"] }
             labels: vec!["recovery".into()],
             ..AgentRequirements::default()
         };
-        let attempt = storage
+        let _attempt = storage
             .create_remote_attempt(
                 build.id,
                 project.id,
@@ -6105,6 +6157,21 @@ agent = { os = "macos", arch = "aarch64", labels = ["recovery"] }
                 &BTreeMap::new(),
             )
             .expect("remote attempt");
+        let replacement_agent = uuid::Uuid::new_v4();
+        assert_eq!(
+            storage
+                .advance_remote_attempt(build.id, replacement_agent, 1)
+                .expect("persist replacement recovery slot"),
+            Some(1)
+        );
+        let attempt = storage
+            .list_remote_attempts()
+            .expect("reload remote attempt")
+            .into_iter()
+            .next()
+            .expect("reloaded attempt");
+        assert_eq!(attempt.agent_id, replacement_agent);
+        assert_eq!(attempt.recovery_attempts, 1);
         let state = AppState::new(storage);
         let (outbound, mut received) = mpsc::channel(16);
         state

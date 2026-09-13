@@ -54,15 +54,18 @@ projection also ignores exact redelivery of an already recorded domain event by
 its SHA-256 identity. If the assigned
 agent disconnects, the server makes at most one replacement-agent attempt and
 closes unfinished steps, stages, and builds as failed when recovery is
-unavailable. Steps may also use a bounded, cancellation-aware retry policy
-shared by local and assigned-agent execution. On startup, persisted incomplete
-builds are reconciled idempotently so a crashed server cannot leave history
-stuck forever. Non-secret remote attempts additionally retain their plan and
-redacted parameters and are redispatched with the same build identity when a
-compatible agent returns; attempts that require secret values fail closed.
+unavailable. That replacement budget and the selected replacement agent now
+survive a server restart, so recovery cannot silently reset its retry limit.
+Steps may also use a bounded, cancellation-aware retry policy shared by local
+and assigned-agent execution. On startup, persisted incomplete builds are
+reconciled idempotently so a crashed server cannot leave history stuck forever.
+Non-secret remote attempts additionally retain their plan and redacted
+parameters and are redispatched with the same build identity when a compatible
+agent returns; attempts that require secret values fail closed.
 Bounded session-scoped agent delivery now uses versioned delivery IDs, ACKs,
 duplicate suppression, and timed retransmission; durable cross-restart
-exactly-once delivery and retry recovery remain future gates. Authenticated deployments persist bounded success/failure audit records
+exactly-once delivery remains a future gate; bounded retry recovery is now
+durable locally. Authenticated deployments persist bounded success/failure audit records
 without request bodies or Bearer values and expose them only to administrators.
 Server deployments can exchange an authenticated API token for a twelve-hour
 opaque session token; only its SHA-256 digest and scoped principal snapshot are
@@ -484,11 +487,13 @@ with the shared Rust runner, and persists the agent's typed build events and out
 Cancellation is propagated to the agent, and declared artifacts return through
 the same bounded transfer with checksum verification before local storage.
 After an agent disconnect, the server makes one bounded replacement attempt and
-persists a terminal failed state when no replacement is available. Non-secret
+persists a terminal failed state when no replacement is available. The bounded
+replacement budget and selected agent are persisted, so a server restart
+resumes the current recovery slot instead of granting another one. Non-secret
 remote attempts can also be preserved and redispatched with the same build
 identity after a server restart; session-scoped delivery IDs, ACKs, duplicate
 suppression, and timed retransmission are covered locally, while durable
-cross-restart exactly-once guarantees and retry recovery remain future gates.
+cross-restart exactly-once delivery remains a future gate.
 
 Connect a worker for heartbeat and capability discovery:
 
