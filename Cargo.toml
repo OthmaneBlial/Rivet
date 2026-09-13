@@ -2,6 +2,7 @@
 members = [
     "crates/rivet-core",
     "crates/rivet-agent-protocol",
+    "crates/rivet-credentials",
     "crates/rivet-migration",
     "crates/rivet-runner",
     "crates/rivet-scm",
@@ -18,6 +19,10 @@ license = "Apache-2.0"
 repository = "https://github.com/OthmaneBlial/Rivet"
 
 [workspace.dependencies]
+aes-gcm = "0.11.1"
+argon2 = "0.6"
+base64 = "0.22"
+getrandom = "0.3"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
 cron = "0.17"

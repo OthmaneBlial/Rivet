@@ -1,0 +1,556 @@
+//! Passphrase-encrypted local credentials for provider integrations.
+//!
+//! The vault stores only authenticated ciphertext on disk. A caller must
+//! provide the passphrase at runtime; the decrypted credentials are kept in
+//! memory and are intentionally omitted from `Debug` output and metadata.
+
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
+use argon2::Argon2;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
+
+const VAULT_VERSION: u8 = 1;
+const KDF_NAME: &str = "argon2id-v1-default";
+const AAD: &[u8] = b"rivet-credentials-v1";
+const SALT_BYTES: usize = 16;
+const NONCE_BYTES: usize = 12;
+const KEY_BYTES: usize = 32;
+const MIN_PASSPHRASE_BYTES: usize = 12;
+const MAX_ID_BYTES: usize = 64;
+const MAX_USERNAME_BYTES: usize = 256;
+
+#[derive(Debug, Error)]
+pub enum CredentialError {
+    #[error("credential vault path is a symbolic link: {0}")]
+    SymlinkPath(PathBuf),
+    #[error("credential vault file was not found: {0}")]
+    VaultNotFound(PathBuf),
+    #[error("credential vault is not a regular file: {0}")]
+    VaultNotAFile(PathBuf),
+    #[error("credential vault passphrase must contain at least {MIN_PASSPHRASE_BYTES} bytes")]
+    WeakPassphrase,
+    #[error("credential ID is invalid: {0}")]
+    InvalidId(String),
+    #[error("credential username is empty or too long")]
+    InvalidUsername,
+    #[error("credential secret cannot be empty")]
+    EmptySecret,
+    #[error("credential was not found: {0}")]
+    CredentialNotFound(String),
+    #[error("credential vault format is invalid: {0}")]
+    InvalidFormat(String),
+    #[error("credential vault encryption or passphrase verification failed")]
+    Cryptography,
+    #[error("randomness source failed: {0}")]
+    Randomness(String),
+    #[error("credential vault serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("credential vault filesystem operation failed: {0}")]
+    Filesystem(#[from] std::io::Error),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct Credential {
+    id: String,
+    username: String,
+    secret: String,
+}
+
+impl Credential {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn secret(&self) -> &str {
+        &self.secret
+    }
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Credential")
+            .field("id", &self.id)
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Credential {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CredentialSummary {
+    pub id: String,
+    pub username: String,
+}
+
+pub struct CredentialVault {
+    path: PathBuf,
+    passphrase: Zeroizing<Vec<u8>>,
+    credentials: BTreeMap<String, Credential>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EncryptedVault {
+    version: u8,
+    kdf: String,
+    salt: String,
+    nonce: String,
+    ciphertext: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct VaultPayload {
+    version: u8,
+    credentials: BTreeMap<String, VaultCredential>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct VaultCredential {
+    username: String,
+    secret: String,
+}
+
+impl Drop for VaultCredential {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+impl fmt::Debug for CredentialVault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CredentialVault")
+            .field("path", &self.path)
+            .field(
+                "credential_ids",
+                &self.credentials.keys().collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl CredentialVault {
+    /// Open an existing encrypted vault.
+    pub fn open(
+        path: impl AsRef<Path>,
+        passphrase: impl AsRef<[u8]>,
+    ) -> Result<Self, CredentialError> {
+        let path = path.as_ref().to_path_buf();
+        validate_passphrase(passphrase.as_ref())?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                CredentialError::VaultNotFound(path.clone())
+            } else {
+                CredentialError::Filesystem(error)
+            }
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(CredentialError::SymlinkPath(path));
+        }
+        if !metadata.is_file() {
+            return Err(CredentialError::VaultNotAFile(path));
+        }
+        let bytes = fs::read(&path)?;
+        let encrypted: EncryptedVault = serde_json::from_slice(&bytes)?;
+        let plaintext = decrypt_vault(&encrypted, passphrase.as_ref())?;
+        let payload: VaultPayload = serde_json::from_slice(&plaintext)?;
+        if payload.version != VAULT_VERSION {
+            return Err(CredentialError::InvalidFormat(format!(
+                "unsupported payload version {}; expected {VAULT_VERSION}",
+                payload.version
+            )));
+        }
+        let credentials = payload
+            .credentials
+            .into_iter()
+            .map(|(id, credential)| {
+                validate_id(&id)?;
+                validate_username(&credential.username)?;
+                if credential.secret.is_empty() {
+                    return Err(CredentialError::EmptySecret);
+                }
+                Ok((
+                    id.clone(),
+                    Credential {
+                        id,
+                        username: credential.username.clone(),
+                        secret: credential.secret.clone(),
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, CredentialError>>()?;
+        Ok(Self {
+            path,
+            passphrase: Zeroizing::new(passphrase.as_ref().to_vec()),
+            credentials,
+        })
+    }
+
+    /// Open a vault, creating an encrypted empty vault when it does not exist.
+    pub fn open_or_create(
+        path: impl AsRef<Path>,
+        passphrase: impl AsRef<[u8]>,
+    ) -> Result<Self, CredentialError> {
+        let path = path.as_ref().to_path_buf();
+        validate_passphrase(passphrase.as_ref())?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(CredentialError::SymlinkPath(path))
+            }
+            Ok(_) => Self::open(path, passphrase),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let vault = Self {
+                    path,
+                    passphrase: Zeroizing::new(passphrase.as_ref().to_vec()),
+                    credentials: BTreeMap::new(),
+                };
+                vault.save()?;
+                Ok(vault)
+            }
+            Err(error) => Err(CredentialError::Filesystem(error)),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Return metadata without exposing the credential secret.
+    pub fn list(&self) -> Vec<CredentialSummary> {
+        self.credentials
+            .values()
+            .map(|credential| CredentialSummary {
+                id: credential.id.clone(),
+                username: credential.username.clone(),
+            })
+            .collect()
+    }
+
+    pub fn get(&self, id: &str) -> Result<Credential, CredentialError> {
+        validate_id(id)?;
+        self.credentials
+            .get(id)
+            .cloned()
+            .ok_or_else(|| CredentialError::CredentialNotFound(id.to_owned()))
+    }
+
+    /// Store or replace an HTTP basic credential and immediately persist it.
+    pub fn set_http_basic(
+        &mut self,
+        id: impl Into<String>,
+        username: impl Into<String>,
+        secret: impl Into<String>,
+    ) -> Result<(), CredentialError> {
+        let id = id.into();
+        let username = username.into();
+        let secret = secret.into();
+        validate_id(&id)?;
+        validate_username(&username)?;
+        if secret.is_empty() {
+            return Err(CredentialError::EmptySecret);
+        }
+        let previous = self.credentials.insert(
+            id.clone(),
+            Credential {
+                id: id.clone(),
+                username,
+                secret,
+            },
+        );
+        if let Err(error) = self.save() {
+            if let Some(previous) = previous {
+                self.credentials.insert(id, previous);
+            } else {
+                self.credentials.remove(&id);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn remove(&mut self, id: &str) -> Result<(), CredentialError> {
+        validate_id(id)?;
+        let Some(previous) = self.credentials.remove(id) else {
+            return Err(CredentialError::CredentialNotFound(id.to_owned()));
+        };
+        if let Err(error) = self.save() {
+            self.credentials.insert(id.to_owned(), previous);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn save(&self) -> Result<(), CredentialError> {
+        let payload = VaultPayload {
+            version: VAULT_VERSION,
+            credentials: self
+                .credentials
+                .iter()
+                .map(|(id, credential)| {
+                    (
+                        id.clone(),
+                        VaultCredential {
+                            username: credential.username.clone(),
+                            secret: credential.secret.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let plaintext = serde_json::to_vec(&payload)?;
+        let encrypted = encrypt_vault(&plaintext, &self.passphrase)?;
+        let bytes = serde_json::to_vec_pretty(&encrypted)?;
+        write_atomic(&self.path, &bytes)
+    }
+}
+
+fn validate_passphrase(passphrase: &[u8]) -> Result<(), CredentialError> {
+    if passphrase.len() < MIN_PASSPHRASE_BYTES {
+        Err(CredentialError::WeakPassphrase)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_id(id: &str) -> Result<(), CredentialError> {
+    if id.is_empty()
+        || id.len() > MAX_ID_BYTES
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(CredentialError::InvalidId(id.to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_username(username: &str) -> Result<(), CredentialError> {
+    if username.is_empty() || username.len() > MAX_USERNAME_BYTES || username.contains('\0') {
+        Err(CredentialError::InvalidUsername)
+    } else {
+        Ok(())
+    }
+}
+
+fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; KEY_BYTES], CredentialError> {
+    validate_passphrase(passphrase)?;
+    let mut key = [0u8; KEY_BYTES];
+    Argon2::default()
+        .hash_password_into(passphrase, salt, &mut key)
+        .map_err(|_| CredentialError::Cryptography)?;
+    Ok(key)
+}
+
+fn encrypt_vault(plaintext: &[u8], passphrase: &[u8]) -> Result<EncryptedVault, CredentialError> {
+    let mut salt = [0u8; SALT_BYTES];
+    let mut nonce = [0u8; NONCE_BYTES];
+    getrandom::fill(&mut salt).map_err(|error| CredentialError::Randomness(error.to_string()))?;
+    getrandom::fill(&mut nonce).map_err(|error| CredentialError::Randomness(error.to_string()))?;
+    let key = derive_key(passphrase, &salt)?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| CredentialError::Cryptography)?;
+    let nonce = Nonce::try_from(&nonce[..]).map_err(|_| CredentialError::Cryptography)?;
+    let ciphertext = cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad: AAD,
+            },
+        )
+        .map_err(|_| CredentialError::Cryptography)?;
+    Ok(EncryptedVault {
+        version: VAULT_VERSION,
+        kdf: KDF_NAME.to_owned(),
+        salt: hex::encode(salt),
+        nonce: hex::encode(nonce),
+        ciphertext: hex::encode(ciphertext),
+    })
+}
+
+fn decrypt_vault(
+    encrypted: &EncryptedVault,
+    passphrase: &[u8],
+) -> Result<Vec<u8>, CredentialError> {
+    if encrypted.version != VAULT_VERSION {
+        return Err(CredentialError::InvalidFormat(format!(
+            "unsupported vault version {}; expected {VAULT_VERSION}",
+            encrypted.version
+        )));
+    }
+    if encrypted.kdf != KDF_NAME {
+        return Err(CredentialError::InvalidFormat(format!(
+            "unsupported key derivation function {:?}",
+            encrypted.kdf
+        )));
+    }
+    let salt = decode_fixed_hex::<SALT_BYTES>(&encrypted.salt, "salt")?;
+    let nonce = decode_fixed_hex::<NONCE_BYTES>(&encrypted.nonce, "nonce")?;
+    let ciphertext = hex::decode(&encrypted.ciphertext)
+        .map_err(|_| CredentialError::InvalidFormat("ciphertext is not valid hex".into()))?;
+    if ciphertext.is_empty() {
+        return Err(CredentialError::InvalidFormat("ciphertext is empty".into()));
+    }
+    let key = derive_key(passphrase, &salt)?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| CredentialError::Cryptography)?;
+    let nonce = Nonce::try_from(&nonce[..]).map_err(|_| CredentialError::Cryptography)?;
+    cipher
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: ciphertext.as_ref(),
+                aad: AAD,
+            },
+        )
+        .map_err(|_| CredentialError::Cryptography)
+}
+
+fn decode_fixed_hex<const N: usize>(value: &str, field: &str) -> Result<[u8; N], CredentialError> {
+    let bytes = hex::decode(value)
+        .map_err(|_| CredentialError::InvalidFormat(format!("{field} is not valid hex")))?;
+    bytes.try_into().map_err(|_| {
+        CredentialError::InvalidFormat(format!("{field} must contain exactly {N} bytes"))
+    })
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CredentialError> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(CredentialError::SymlinkPath(path.to_path_buf()));
+        }
+        if !metadata.is_file() {
+            return Err(CredentialError::VaultNotAFile(path.to_path_buf()));
+        }
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    if fs::symlink_metadata(parent)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(CredentialError::SymlinkPath(parent.to_path_buf()));
+    }
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| CredentialError::InvalidFormat("vault path has no valid filename".into()))?;
+    let temporary = parent.join(format!(".{filename}.{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)]
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        if let Ok(directory) = File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok::<(), std::io::Error>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(CredentialError::Filesystem)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    const PASSPHRASE: &str = "local-vault-passphrase";
+
+    #[test]
+    fn vault_round_trips_without_plaintext_on_disk() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("credentials.vault");
+        let mut vault = CredentialVault::open_or_create(&path, PASSPHRASE).expect("create");
+        vault
+            .set_http_basic("github", "oauth2", "fixture-token-value")
+            .expect("set");
+        let raw = fs::read_to_string(&path).expect("read vault");
+        assert!(!raw.contains("fixture-token-value"));
+        assert!(!raw.contains("oauth2"));
+        drop(vault);
+
+        let vault = CredentialVault::open(&path, PASSPHRASE).expect("reopen");
+        let credential = vault.get("github").expect("credential");
+        assert_eq!(credential.username(), "oauth2");
+        assert_eq!(credential.secret(), "fixture-token-value");
+        assert_eq!(
+            vault.list(),
+            [CredentialSummary {
+                id: "github".into(),
+                username: "oauth2".into(),
+            }]
+        );
+        assert!(matches!(
+            CredentialVault::open(&path, "wrong-passphrase"),
+            Err(CredentialError::Cryptography)
+        ));
+    }
+
+    #[test]
+    fn invalid_entries_are_rejected_before_persistence() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("credentials.vault");
+        let mut vault = CredentialVault::open_or_create(&path, PASSPHRASE).expect("create");
+        assert!(matches!(
+            vault.set_http_basic("../escape", "user", "secret"),
+            Err(CredentialError::InvalidId(_))
+        ));
+        assert!(matches!(
+            vault.set_http_basic("valid", "", "secret"),
+            Err(CredentialError::InvalidUsername)
+        ));
+        assert!(matches!(
+            vault.set_http_basic("valid", "user", ""),
+            Err(CredentialError::EmptySecret)
+        ));
+        assert!(matches!(
+            CredentialVault::open_or_create(directory.path().join("weak.vault"), "short"),
+            Err(CredentialError::WeakPassphrase)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("credentials.vault");
+        CredentialVault::open_or_create(&path, PASSPHRASE).expect("create");
+        let mode = fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}
