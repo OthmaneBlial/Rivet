@@ -153,6 +153,13 @@
       "status": "partial",
       "evidence": ["crates/rivet-extension-protocol/src/lib.rs", "apps/desktop/src/extensionModel.ts", "apps/desktop/src/App.tsx"],
       "notes": "Manifests, explicit permissions, bounded length-prefixed JSON frames, a direct-argument subprocess host, bounded local catalog discovery/API, a desktop model, and a root-confined subprocess lifecycle manager with per-request permission enforcement are present. WASM execution and server/desktop lifecycle controls remain planned."
+    },
+    {
+      "category": "Differential testing",
+      "feature": "Normalized recorded behavior comparison",
+      "status": "partial",
+      "evidence": ["crates/rivet-compat/src/lib.rs", "crates/rivet-cli/src/main.rs", "compat/fixtures/sequential-build.json"],
+      "notes": "The local harness validates bounded JSON snapshots, normalizes provider status spelling, line endings, checksum prefixes, and redaction markers, then returns a non-zero result for semantic differences. Live Jenkins/Rivet capture adapters and a permanent live regression corpus remain planned."
     }
   ]
 }

@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **84% verified** · `████████████████▊░░░`<br>
-Weighted evidence score: **84.13 / 100** · displayed conservatively as the
+Weighted evidence score: **84.73 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -79,6 +79,7 @@ crates/
   rivet-cli/         local operator interface and first runnable slice
 apps/desktop/       Tauri client (next vertical slice)
 compat/             measured Jenkins/Rivet compatibility data
+rivet-compat/       normalized local behavior comparison harness
 ```
 
 ## Validate the current slice
@@ -184,6 +185,18 @@ legacy records without it remain non-expiring. Authenticated requests also
 produce bounded audit records available to administrators at
 `GET /api/v1/audit`; request bodies and Bearer values are never recorded. User
 accounts, sessions, and external identity providers remain future gates.
+
+Recorded Jenkins/Rivet behavior snapshots can be compared locally with the
+same explicit normalizer used by future live adapters:
+
+\`\`\`sh
+cargo run -p rivet -- compat compare ./compat/fixtures/sequential-build.json
+\`\`\`
+
+The command exits non-zero when normalized stage, step, parameter, artifact, or
+log semantics differ. The checked-in fixture exercises provider status spelling,
+CRLF handling, checksum prefixes, and redaction markers; live Jenkins/Rivet
+capture adapters and a permanent live regression corpus remain future gates.
 
 Extension manifests can be loaded by the headless server from an explicit
 local directory:

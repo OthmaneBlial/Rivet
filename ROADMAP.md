@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **84 / 100 points** (**84.13 weighted evidence
+The current verified total is **84 / 100 points** (**84.73 weighted evidence
 points**, displayed conservatively as 84%).
 
 | Workstream | Weight | Current state | Gate for completion |
@@ -28,7 +28,7 @@ points**, displayed conservatively as 84%).
 | Authentication and authorization | 4 | partial | protected remote transport with private Bearer tokens, policy-file token digests, roles, project scopes, route authorization, agent-connect permission checks, local token creation/listing/revocation, optional RFC3339 token expiration enforcement, and bounded admin-only authentication audit history pass; users, sessions, and external identity providers remain |
 | Extension protocol | 4 | partial | versioned manifest, WASM/subprocess kind model, declared permission vocabulary, bounded length-prefixed JSON framing, direct-argument subprocess host, bounded local catalog discovery/API, desktop extension model, and a root-confined subprocess lifecycle manager with per-request permission enforcement pass; WASM runtime and server/desktop lifecycle UI remain |
 | Jenkins migration analyzer | 3 | partial | bounded Jenkinsfile analysis, headless API delivery, rendered desktop report, and valid drafts for deterministic quoted shell steps pass; full Groovy parsing, plugin semantics, and broad generated Rivetfile conversion remain |
-| Differential compatibility harness | 2 | planned | normalized behavioral fixtures and permanent regressions |
+| Differential compatibility harness | 2 | partial | bounded JSON snapshots, explicit semantic normalization/comparison, mismatch exit status, and a checked-in regression fixture pass; live Jenkins/Rivet capture adapters and a permanent live regression corpus remain |
 | Release and operations | 2 | planned | packaging, observability, upgrades, recovery, security and load gates |
 
 ## Progress policy
@@ -42,7 +42,8 @@ The next gates are the WASM runtime and lifecycle UI, the final Tauri-window
 flow inside the packaged app, API
 deployment hardening, resuming remote attempts across server restart and
 richer retry policy, credential ownership/rotation/keychain integration, user
-sessions and external identity providers, pull-request and broader
+sessions and external identity providers, live compatibility capture adapters
+and a permanent differential regression corpus, pull-request and broader
 repository-event mapping, upstream triggers, full Groovy/plugin migration
 semantics, and generated Rivetfile conversion with fixture-backed migration
 regressions.
