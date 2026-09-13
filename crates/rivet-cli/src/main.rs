@@ -593,6 +593,14 @@ struct AgentArgs {
     /// Number of local executor slots advertised to the scheduler.
     #[arg(long, default_value_t = 1)]
     executors: u16,
+    /// Optional allocatable CPU capacity in cores. If omitted, CPU-specific
+    /// pipeline requirements will not match this agent.
+    #[arg(long)]
+    cpu_cores: Option<u16>,
+    /// Optional allocatable memory capacity in MiB. If omitted, memory-
+    /// specific pipeline requirements will not match this agent.
+    #[arg(long)]
+    memory_mb: Option<u64>,
     /// Read a Bearer token from a private file without persisting it.
     #[arg(long)]
     token_file: Option<PathBuf>,
@@ -837,6 +845,8 @@ async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
             docker: args.docker,
             labels: args.labels.clone(),
             executors: args.executors,
+            cpu_cores: args.cpu_cores,
+            memory_mb: args.memory_mb,
         },
     };
     registration.validate()?;

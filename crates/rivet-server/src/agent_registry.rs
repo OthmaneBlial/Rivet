@@ -37,6 +37,8 @@ pub struct AgentSummary {
     pub running: Vec<rivet_core::BuildId>,
     pub reserved: Vec<rivet_core::BuildId>,
     pub available_executors: u16,
+    pub available_cpu_cores: Option<u16>,
+    pub available_memory_mb: Option<u64>,
     pub status: AgentStatus,
 }
 
@@ -91,9 +93,16 @@ struct AgentEntry {
     last_heartbeat: DateTime<Utc>,
     last_sequence: u64,
     running: Vec<rivet_core::BuildId>,
-    reserved: HashMap<rivet_core::BuildId, u16>,
+    reserved: HashMap<rivet_core::BuildId, ReservedResources>,
     session_id: Uuid,
     outbound: Option<mpsc::Sender<AgentTransportMessage>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReservedResources {
+    executors: u16,
+    cpu_cores: u16,
+    memory_mb: u64,
 }
 
 impl Default for AgentRegistry {
@@ -219,7 +228,7 @@ impl AgentRegistry {
             .values()
             .filter(|entry| self.status(entry, now) == AgentStatus::Online)
             .filter(|entry| entry.capabilities.supports(requirements))
-            .filter(|entry| available_executors(entry) >= requirements.requested_executors())
+            .filter(|entry| resources_available(entry, requirements))
             .map(|entry| summary(entry, AgentStatus::Online))
             .collect();
         summaries.sort_by(|left, right| left.name.cmp(&right.name));
@@ -245,7 +254,7 @@ impl AgentRegistry {
             .values()
             .filter(|entry| self.status(entry, now) == AgentStatus::Online)
             .filter(|entry| entry.capabilities.supports(requirements))
-            .filter(|entry| available_executors(entry) >= requested)
+            .filter(|entry| resources_available(entry, requirements))
             .map(|entry| {
                 (
                     available_executors(entry),
@@ -267,7 +276,14 @@ impl AgentRegistry {
         let entry = agents
             .get_mut(&agent_id)
             .expect("matching agent remains in registry write lock");
-        entry.reserved.insert(build_id, requested);
+        entry.reserved.insert(
+            build_id,
+            ReservedResources {
+                executors: requested,
+                cpu_cores: requirements.requested_cpu_cores(),
+                memory_mb: requirements.requested_memory_mb(),
+            },
+        );
         Ok(AgentReservation {
             agent_id,
             session_id: entry.session_id,
@@ -295,9 +311,16 @@ impl AgentRegistry {
             .get_mut(&agent_id)
             .filter(|entry| self.status(entry, now) == AgentStatus::Online)
             .filter(|entry| entry.capabilities.supports(requirements))
-            .filter(|entry| available_executors(entry) >= requested)
+            .filter(|entry| resources_available(entry, requirements))
             .ok_or(AgentRegistryError::NoMatchingAgent)?;
-        entry.reserved.insert(build_id, requested);
+        entry.reserved.insert(
+            build_id,
+            ReservedResources {
+                executors: requested,
+                cpu_cores: requirements.requested_cpu_cores(),
+                memory_mb: requirements.requested_memory_mb(),
+            },
+        );
         Ok(AgentReservation {
             agent_id,
             session_id: entry.session_id,
@@ -383,6 +406,8 @@ fn summary(entry: &AgentEntry, status: AgentStatus) -> AgentSummary {
             reserved
         },
         available_executors: available_executors(entry),
+        available_cpu_cores: available_cpu_cores(entry),
+        available_memory_mb: available_memory_mb(entry),
         status,
     }
 }
@@ -391,7 +416,7 @@ fn available_executors(entry: &AgentEntry) -> u16 {
     let reserved_executors = entry
         .reserved
         .values()
-        .map(|executors| u32::from(*executors))
+        .map(|resources| u32::from(resources.executors))
         .sum::<u32>();
     let reserved_builds = entry.reserved.keys().collect::<HashSet<_>>();
     let running_executors = entry
@@ -404,6 +429,50 @@ fn available_executors(entry: &AgentEntry) -> u16 {
         .capabilities
         .executors
         .saturating_sub((reserved_executors + running_executors).min(u32::from(u16::MAX)) as u16)
+}
+
+fn resources_available(entry: &AgentEntry, requirements: &AgentRequirements) -> bool {
+    if available_executors(entry) < requirements.requested_executors() {
+        return false;
+    }
+    requirements.cpu_cores.is_none_or(|required| {
+        available_cpu_cores(entry).is_some_and(|available| available >= required)
+    }) && requirements.memory_mb.is_none_or(|required| {
+        available_memory_mb(entry).is_some_and(|available| available >= required)
+    })
+}
+
+fn has_unreserved_running_build(entry: &AgentEntry) -> bool {
+    entry
+        .running
+        .iter()
+        .any(|build_id| !entry.reserved.contains_key(build_id))
+}
+
+fn available_cpu_cores(entry: &AgentEntry) -> Option<u16> {
+    let capacity = entry.capabilities.cpu_cores?;
+    if has_unreserved_running_build(entry) {
+        return Some(0);
+    }
+    let reserved = entry
+        .reserved
+        .values()
+        .map(|resources| u32::from(resources.cpu_cores))
+        .sum::<u32>();
+    Some(capacity.saturating_sub(reserved.min(u32::from(u16::MAX)) as u16))
+}
+
+fn available_memory_mb(entry: &AgentEntry) -> Option<u64> {
+    let capacity = entry.capabilities.memory_mb?;
+    if has_unreserved_running_build(entry) {
+        return Some(0);
+    }
+    let reserved = entry
+        .reserved
+        .values()
+        .map(|resources| resources.memory_mb)
+        .sum::<u64>();
+    Some(capacity.saturating_sub(reserved))
 }
 
 #[cfg(test)]
@@ -422,6 +491,8 @@ mod tests {
                 docker: true,
                 labels: vec!["build".into()],
                 executors: 2,
+                cpu_cores: Some(8),
+                memory_mb: Some(16 * 1024),
             },
         }
     }
@@ -565,6 +636,8 @@ mod tests {
                     docker: true,
                     labels: vec!["build".into()],
                     executors: Some(2),
+                    cpu_cores: Some(4),
+                    memory_mb: Some(8 * 1024),
                 },
                 now,
             )
@@ -573,6 +646,67 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].agent_id, available_id);
         assert_eq!(matches[0].available_executors, 2);
+
+        let resource_matches = registry
+            .matching(
+                &AgentRequirements {
+                    cpu_cores: Some(4),
+                    memory_mb: Some(8 * 1024),
+                    ..AgentRequirements::default()
+                },
+                now,
+            )
+            .await
+            .expect("resource matches");
+        assert_eq!(resource_matches.len(), 1);
+        assert_eq!(resource_matches[0].agent_id, available_id);
+        assert!(
+            registry
+                .matching(
+                    &AgentRequirements {
+                        memory_mb: Some(32 * 1024),
+                        ..AgentRequirements::default()
+                    },
+                    now,
+                )
+                .await
+                .expect("insufficient memory matches")
+                .is_empty()
+        );
+
+        let resource_reservation = registry
+            .reserve(
+                &AgentRequirements {
+                    cpu_cores: Some(6),
+                    memory_mb: Some(12 * 1024),
+                    ..AgentRequirements::default()
+                },
+                Uuid::new_v4(),
+                now,
+            )
+            .await
+            .expect("resource reservation");
+        let summary = registry.list(now).await;
+        let available_summary = summary
+            .iter()
+            .find(|summary| summary.agent_id == available_id)
+            .expect("available resource summary");
+        assert_eq!(available_summary.available_cpu_cores, Some(2));
+        assert_eq!(available_summary.available_memory_mb, Some(4 * 1024));
+        assert!(
+            registry
+                .matching(
+                    &AgentRequirements {
+                        cpu_cores: Some(4),
+                        ..AgentRequirements::default()
+                    },
+                    now,
+                )
+                .await
+                .expect("resource capacity is reserved")
+                .is_empty()
+        );
+        assert!(registry.release(&resource_reservation).await);
 
         let one_slot = registry
             .matching(

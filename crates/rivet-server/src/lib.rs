@@ -4957,6 +4957,8 @@ mod tests {
                         docker: true,
                         labels: vec!["build".into()],
                         executors: 2,
+                        cpu_cores: Some(8),
+                        memory_mb: Some(16 * 1024),
                     },
                 },
                 Utc::now(),
@@ -4968,6 +4970,8 @@ mod tests {
             docker: true,
             labels: vec!["build".into()],
             executors: Some(1),
+            cpu_cores: Some(4),
+            memory_mb: Some(8192),
             ..AgentRequirements::default()
         })
         .expect("request body");
@@ -4989,6 +4993,8 @@ mod tests {
         let matches: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
         assert_eq!(matches[0]["agent_id"], agent_id.to_string());
         assert_eq!(matches[0]["available_executors"], 2);
+        assert_eq!(matches[0]["available_cpu_cores"].as_u64(), Some(8));
+        assert_eq!(matches[0]["available_memory_mb"].as_u64(), Some(16 * 1024));
 
         let invalid = router(state)
             .oneshot(
@@ -5141,6 +5147,8 @@ mod tests {
                 docker: false,
                 labels: vec!["local".into()],
                 executors: 1,
+                cpu_cores: Some(4),
+                memory_mb: Some(8 * 1024),
             },
         });
         socket
@@ -5276,6 +5284,8 @@ mod tests {
                     docker: false,
                     labels: vec![],
                     executors: 1,
+                    cpu_cores: Some(4),
+                    memory_mb: Some(8 * 1024),
                 },
             }));
         socket
@@ -5454,6 +5464,8 @@ agent = { os = "macos", arch = "aarch64", labels = ["recovery"] }
                         docker: false,
                         labels: vec!["recovery".into()],
                         executors: 1,
+                        cpu_cores: Some(4),
+                        memory_mb: Some(8 * 1024),
                     },
                 },
                 Utc::now(),

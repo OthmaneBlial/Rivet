@@ -6,6 +6,8 @@ use thiserror::Error;
 
 const MAX_AGENT_REQUIREMENT_VALUE_BYTES: usize = 64;
 const MAX_AGENT_REQUIREMENT_LABELS: usize = 64;
+const MAX_AGENT_CPU_CORES: u16 = 4096;
+const MAX_AGENT_MEMORY_MB: u64 = 4 * 1024 * 1024;
 const MAX_ENVIRONMENT_VARIABLES: usize = 128;
 const MAX_ENVIRONMENT_NAME_BYTES: usize = 256;
 const MAX_ENVIRONMENT_VALUE_BYTES: usize = 16 * 1024;
@@ -150,6 +152,14 @@ pub struct AgentRequirement {
     pub labels: Vec<String>,
     #[serde(default)]
     pub executors: Option<u16>,
+    /// Minimum CPU capacity that the assigned agent must advertise. An
+    /// omitted value means the pipeline has no CPU-specific requirement.
+    #[serde(default)]
+    pub cpu_cores: Option<u16>,
+    /// Minimum memory capacity in MiB that the assigned agent must advertise.
+    /// An omitted value means the pipeline has no memory-specific requirement.
+    #[serde(default)]
+    pub memory_mb: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -211,6 +221,18 @@ pub enum PipelineError {
         "agent requirement for step {step:?} in stage {stage:?} must request at least one executor"
     )]
     ZeroAgentExecutors { stage: String, step: String },
+    #[error(
+        "agent requirement cpu_cores for step {step:?} in stage {stage:?} must request at least one core"
+    )]
+    ZeroAgentCpuCores { stage: String, step: String },
+    #[error(
+        "agent requirement memory_mb for step {step:?} in stage {stage:?} must request at least one MiB"
+    )]
+    ZeroAgentMemory { stage: String, step: String },
+    #[error("agent requirement cpu_cores for step {step:?} in stage {stage:?} is too large")]
+    InvalidAgentCpuCores { stage: String, step: String },
+    #[error("agent requirement memory_mb for step {step:?} in stage {stage:?} is too large")]
+    InvalidAgentMemory { stage: String, step: String },
     #[error("workspace escapes the repository root: {0}")]
     WorkspaceOutsideRepository(PathBuf),
     #[error("workspace does not exist: {0}")]
@@ -613,6 +635,36 @@ impl Pipeline {
                             step: step.name.clone(),
                         });
                     }
+                    if agent.cpu_cores == Some(0) {
+                        return Err(PipelineError::ZeroAgentCpuCores {
+                            stage: stage.name.clone(),
+                            step: step.name.clone(),
+                        });
+                    }
+                    if agent
+                        .cpu_cores
+                        .is_some_and(|cores| cores > MAX_AGENT_CPU_CORES)
+                    {
+                        return Err(PipelineError::InvalidAgentCpuCores {
+                            stage: stage.name.clone(),
+                            step: step.name.clone(),
+                        });
+                    }
+                    if agent.memory_mb == Some(0) {
+                        return Err(PipelineError::ZeroAgentMemory {
+                            stage: stage.name.clone(),
+                            step: step.name.clone(),
+                        });
+                    }
+                    if agent
+                        .memory_mb
+                        .is_some_and(|memory| memory > MAX_AGENT_MEMORY_MB)
+                    {
+                        return Err(PipelineError::InvalidAgentMemory {
+                            stage: stage.name.clone(),
+                            step: step.name.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -876,6 +928,8 @@ arch = "x86_64"
 docker = true
 labels = ["large-memory"]
 executors = 2
+cpu_cores = 4
+memory_mb = 8192
 "#,
         )
         .expect("remote requirement is valid");
@@ -885,6 +939,8 @@ executors = 2
             .expect("agent requirement");
         assert_eq!(requirement.os.as_deref(), Some("linux"));
         assert_eq!(requirement.executors, Some(2));
+        assert_eq!(requirement.cpu_cores, Some(4));
+        assert_eq!(requirement.memory_mb, Some(8192));
 
         let invalid = Pipeline::from_toml_str(
             r#"
@@ -901,6 +957,44 @@ executors = 0
         )
         .expect_err("zero remote executors must be rejected");
         assert!(matches!(invalid, PipelineError::ZeroAgentExecutors { .. }));
+
+        let invalid_cpu = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "invalid-remote-cpu"
+[[stages]]
+name = "Build"
+[[stages.steps]]
+name = "compile"
+program = "true"
+[stages.steps.agent]
+cpu_cores = 0
+"#,
+        )
+        .expect_err("zero remote CPU must be rejected");
+        assert!(matches!(
+            invalid_cpu,
+            PipelineError::ZeroAgentCpuCores { .. }
+        ));
+
+        let invalid_memory = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "invalid-remote-memory"
+[[stages]]
+name = "Build"
+[[stages.steps]]
+name = "compile"
+program = "true"
+[stages.steps.agent]
+memory_mb = 5_000_000
+"#,
+        )
+        .expect_err("excessive remote memory must be rejected");
+        assert!(matches!(
+            invalid_memory,
+            PipelineError::InvalidAgentMemory { .. }
+        ));
     }
 
     #[test]

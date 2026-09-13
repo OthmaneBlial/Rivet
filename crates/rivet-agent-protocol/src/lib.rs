@@ -24,6 +24,8 @@ const MAX_LABELS: usize = 64;
 const MAX_LABEL_BYTES: usize = 64;
 const MAX_RUNNING_BUILDS: usize = 256;
 const MAX_REQUIREMENT_VALUE_BYTES: usize = 64;
+const MAX_CPU_CORES: u16 = 4096;
+const MAX_MEMORY_MB: u64 = 4 * 1024 * 1024;
 pub const MAX_WORKSPACE_CHUNK_BYTES: usize = 128 * 1024;
 pub const MAX_WORKSPACE_FILES: u32 = 100_000;
 pub const MAX_WORKSPACE_BYTES: u64 = 512 * 1024 * 1024;
@@ -35,6 +37,16 @@ pub struct AgentCapabilities {
     pub docker: bool,
     pub labels: Vec<String>,
     pub executors: u16,
+    /// Optional allocatable CPU capacity. `None` means the agent did not
+    /// advertise a resource dimension and cannot satisfy an explicit CPU
+    /// requirement.
+    #[serde(default)]
+    pub cpu_cores: Option<u16>,
+    /// Optional allocatable memory capacity in MiB. `None` means the agent
+    /// did not advertise a resource dimension and cannot satisfy an explicit
+    /// memory requirement.
+    #[serde(default)]
+    pub memory_mb: Option<u64>,
 }
 
 impl AgentCapabilities {
@@ -48,6 +60,8 @@ impl AgentCapabilities {
         if self.executors == 0 {
             return Err(ProtocolError::ZeroExecutors);
         }
+        validate_capacity(self.cpu_cores, "cpu_cores")?;
+        validate_memory(self.memory_mb, "memory_mb")?;
         if self.labels.len() > MAX_LABELS {
             return Err(ProtocolError::TooManyLabels);
         }
@@ -76,6 +90,14 @@ impl AgentCapabilities {
             && requirements
                 .executors
                 .is_none_or(|executors| self.executors >= executors)
+            && requirements.cpu_cores.is_none_or(|required| {
+                self.cpu_cores
+                    .is_some_and(|available| available >= required)
+            })
+            && requirements.memory_mb.is_none_or(|required| {
+                self.memory_mb
+                    .is_some_and(|available| available >= required)
+            })
     }
 }
 
@@ -91,6 +113,10 @@ pub struct AgentRequirements {
     pub labels: Vec<String>,
     #[serde(default)]
     pub executors: Option<u16>,
+    #[serde(default)]
+    pub cpu_cores: Option<u16>,
+    #[serde(default)]
+    pub memory_mb: Option<u64>,
 }
 
 impl AgentRequirements {
@@ -115,11 +141,34 @@ impl AgentRequirements {
         if self.executors == Some(0) {
             return Err(ProtocolError::ZeroRequiredExecutors);
         }
+        validate_capacity(self.cpu_cores, "cpu_cores").map_err(|error| match error {
+            ProtocolError::ZeroCapability(_) => ProtocolError::ZeroRequiredCpuCores,
+            ProtocolError::CapabilityTooLarge(_) => ProtocolError::RequiredCpuCoresTooLarge,
+            other => other,
+        })?;
+        validate_memory(self.memory_mb, "memory_mb").map_err(|error| match error {
+            ProtocolError::ZeroMemory(_) => ProtocolError::ZeroRequiredMemory,
+            ProtocolError::MemoryTooLarge(_) => ProtocolError::RequiredMemoryTooLarge,
+            other => other,
+        })?;
         Ok(())
     }
 
     pub fn requested_executors(&self) -> u16 {
         self.executors.unwrap_or(1)
+    }
+
+    /// Return the explicitly requested CPU capacity. An omitted dimension
+    /// consumes no CPU reservation because the pipeline did not ask the
+    /// scheduler to account for it.
+    pub fn requested_cpu_cores(&self) -> u16 {
+        self.cpu_cores.unwrap_or(0)
+    }
+
+    /// Return the explicitly requested memory capacity in MiB. An omitted
+    /// dimension consumes no memory reservation for the same reason.
+    pub fn requested_memory_mb(&self) -> u64 {
+        self.memory_mb.unwrap_or(0)
     }
 }
 
@@ -131,6 +180,8 @@ impl From<&AgentRequirement> for AgentRequirements {
             docker: requirement.docker,
             labels: requirement.labels.clone(),
             executors: requirement.executors,
+            cpu_cores: requirement.cpu_cores,
+            memory_mb: requirement.memory_mb,
         }
     }
 }
@@ -473,6 +524,22 @@ pub enum ProtocolError {
     ZeroRequiredExecutors,
     #[error("agent requires too many labels")]
     TooManyRequirementLabels,
+    #[error("agent capability {0} must be positive")]
+    ZeroCapability(&'static str),
+    #[error("agent capability {0} exceeds the protocol limit")]
+    CapabilityTooLarge(&'static str),
+    #[error("agent memory capability {0} must be positive")]
+    ZeroMemory(&'static str),
+    #[error("agent memory capability {0} exceeds the protocol limit")]
+    MemoryTooLarge(&'static str),
+    #[error("agent requirement cpu_cores must be positive")]
+    ZeroRequiredCpuCores,
+    #[error("agent requirement cpu_cores exceeds the protocol limit")]
+    RequiredCpuCoresTooLarge,
+    #[error("agent requirement memory_mb must be positive")]
+    ZeroRequiredMemory,
+    #[error("agent requirement memory_mb exceeds the protocol limit")]
+    RequiredMemoryTooLarge,
     #[error("workspace transfer exceeds the protocol size limit")]
     WorkspaceTooLarge,
     #[error("workspace transfer contains too many files")]
@@ -522,6 +589,32 @@ fn validate_requirement_value(
     Ok(())
 }
 
+fn validate_capacity(value: Option<u16>, field: &'static str) -> Result<(), ProtocolError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value == 0 {
+        return Err(ProtocolError::ZeroCapability(field));
+    }
+    if value > MAX_CPU_CORES {
+        return Err(ProtocolError::CapabilityTooLarge(field));
+    }
+    Ok(())
+}
+
+fn validate_memory(value: Option<u64>, field: &'static str) -> Result<(), ProtocolError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value == 0 {
+        return Err(ProtocolError::ZeroMemory(field));
+    }
+    if value > MAX_MEMORY_MB {
+        return Err(ProtocolError::MemoryTooLarge(field));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +626,8 @@ mod tests {
             docker: true,
             labels: vec!["large-memory".into(), "production".into()],
             executors: 4,
+            cpu_cores: Some(8),
+            memory_mb: Some(16 * 1024),
         }
     }
 
@@ -615,6 +710,18 @@ program = "true"
         registration.protocol_version = PROTOCOL_VERSION;
         registration.capabilities.executors = 0;
         assert_eq!(registration.validate(), Err(ProtocolError::ZeroExecutors));
+        registration.capabilities.executors = 1;
+        registration.capabilities.cpu_cores = Some(0);
+        assert_eq!(
+            registration.validate(),
+            Err(ProtocolError::ZeroCapability("cpu_cores"))
+        );
+        registration.capabilities.cpu_cores = None;
+        registration.capabilities.memory_mb = Some(0);
+        assert_eq!(
+            registration.validate(),
+            Err(ProtocolError::ZeroMemory("memory_mb"))
+        );
     }
 
     #[test]
@@ -626,6 +733,8 @@ program = "true"
             docker: true,
             labels: vec!["production".into()],
             executors: Some(2),
+            cpu_cores: Some(4),
+            memory_mb: Some(8 * 1024),
         };
         requirements.validate().expect("valid requirements");
         assert!(capabilities.supports(&requirements));
@@ -635,6 +744,14 @@ program = "true"
         }));
         assert!(!capabilities.supports(&AgentRequirements {
             os: Some("darwin".into()),
+            ..AgentRequirements::default()
+        }));
+        assert!(!capabilities.supports(&AgentRequirements {
+            cpu_cores: Some(16),
+            ..AgentRequirements::default()
+        }));
+        assert!(!capabilities.supports(&AgentRequirements {
+            memory_mb: Some(32 * 1024),
             ..AgentRequirements::default()
         }));
     }
@@ -658,6 +775,22 @@ program = "true"
             Err(ProtocolError::ZeroRequiredExecutors)
         );
         assert_eq!(AgentRequirements::default().requested_executors(), 1);
+        assert_eq!(
+            AgentRequirements {
+                cpu_cores: Some(0),
+                ..AgentRequirements::default()
+            }
+            .validate(),
+            Err(ProtocolError::ZeroRequiredCpuCores)
+        );
+        assert_eq!(
+            AgentRequirements {
+                memory_mb: Some(0),
+                ..AgentRequirements::default()
+            }
+            .validate(),
+            Err(ProtocolError::ZeroRequiredMemory)
+        );
     }
 
     #[test]
@@ -668,6 +801,8 @@ program = "true"
             docker: true,
             labels: vec!["build".into()],
             executors: Some(2),
+            cpu_cores: Some(4),
+            memory_mb: Some(8192),
         };
         let wire = AgentRequirements::from(&pipeline_requirement);
         assert_eq!(wire.os.as_deref(), Some("linux"));
@@ -675,6 +810,8 @@ program = "true"
         assert!(wire.docker);
         assert_eq!(wire.labels, ["build"]);
         assert_eq!(wire.executors, Some(2));
+        assert_eq!(wire.cpu_cores, Some(4));
+        assert_eq!(wire.memory_mb, Some(8192));
     }
 
     #[test]

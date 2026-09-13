@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.38 / 100** · displayed conservatively as the
+Weighted evidence score: **92.44 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -42,10 +42,11 @@ gated. The
 server also exposes a
 versioned agent handshake/heartbeat registry with online/stale state, capacity-aware
 matching, a reconnecting heartbeat CLI client, and a rendered fleet view. Pipeline
-steps can declare exact remote requirements; the local runner refuses those steps
-until assignment exists. A matching agent can now reserve capacity, receive a
-bounded workspace archive, execute the assigned pipeline through the shared Rust
-runner, and relay typed events, output, and cancellation. Remote artifact
+steps can declare exact remote requirements, including optional CPU cores and
+memory in MiB; the local runner refuses those steps until assignment exists. A
+matching agent can now reserve executor, CPU, and memory capacity atomically,
+receive a bounded workspace archive, execute the assigned pipeline through the
+shared Rust runner, and relay typed events, output, and cancellation. Remote artifact
 bundles now return through a bounded, checksum-verified channel. Persisted event
 projection also ignores exact redelivery of an already recorded domain event by
 its SHA-256 identity. If the assigned
@@ -459,13 +460,16 @@ local build needs an authenticated fetch.
 
 Remote agents use a versioned WebSocket contract at
 `GET /api/v1/agents/connect`. Agents register capabilities such as operating
-system, architecture, Docker availability, labels, and executor capacity,
-then send monotone heartbeats. `GET /api/v1/agents` reports the current
+system, architecture, Docker availability, labels, and executor capacity, then
+send monotone heartbeats. They may also advertise explicit allocatable
+`cpu_cores` and `memory_mb` capacity. `GET /api/v1/agents` reports the current
 ephemeral registry; silent agents become `stale` after the heartbeat window.
-`POST /api/v1/agents/match` accepts exact capability requirements and excludes
-stale or saturated agents. A build with a remote step reserves a matching online
-agent, transfers the repository workspace in bounded chunks, executes it with
-the shared Rust runner, and persists the agent's typed build events and output.
+`POST /api/v1/agents/match` accepts exact capability and resource requirements and
+excludes stale or saturated agents. Reservations account for every explicitly
+requested executor, CPU, and memory unit; an unknown running build fails closed
+for resource-constrained matching. A build with a remote step reserves a matching
+online agent, transfers the repository workspace in bounded chunks, executes it
+with the shared Rust runner, and persists the agent's typed build events and output.
 Cancellation is propagated to the agent, and declared artifacts return through
 the same bounded transfer with checksum verification before local storage.
 After an agent disconnect, the server makes one bounded replacement attempt and
@@ -481,8 +485,12 @@ Connect a worker for heartbeat and capability discovery:
 cargo run -p rivet -- agent \
   --server ws://127.0.0.1:7878/api/v1/agents/connect \
   --name linux-builder --os linux --arch x86_64 \
-  --label build --executors 2
+  --label build --executors 2 --cpu-cores 8 --memory-mb 16384
 ```
+
+The CPU and memory flags are optional. A pipeline that declares either resource
+dimension only matches an agent that explicitly advertises that dimension; Rivet
+does not infer host memory or pretend that an unknown capacity is available.
 
 The command keeps its stable agent ID and reconnects with bounded backoff after a
 transport interruption. It accepts assignments, stages each workspace under an
