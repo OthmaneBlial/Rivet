@@ -6,7 +6,10 @@
 //! against the same compatibility contract.
 
 use chrono::{DateTime, Utc};
-use rivet_core::{AgentRequirement, BuildId, BuildStatus, ExecutionPlan, LogStream, ProjectId};
+use rivet_core::{
+    AgentRequirement, BuildEvent, BuildId, BuildStatus, ExecutionPlan, LogStream, Pipeline,
+    ProjectId,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -21,6 +24,9 @@ const MAX_LABELS: usize = 64;
 const MAX_LABEL_BYTES: usize = 64;
 const MAX_RUNNING_BUILDS: usize = 256;
 const MAX_REQUIREMENT_VALUE_BYTES: usize = 64;
+const MAX_WORKSPACE_CHUNK_BYTES: usize = 128 * 1024;
+const MAX_WORKSPACE_FILES: u32 = 100_000;
+const MAX_WORKSPACE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentCapabilities {
@@ -130,6 +136,33 @@ impl From<&AgentRequirement> for AgentRequirements {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceTransfer {
+    pub total_bytes: u64,
+    pub file_count: u32,
+    pub sha256: String,
+}
+
+impl WorkspaceTransfer {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.total_bytes > MAX_WORKSPACE_BYTES {
+            return Err(ProtocolError::WorkspaceTooLarge);
+        }
+        if self.file_count > MAX_WORKSPACE_FILES {
+            return Err(ProtocolError::TooManyWorkspaceFiles);
+        }
+        if self.sha256.len() != 64
+            || self
+                .sha256
+                .chars()
+                .any(|character| !character.is_ascii_hexdigit())
+        {
+            return Err(ProtocolError::InvalidWorkspaceChecksum);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentRegistration {
     pub protocol_version: u16,
     pub agent_id: AgentId,
@@ -185,7 +218,27 @@ pub enum AgentMessage {
         build_id: BuildId,
         project_id: ProjectId,
         plan: ExecutionPlan,
+        pipeline: Pipeline,
         parameters: BTreeMap<String, String>,
+        workspace: WorkspaceTransfer,
+    },
+    AssignmentAccepted {
+        protocol_version: u16,
+        build_id: BuildId,
+    },
+    WorkspaceChunk {
+        protocol_version: u16,
+        build_id: BuildId,
+        sequence: u32,
+        data: Vec<u8>,
+    },
+    WorkspaceReady {
+        protocol_version: u16,
+        build_id: BuildId,
+    },
+    Event {
+        protocol_version: u16,
+        event: BuildEvent,
     },
     Cancel {
         protocol_version: u16,
@@ -225,6 +278,18 @@ impl AgentMessage {
             | Self::Assign {
                 protocol_version, ..
             }
+            | Self::AssignmentAccepted {
+                protocol_version, ..
+            }
+            | Self::WorkspaceChunk {
+                protocol_version, ..
+            }
+            | Self::WorkspaceReady {
+                protocol_version, ..
+            }
+            | Self::Event {
+                protocol_version, ..
+            }
             | Self::Cancel {
                 protocol_version, ..
             }
@@ -239,6 +304,13 @@ impl AgentMessage {
             } => validate_version(*protocol_version),
             Self::Heartbeat(heartbeat) => heartbeat.validate(),
         }
+        .and_then(|()| match self {
+            Self::Assign { workspace, .. } => workspace.validate(),
+            Self::WorkspaceChunk { data, .. } if data.len() > MAX_WORKSPACE_CHUNK_BYTES => {
+                Err(ProtocolError::WorkspaceChunkTooLarge)
+            }
+            _ => Ok(()),
+        })
     }
 
     pub fn protocol_version(&self) -> u16 {
@@ -251,6 +323,18 @@ impl AgentMessage {
                 protocol_version, ..
             }
             | Self::Assign {
+                protocol_version, ..
+            }
+            | Self::AssignmentAccepted {
+                protocol_version, ..
+            }
+            | Self::WorkspaceChunk {
+                protocol_version, ..
+            }
+            | Self::WorkspaceReady {
+                protocol_version, ..
+            }
+            | Self::Event {
                 protocol_version, ..
             }
             | Self::Cancel {
@@ -298,6 +382,14 @@ pub enum ProtocolError {
     ZeroRequiredExecutors,
     #[error("agent requires too many labels")]
     TooManyRequirementLabels,
+    #[error("workspace transfer exceeds the protocol size limit")]
+    WorkspaceTooLarge,
+    #[error("workspace transfer contains too many files")]
+    TooManyWorkspaceFiles,
+    #[error("workspace transfer checksum must be 64 hexadecimal characters")]
+    InvalidWorkspaceChecksum,
+    #[error("workspace transfer chunk exceeds the protocol size limit")]
+    WorkspaceChunkTooLarge,
 }
 
 fn validate_version(version: u16) -> Result<(), ProtocolError> {

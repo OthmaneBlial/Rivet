@@ -1,12 +1,13 @@
 use chrono::{DateTime, Duration, Utc};
 use rivet_agent_protocol::{
-    AgentCapabilities, AgentHeartbeat, AgentId, AgentRegistration, AgentRequirements, ProtocolError,
+    AgentCapabilities, AgentHeartbeat, AgentId, AgentMessage, AgentRegistration, AgentRequirements,
+    ProtocolError,
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
 const DEFAULT_STALE_AFTER: Duration = Duration::seconds(30);
@@ -34,6 +35,7 @@ pub struct AgentSummary {
     pub last_heartbeat: DateTime<Utc>,
     pub last_sequence: u64,
     pub running: Vec<rivet_core::BuildId>,
+    pub reserved: Vec<rivet_core::BuildId>,
     pub available_executors: u16,
     pub status: AgentStatus,
 }
@@ -42,6 +44,13 @@ pub struct AgentSummary {
 pub struct AgentLease {
     pub agent_id: AgentId,
     pub session_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentReservation {
+    pub agent_id: AgentId,
+    pub session_id: Uuid,
+    pub build_id: rivet_core::BuildId,
 }
 
 #[derive(Debug, Error)]
@@ -58,6 +67,19 @@ pub enum AgentRegistryError {
         sequence: u64,
         last_sequence: u64,
     },
+    #[error("no online agent matches the requested capabilities and available capacity")]
+    NoMatchingAgent,
+    #[error("agent {0} is not connected for remote assignment")]
+    AgentNotConnected(AgentId),
+    #[error("agent {0} assignment channel is closed")]
+    AgentChannelClosed(AgentId),
+    #[error("build {0} already has an agent reservation")]
+    ReservationConflict(rivet_core::BuildId),
+    #[error("agent {agent_id} reservation for build {build_id} is no longer current")]
+    StaleReservation {
+        agent_id: AgentId,
+        build_id: rivet_core::BuildId,
+    },
 }
 
 struct AgentEntry {
@@ -69,7 +91,9 @@ struct AgentEntry {
     last_heartbeat: DateTime<Utc>,
     last_sequence: u64,
     running: Vec<rivet_core::BuildId>,
+    reserved: HashMap<rivet_core::BuildId, u16>,
     session_id: Uuid,
+    outbound: Option<mpsc::Sender<AgentMessage>>,
 }
 
 impl Default for AgentRegistry {
@@ -95,6 +119,24 @@ impl AgentRegistry {
         registration: AgentRegistration,
         now: DateTime<Utc>,
     ) -> Result<AgentLease, AgentRegistryError> {
+        self.register_inner(registration, now, None).await
+    }
+
+    pub async fn register_with_sender(
+        &self,
+        registration: AgentRegistration,
+        now: DateTime<Utc>,
+        outbound: mpsc::Sender<AgentMessage>,
+    ) -> Result<AgentLease, AgentRegistryError> {
+        self.register_inner(registration, now, Some(outbound)).await
+    }
+
+    async fn register_inner(
+        &self,
+        registration: AgentRegistration,
+        now: DateTime<Utc>,
+        outbound: Option<mpsc::Sender<AgentMessage>>,
+    ) -> Result<AgentLease, AgentRegistryError> {
         registration.validate()?;
         let session_id = Uuid::new_v4();
         let entry = AgentEntry {
@@ -106,7 +148,9 @@ impl AgentRegistry {
             last_heartbeat: now,
             last_sequence: 0,
             running: Vec::new(),
+            reserved: HashMap::new(),
             session_id,
+            outbound,
         };
         self.agents
             .write()
@@ -182,6 +226,95 @@ impl AgentRegistry {
         Ok(summaries)
     }
 
+    pub async fn reserve(
+        &self,
+        requirements: &AgentRequirements,
+        build_id: rivet_core::BuildId,
+        now: DateTime<Utc>,
+    ) -> Result<AgentReservation, AgentRegistryError> {
+        requirements.validate()?;
+        let mut agents = self.agents.write().await;
+        if agents
+            .values()
+            .any(|entry| entry.reserved.contains_key(&build_id))
+        {
+            return Err(AgentRegistryError::ReservationConflict(build_id));
+        }
+        let requested = requirements.requested_executors();
+        let mut candidates: Vec<_> = agents
+            .values()
+            .filter(|entry| self.status(entry, now) == AgentStatus::Online)
+            .filter(|entry| entry.capabilities.supports(requirements))
+            .filter(|entry| available_executors(entry) >= requested)
+            .map(|entry| {
+                (
+                    available_executors(entry),
+                    entry.name.clone(),
+                    entry.agent_id,
+                )
+            })
+            .collect();
+        candidates.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        let Some((_, _, agent_id)) = candidates.into_iter().next() else {
+            return Err(AgentRegistryError::NoMatchingAgent);
+        };
+        let entry = agents
+            .get_mut(&agent_id)
+            .expect("matching agent remains in registry write lock");
+        entry.reserved.insert(build_id, requested);
+        Ok(AgentReservation {
+            agent_id,
+            session_id: entry.session_id,
+            build_id,
+        })
+    }
+
+    pub async fn release(&self, reservation: &AgentReservation) -> bool {
+        let mut agents = self.agents.write().await;
+        let Some(entry) = agents.get_mut(&reservation.agent_id) else {
+            return false;
+        };
+        if entry.session_id != reservation.session_id {
+            return false;
+        }
+        entry.reserved.remove(&reservation.build_id).is_some()
+    }
+
+    pub async fn send(
+        &self,
+        reservation: &AgentReservation,
+        message: AgentMessage,
+    ) -> Result<(), AgentRegistryError> {
+        let sender = {
+            let agents = self.agents.read().await;
+            let entry = agents
+                .get(&reservation.agent_id)
+                .ok_or(AgentRegistryError::AgentNotConnected(reservation.agent_id))?;
+            if entry.session_id != reservation.session_id
+                || !entry.reserved.contains_key(&reservation.build_id)
+            {
+                return Err(AgentRegistryError::StaleReservation {
+                    agent_id: reservation.agent_id,
+                    build_id: reservation.build_id,
+                });
+            }
+            entry
+                .outbound
+                .clone()
+                .ok_or(AgentRegistryError::AgentNotConnected(reservation.agent_id))?
+        };
+        sender
+            .send(message)
+            .await
+            .map_err(|_| AgentRegistryError::AgentChannelClosed(reservation.agent_id))
+    }
+
     fn status(&self, entry: &AgentEntry, now: DateTime<Utc>) -> AgentStatus {
         if now - entry.last_heartbeat <= self.stale_after {
             AgentStatus::Online
@@ -201,17 +334,33 @@ fn summary(entry: &AgentEntry, status: AgentStatus) -> AgentSummary {
         last_heartbeat: entry.last_heartbeat,
         last_sequence: entry.last_sequence,
         running: entry.running.clone(),
+        reserved: {
+            let mut reserved = entry.reserved.keys().copied().collect::<Vec<_>>();
+            reserved.sort();
+            reserved
+        },
         available_executors: available_executors(entry),
         status,
     }
 }
 
 fn available_executors(entry: &AgentEntry) -> u16 {
-    let distinct_running = entry.running.iter().collect::<HashSet<_>>().len() as u16;
+    let reserved_executors = entry
+        .reserved
+        .values()
+        .map(|executors| u32::from(*executors))
+        .sum::<u32>();
+    let reserved_builds = entry.reserved.keys().collect::<HashSet<_>>();
+    let running_executors = entry
+        .running
+        .iter()
+        .filter(|build_id| !reserved_builds.contains(build_id))
+        .collect::<HashSet<_>>()
+        .len() as u32;
     entry
         .capabilities
         .executors
-        .saturating_sub(distinct_running)
+        .saturating_sub((reserved_executors + running_executors).min(u32::from(u16::MAX)) as u16)
 }
 
 #[cfg(test)]
@@ -421,5 +570,59 @@ mod tests {
             error,
             AgentRegistryError::Protocol(ProtocolError::InvalidRequirementLabel)
         ));
+    }
+
+    #[tokio::test]
+    async fn reservations_are_atomic_and_release_capacity_after_completion() {
+        let registry = AgentRegistry::default();
+        let now = Utc::now();
+        let agent_id = Uuid::new_v4();
+        let (outbound, mut received) = mpsc::channel(4);
+        let lease = registry
+            .register_with_sender(registration(agent_id), now, outbound)
+            .await
+            .expect("register agent");
+        let first_build = Uuid::new_v4();
+        let first = registry
+            .reserve(
+                &AgentRequirements {
+                    executors: Some(2),
+                    ..AgentRequirements::default()
+                },
+                first_build,
+                now,
+            )
+            .await
+            .expect("first reservation");
+        assert_eq!(first.agent_id, agent_id);
+        assert_eq!(registry.list(now).await[0].available_executors, 0);
+        assert!(matches!(
+            registry
+                .reserve(&AgentRequirements::default(), Uuid::new_v4(), now)
+                .await,
+            Err(AgentRegistryError::NoMatchingAgent)
+        ));
+
+        registry
+            .send(
+                &first,
+                AgentMessage::AssignmentAccepted {
+                    protocol_version: PROTOCOL_VERSION,
+                    build_id: first_build,
+                },
+            )
+            .await
+            .expect("send assignment");
+        assert!(matches!(
+            received.recv().await,
+            Some(AgentMessage::AssignmentAccepted { build_id, .. }) if build_id == first_build
+        ));
+        assert!(registry.release(&first).await);
+        let second = registry
+            .reserve(&AgentRequirements::default(), Uuid::new_v4(), now)
+            .await
+            .expect("released capacity");
+        assert_eq!(second.agent_id, agent_id);
+        assert_eq!(lease.session_id, first.session_id);
     }
 }
