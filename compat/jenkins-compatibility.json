@@ -77,6 +77,13 @@
       "notes": "Explicit local fetch, detached revision checkout, and clean preparation are supported at build admission; provider credentials and webhooks remain planned."
     },
     {
+      "category": "Triggers",
+      "feature": "Manual/API builds and persistent UTC cron schedules",
+      "status": "partial",
+      "evidence": ["crates/rivet-core/src/schedule.rs", "crates/rivet-storage/migrations/006_schedules.sql", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
+      "notes": "Five-field cron expressions are validated, persisted, atomically claimed, dispatched into real builds, and exposed through API, CLI, and desktop controls; webhook, repository-event, and upstream triggers remain planned."
+    },
+    {
       "category": "Agents",
       "feature": "Remote authenticated agents",
       "status": "planned",

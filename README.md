@@ -5,7 +5,7 @@ from Jenkins.
 
 ## Delivery progress
 
-**52% verified** · `██████████▍░░░░░░░░░`<br>
+**56% verified** · `███████████▍░░░░░░░░`<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
 behavior backed by current tests or an exercised local workflow; incomplete
@@ -18,7 +18,8 @@ event replay, quiet engine offline recovery, explicit Git preparation at build
 admission, parameterized builds, local artifact storage, protected server
 transport, build retry, pre-execution queue cancellation, build artifact
 downloads, and a light-default desktop theme with an accessible dark-mode
-toggle milestone.
+toggle, persistent UTC cron schedules, server dispatch, and desktop schedule
+controls milestone.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
@@ -86,8 +87,10 @@ database. Health checks remain public; API and WebSocket routes require
 
 The versioned API currently exposes health, projects, queued builds, build
 details, persisted logs, cancellation, a live queue snapshot, durable replay,
-and a per-build WebSocket event stream under `/api/v1/`. It also exposes Git repository inspection and an explicit
-prepare operation for fetch/checkout/clean workflows. The server returns
+and a per-build WebSocket event stream under `/api/v1/`. It also exposes
+persisted UTC cron schedules with create/list/pause/resume/delete operations,
+automatic server dispatch, Git repository inspection, and an explicit prepare
+operation for fetch/checkout/clean workflows. The server returns
 `202 Accepted` when a build is queued. A build request may opt into Git
 fetching, revision checkout, and workspace cleaning; the default remains
 inspection-only. Clients read durable state from the build resource and
@@ -104,6 +107,15 @@ Cleaning is never implicit.
 Completed builds can be retried without losing their original history. The
 retry creates a new build number and reuses the original resolved parameters
 unless the API caller supplies replacements.
+
+Schedules can also be managed from the CLI. Expressions use UTC and accept
+the familiar five-field form:
+
+```sh
+cargo run -p rivet -- schedule create rivet \
+  --name nightly --expression "0 2 * * *"
+cargo run -p rivet -- schedule list rivet
+```
 
 The first executable pipeline format is deliberately explicit:
 
