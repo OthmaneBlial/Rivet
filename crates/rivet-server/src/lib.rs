@@ -178,6 +178,10 @@ pub fn router(state: AppState) -> Router {
             post(cancel_build),
         )
         .route(
+            "/api/v1/projects/{name}/builds/{number}/retry",
+            post(retry_build),
+        )
+        .route(
             "/api/v1/projects/{name}/scm",
             get(get_scm).post(prepare_scm),
         )
@@ -456,6 +460,39 @@ async fn queue_build(
 ) -> Result<(StatusCode, Json<QueueBuildResponse>), ApiError> {
     let request = request.map(|Json(request)| request).unwrap_or_default();
     let project = project_by_name(&state.storage, &name)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(enqueue_project_build(&state, project, request).await?),
+    ))
+}
+
+async fn retry_build(
+    State(state): State<AppState>,
+    AxumPath((name, number)): AxumPath<(String, i64)>,
+    request: Option<Json<QueueBuildRequest>>,
+) -> Result<(StatusCode, Json<QueueBuildResponse>), ApiError> {
+    let project = project_by_name(&state.storage, &name)?;
+    let original = build_by_number(&state.storage, project.id, &name, number)?;
+    if !original.status.is_terminal() {
+        return Err(ApiError::BadRequest(format!(
+            "build {name} #{number} is not finished and cannot be retried"
+        )));
+    }
+    let mut request = request.map(|Json(request)| request).unwrap_or_default();
+    if request.parameters.is_empty() {
+        request.parameters = original.parameters;
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(enqueue_project_build(&state, project, request).await?),
+    ))
+}
+
+async fn enqueue_project_build(
+    state: &AppState,
+    project: Project,
+    request: QueueBuildRequest,
+) -> Result<QueueBuildResponse, ApiError> {
     let repository_root = PathBuf::from(&project.repository_path);
     let source = capture_source_snapshot(&repository_root, request.scm.as_ref()).await?;
     let pipeline = Pipeline::load(&project.pipeline_path)?;
@@ -510,13 +547,10 @@ async fn queue_build(
     spawn_build_reaper(state.active_builds.clone(), handle);
     let mut response_build = build;
     response_build.status = BuildStatus::Queued;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(QueueBuildResponse {
-            build: response_build,
-            status: BuildStatus::Queued,
-        }),
-    ))
+    Ok(QueueBuildResponse {
+        build: response_build,
+        status: BuildStatus::Queued,
+    })
 }
 
 fn finalize_artifacts(

@@ -28,6 +28,11 @@ export interface ScmPrepareOptions {
   clean_ignored?: boolean;
 }
 
+export interface BuildRequestOptions {
+  scm?: ScmPrepareOptions;
+  parameters?: Record<string, string>;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
@@ -98,13 +103,21 @@ export function artifacts(project: string, number: number): Promise<ArtifactReco
 
 export function queueBuild(
   project: string,
-  options: {
-    scm?: ScmPrepareOptions;
-    parameters?: Record<string, string>;
-  } = {},
+  options: BuildRequestOptions = {},
 ): Promise<QueueResponse> {
   return request<QueueResponse>(
     `/api/v1/projects/${encodeURIComponent(project)}/builds`,
+    { method: "POST", body: JSON.stringify(options) },
+  );
+}
+
+export function retryBuild(
+  project: string,
+  number: number,
+  options: BuildRequestOptions = {},
+): Promise<QueueResponse> {
+  return request<QueueResponse>(
+    `/api/v1/projects/${encodeURIComponent(project)}/builds/${number}/retry`,
     { method: "POST", body: JSON.stringify(options) },
   );
 }
