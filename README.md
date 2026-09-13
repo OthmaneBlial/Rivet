@@ -358,6 +358,11 @@ administrator permission and append a bounded audit event without recording
 the secret. Keychain integration and project-level access control remain
 future gates.
 
+The desktop control room exposes the same admin-only lifecycle when the server
+has a vault configured: it shows credential IDs and usernames, supports secure
+replacement/removal, and clears the entered secret after each save. The API
+response still contains no secret material.
+
 The same `--credential-id`, `--credentials-file`, and
 `--credentials-passphrase-file` flags can be passed to `rivet run` when a
 local build needs an authenticated fetch.

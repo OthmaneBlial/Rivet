@@ -116,6 +116,11 @@ export interface QueueStats {
   paused: boolean;
 }
 
+export interface CredentialSummary {
+  id: string;
+  username: string;
+}
+
 export type AgentStatus = "online" | "stale";
 
 export interface AgentCapabilities {

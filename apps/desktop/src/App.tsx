@@ -3,8 +3,10 @@ import {
   buildDetails,
   builds,
   cancelBuild,
+  credentials as fetchCredentials,
   createProject,
   createSchedule,
+  deleteCredential,
   deleteSchedule,
   artifactUrl,
   analyzeJenkinsfile,
@@ -22,6 +24,7 @@ import {
   queueBuild,
   retryBuild,
   resumeQueue,
+  setCredential,
   schedules,
   updateSchedule,
 } from "./api";
@@ -31,6 +34,7 @@ import type {
   BuildDetails,
   BuildRecord,
   BuildStatus,
+  CredentialSummary,
   LogRecord,
   MigrationResponse,
   Project,
@@ -50,7 +54,7 @@ const NAV_ITEMS = [
   { label: "Queue", mark: "≋", active: false },
   { label: "Agents", mark: "⊙", active: true },
   { label: "Artifacts", mark: "□", active: false },
-  { label: "Credentials", mark: "◈", active: false },
+  { label: "Credentials", mark: "◈", active: true },
   { label: "Migration", mark: "⇄", active: true },
   { label: "Extensions", mark: "◇", active: true },
 ];
@@ -144,6 +148,13 @@ function App() {
   const [queueStatus, setQueueStatus] = useState<QueueStats | null>(null);
   const [agentList, setAgentList] = useState<AgentSummary[]>([]);
   const [extensionList, setExtensionList] = useState<ExtensionManifest[]>([]);
+  const [credentialList, setCredentialList] = useState<CredentialSummary[]>([]);
+  const [credentialsReady, setCredentialsReady] = useState<boolean | null>(null);
+  const [credentialError, setCredentialError] = useState<string | null>(null);
+  const [credentialBusy, setCredentialBusy] = useState(false);
+  const [credentialId, setCredentialId] = useState("");
+  const [credentialUsername, setCredentialUsername] = useState("");
+  const [credentialSecret, setCredentialSecret] = useState("");
   const [selectedBuild, setSelectedBuild] = useState<number | null>(null);
   const [details, setDetails] = useState<BuildDetails | null>(null);
   const [logLines, setLogLines] = useState<LogRecord[]>([]);
@@ -248,6 +259,19 @@ function App() {
     }
   }, []);
 
+  const loadCredentialList = useCallback(async () => {
+    if (!engineOnline || activeNav !== "Credentials") return;
+    try {
+      setCredentialList(await fetchCredentials());
+      setCredentialsReady(true);
+      setCredentialError(null);
+    } catch (cause) {
+      setCredentialList([]);
+      setCredentialsReady(false);
+      setCredentialError(cause instanceof Error ? cause.message : "Credential vault unavailable");
+    }
+  }, [activeNav, engineOnline]);
+
   useEffect(() => {
     void initializeEngineOrigin();
     void loadProjects();
@@ -299,6 +323,16 @@ function App() {
     }
     void loadExtensionList();
   }, [engineOnline, loadExtensionList]);
+
+  useEffect(() => {
+    if (!engineOnline || activeNav !== "Credentials") {
+      setCredentialList([]);
+      setCredentialsReady(null);
+      setCredentialError(null);
+      return;
+    }
+    void loadCredentialList();
+  }, [activeNav, engineOnline, loadCredentialList]);
 
   useEffect(() => {
     if (engineOnline) return;
@@ -449,6 +483,54 @@ function App() {
     }
   }
 
+  function editCredential(credential: CredentialSummary) {
+    setCredentialId(credential.id);
+    setCredentialUsername(credential.username);
+    setCredentialSecret("");
+    setCredentialError(null);
+  }
+
+  function resetCredentialForm() {
+    setCredentialId("");
+    setCredentialUsername("");
+    setCredentialSecret("");
+  }
+
+  async function submitCredential(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!credentialId.trim() || !credentialUsername.trim() || !credentialSecret) return;
+    setCredentialBusy(true);
+    setCredentialError(null);
+    try {
+      await setCredential(credentialId.trim(), {
+        username: credentialUsername.trim(),
+        secret: credentialSecret,
+      });
+      setCredentialSecret("");
+      resetCredentialForm();
+      await loadCredentialList();
+    } catch (cause) {
+      setCredentialError(cause instanceof Error ? cause.message : "Could not save credential");
+    } finally {
+      setCredentialBusy(false);
+    }
+  }
+
+  async function removeCredential(credential: CredentialSummary) {
+    if (!window.confirm(`Remove credential “${credential.id}”?`)) return;
+    setCredentialBusy(true);
+    setCredentialError(null);
+    try {
+      await deleteCredential(credential.id);
+      if (credentialId === credential.id) resetCredentialForm();
+      await loadCredentialList();
+    } catch (cause) {
+      setCredentialError(cause instanceof Error ? cause.message : "Could not remove credential");
+    } finally {
+      setCredentialBusy(false);
+    }
+  }
+
   const latest = buildList[0] ?? null;
   const passed = buildList.filter((build) => build.status === "passed").length;
   const successRate = buildList.length ? Math.round((passed / buildList.length) * 100) : 0;
@@ -558,6 +640,24 @@ function App() {
           <ExtensionsPanel extensions={extensionList} />
         ) : activeNav === "Agents" ? (
           <AgentsPanel agents={agentList} online={engineOnline} />
+        ) : activeNav === "Credentials" ? (
+          <CredentialsPanel
+            credentials={credentialList}
+            ready={credentialsReady}
+            online={engineOnline}
+            error={credentialError}
+            busy={credentialBusy}
+            id={credentialId}
+            username={credentialUsername}
+            secret={credentialSecret}
+            onIdChange={setCredentialId}
+            onUsernameChange={setCredentialUsername}
+            onSecretChange={setCredentialSecret}
+            onSubmit={submitCredential}
+            onEdit={editCredential}
+            onRemove={removeCredential}
+            onReset={resetCredentialForm}
+          />
         ) : projectsList.length === 0 ? (
           <Onboarding onCreate={() => setShowCreate(true)} online={engineOnline} />
         ) : (
@@ -771,6 +871,126 @@ function EmptyState({ text }: { text: string }) { return <div className="empty-s
 
 function Onboarding({ onCreate, online }: { onCreate: () => void; online: boolean }) {
   return <div className="onboarding"><div className="onboarding-mark"><RivetMark /></div><span className="eyebrow"><span className="eyebrow-line" />First connection</span><h1>Give the engine<br /><em>a pipeline to watch.</em></h1><p>Rivet keeps the execution signal close: a local repository, an explicit `Rivetfile.toml`, and a durable history you can trust.</p><button className="button button-primary onboarding-button" disabled={!online} onClick={onCreate}>＋ Connect a project <span>→</span></button><div className="onboarding-note"><span className="note-rule" />{online ? "The local engine is ready for a repository." : "Start `rivet server` to connect the local engine."}</div></div>;
+}
+
+function CredentialsPanel({
+  credentials,
+  ready,
+  online,
+  error,
+  busy,
+  id,
+  username,
+  secret,
+  onIdChange,
+  onUsernameChange,
+  onSecretChange,
+  onSubmit,
+  onEdit,
+  onRemove,
+  onReset,
+}: {
+  credentials: CredentialSummary[];
+  ready: boolean | null;
+  online: boolean;
+  error: string | null;
+  busy: boolean;
+  id: string;
+  username: string;
+  secret: string;
+  onIdChange: (value: string) => void;
+  onUsernameChange: (value: string) => void;
+  onSecretChange: (value: string) => void;
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
+  onEdit: (credential: CredentialSummary) => void;
+  onRemove: (credential: CredentialSummary) => void;
+  onReset: () => void;
+}) {
+  const vaultUnavailable = ready === false;
+  return (
+    <div className="content-wrap credentials-page">
+      <section className="page-heading credentials-heading">
+        <div>
+          <span className="eyebrow"><span className="eyebrow-line" />Secret boundary</span>
+          <h1>Keep access out of the build.</h1>
+          <p>Store provider credentials once, then reference them by an opaque ID from a build or webhook.</p>
+        </div>
+        <div className={`credentials-status ${vaultUnavailable ? "unavailable" : ""}`}>
+          <span className="overline">Vault status</span>
+          <strong>{!online ? "ENGINE OFFLINE" : vaultUnavailable ? "VAULT UNAVAILABLE" : ready ? "ENCRYPTED VAULT" : "CONNECTING…"}</strong>
+          <small>{!online ? "start the local engine" : vaultUnavailable ? "configure a vault on the server" : "secrets never returned by API"}</small>
+        </div>
+      </section>
+
+      {error && (
+        <div className="credential-alert" role="status">
+          <span className="error-symbol">!</span>
+          <span>{error}</span>
+        </div>
+      )}
+
+      {vaultUnavailable || !online ? (
+        <section className="panel credentials-empty">
+          <span className="credentials-empty-mark">◈</span>
+          <div>
+            <span className="overline">Management is gated</span>
+            <strong>{!online ? "Connect to the local engine first." : "Configure the encrypted vault first."}</strong>
+            <p>{!online ? "Credential management becomes available when the Rust engine is reachable." : "Start the server with a vault file and private passphrase. Rivet keeps only encrypted ciphertext on disk."}</p>
+          </div>
+        </section>
+      ) : (
+        <>
+          <section className="metric-grid credentials-metrics" aria-label="Credential vault metrics">
+            <MetricCard label="Stored entries" value={String(credentials.length).padStart(2, "0")} detail="IDs only in this view" accent="cyan" />
+            <MetricCard label="Secret exposure" value="ZERO" detail="not returned by API" accent="amber" />
+            <MetricCard label="Access model" value="ADMIN" detail="management permission" accent="neutral" />
+            <MetricCard label="Persistence" value="AES-GCM" detail="passphrase-encrypted vault" accent="neutral" />
+          </section>
+
+          <div className="credentials-grid">
+            <section className="panel credential-form-panel">
+              <div className="panel-heading">
+                <div><span className="overline">Write access</span><h2>{id ? "Rotate credential" : "Add credential"}</h2></div>
+                <span className="credential-lock" aria-hidden="true">⌁</span>
+              </div>
+              <form className="credential-form" onSubmit={onSubmit}>
+                <label htmlFor="credential-id">Credential ID<input id="credential-id" value={id} onChange={(event) => onIdChange(event.target.value)} placeholder="github-ci" autoComplete="off" required /></label>
+                <label htmlFor="credential-username">Username<input id="credential-username" value={username} onChange={(event) => onUsernameChange(event.target.value)} placeholder="automation-user" autoComplete="username" required /></label>
+                <label htmlFor="credential-secret">Secret<input id="credential-secret" type="password" value={secret} onChange={(event) => onSecretChange(event.target.value)} placeholder={id ? "enter a new secret" : "paste a provider token"} autoComplete="new-password" required /><small>Required for every save; the field is cleared after success.</small></label>
+                <div className="credential-form-actions">
+                  {id && <button className="button button-quiet" type="button" disabled={busy} onClick={onReset}>Clear</button>}
+                  <button className="button button-primary" type="submit" disabled={busy || !id.trim() || !username.trim() || !secret}>{busy ? "Saving…" : id ? "Rotate securely" : "Store credential"}</button>
+                </div>
+              </form>
+            </section>
+
+            <section className="panel credential-list-panel">
+              <div className="panel-heading">
+                <div><span className="overline">Inventory</span><h2>Known credentials</h2></div>
+                <span className="panel-count">{String(credentials.length).padStart(2, "0")}</span>
+              </div>
+              {credentials.length === 0 ? (
+                <div className="credentials-list-empty"><span>∅</span><p>No provider credential is stored yet.</p></div>
+              ) : (
+                <div className="credential-list">
+                  {credentials.map((credential) => (
+                    <div className="credential-row" key={credential.id}>
+                      <span className="credential-row-mark">◈</span>
+                      <div className="credential-copy"><strong>{credential.id}</strong><small>{credential.username} · secret sealed</small></div>
+                      <button className="button button-quiet credential-action" type="button" disabled={busy} onClick={() => onEdit(credential)}>Rotate</button>
+                      <button className="credential-delete" type="button" disabled={busy} aria-label={`Remove credential ${credential.id}`} onClick={() => void onRemove(credential)}>×</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          </div>
+
+          <p className="credential-boundary"><span />Only credential summaries are rendered here. Secret values are accepted by the admin API, encrypted by the vault, redacted from logs, and never included in responses.</p>
+        </>
+      )}
+    </div>
+  );
 }
 
 function AgentsPanel({ agents, online }: { agents: AgentSummary[]; online: boolean }) {

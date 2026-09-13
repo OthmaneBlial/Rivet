@@ -3,6 +3,7 @@ import type {
   BuildRecord,
   AgentSummary,
   ArtifactRecord,
+  CredentialSummary,
   LogRecord,
   MigrationResponse,
   Project,
@@ -130,6 +131,27 @@ export function agents(): Promise<AgentSummary[]> {
 
 export function extensions(): Promise<ExtensionManifest[]> {
   return request<ExtensionManifest[]>("/api/v1/extensions");
+}
+
+export function credentials(): Promise<CredentialSummary[]> {
+  return request<CredentialSummary[]>("/api/v1/credentials");
+}
+
+export function setCredential(
+  id: string,
+  input: { username: string; secret: string },
+): Promise<CredentialSummary> {
+  return request<CredentialSummary>(
+    `/api/v1/credentials/${encodeURIComponent(id)}`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+}
+
+export function deleteCredential(id: string): Promise<void> {
+  return request<void>(
+    `/api/v1/credentials/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
 }
 
 export function analyzeJenkinsfile(
