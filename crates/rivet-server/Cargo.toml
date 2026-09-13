@@ -14,6 +14,8 @@ rivet-scm = { path = "../rivet-scm" }
 rivet-storage = { path = "../rivet-storage" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tokio = { version = "1.47", features = ["net", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }

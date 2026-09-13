@@ -67,6 +67,9 @@ enum Command {
     Server {
         #[arg(long, default_value = "127.0.0.1:7878")]
         bind: SocketAddr,
+        /// Read a Bearer token from a private file without persisting it.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
     },
     /// Inspect or explicitly prepare a local Git repository.
     Scm {
@@ -143,8 +146,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Builds { project } => list_builds(&cli.data_dir, &project)?,
         Command::Logs { project, build } => show_logs(&cli.data_dir, &project, build)?,
         Command::Artifacts { project, build } => list_artifacts(&cli.data_dir, &project, build)?,
-        Command::Server { bind } => {
-            rivet_server::serve(cli.data_dir.join("rivet.db"), bind).await?
+        Command::Server { bind, token_file } => {
+            let auth_token = token_file.as_deref().map(read_auth_token).transpose()?;
+            rivet_server::serve_with_config(
+                cli.data_dir.join("rivet.db"),
+                rivet_server::ServerConfig { bind, auth_token },
+            )
+            .await?
         }
         Command::Scm { command } => inspect_scm(command).await?,
     }
@@ -183,6 +191,26 @@ async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Erro
 
 fn open_storage(data_dir: &Path) -> Result<Storage, Box<dyn std::error::Error>> {
     Ok(Storage::open(data_dir.join("rivet.db"))?)
+}
+
+fn read_auth_token(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let metadata = fs::metadata(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "token file must not be group- or world-readable: {}",
+                path.display()
+            )
+            .into());
+        }
+    }
+    let token = fs::read_to_string(path)?.trim().to_owned();
+    if token.is_empty() {
+        return Err(format!("token file is empty: {}", path.display()).into());
+    }
+    Ok(token)
 }
 
 fn init_repository(data_dir: &Path, repository: &Path) -> Result<(), Box<dyn std::error::Error>> {

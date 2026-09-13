@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -20,10 +21,12 @@ use rivet_scm::{GitPrepareOptions, GitRepository, GitSnapshot, ScmError};
 use rivet_storage::{ArtifactRecord, BuildDetails, BuildRecord, LogRecord, Storage, StorageError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -36,6 +39,13 @@ pub struct AppState {
     scheduler: Arc<Scheduler>,
     active_builds: Arc<Mutex<HashMap<BuildId, CancellationToken>>>,
     events: broadcast::Sender<BuildEvent>,
+    auth_digest: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub bind: SocketAddr,
+    pub auth_token: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -44,6 +54,10 @@ pub enum ServerError {
     Storage(#[from] StorageError),
     #[error("could not bind Rivet server: {0}")]
     Bind(#[from] std::io::Error),
+    #[error("binding Rivet outside loopback requires an authentication token: {0}")]
+    AuthRequired(SocketAddr),
+    #[error("Rivet authentication token cannot be empty")]
+    EmptyAuthToken,
 }
 
 #[derive(Debug, Error)]
@@ -177,6 +191,7 @@ pub fn router(state: AppState) -> Router {
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
+        .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
 }
 
@@ -227,9 +242,30 @@ async fn prepare_scm(
 }
 
 pub async fn serve(storage_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(), ServerError> {
-    let state = AppState::new(Storage::open(storage_path)?);
-    let listener = TcpListener::bind(bind).await?;
-    tracing::info!(%bind, "Rivet server listening");
+    serve_with_config(
+        storage_path,
+        ServerConfig {
+            bind,
+            auth_token: None,
+        },
+    )
+    .await
+}
+
+pub async fn serve_with_config(
+    storage_path: impl AsRef<Path>,
+    config: ServerConfig,
+) -> Result<(), ServerError> {
+    if !config.bind.ip().is_loopback() && config.auth_token.is_none() {
+        return Err(ServerError::AuthRequired(config.bind));
+    }
+    let state = match config.auth_token.as_deref() {
+        Some(token) if token.trim().is_empty() => return Err(ServerError::EmptyAuthToken),
+        Some(token) => AppState::with_token(Storage::open(storage_path)?, token),
+        None => AppState::new(Storage::open(storage_path)?),
+    };
+    let listener = TcpListener::bind(config.bind).await?;
+    tracing::info!(bind = %config.bind, "Rivet server listening");
     axum::serve(listener, router(state)).await?;
     Ok(())
 }
@@ -242,8 +278,52 @@ impl AppState {
             scheduler: Arc::new(Scheduler::new(2, Some(1))),
             active_builds: Arc::new(Mutex::new(HashMap::new())),
             events,
+            auth_digest: None,
         }
     }
+
+    fn with_token(storage: Storage, token: &str) -> Self {
+        let mut state = Self::new(storage);
+        state.auth_digest = Some(hash_token(token.as_bytes()));
+        state
+    }
+}
+
+async fn authenticate(
+    State(state): State<AppState>,
+    request: axum::http::Request<Body>,
+    next: Next,
+) -> Response {
+    if state.auth_digest.is_none() || request.uri().path() == "/api/v1/health" {
+        return next.run(request).await;
+    }
+    let authorized = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(|token| {
+            let candidate = hash_token(token.as_bytes());
+            bool::from(candidate.ct_eq(state.auth_digest.as_ref().expect("auth digest")))
+        })
+        .unwrap_or(false);
+    if authorized {
+        next.run(request).await
+    } else {
+        let mut response = (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "authentication required" })),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        response
+    }
+}
+
+fn hash_token(token: &[u8]) -> [u8; 32] {
+    Sha256::digest(token).into()
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -671,5 +751,61 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 4096).await.expect("body");
         assert_eq!(&body[..], br#"{"queued":0,"running":0,"capacity":2}"#);
+    }
+
+    #[tokio::test]
+    async fn authenticated_server_keeps_health_public_and_protects_api_routes() {
+        let health = router(AppState::with_token(
+            Storage::open_in_memory().expect("storage"),
+            "rivet-test-token",
+        ));
+        let response = health
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let unauthorized = router(AppState::with_token(
+            Storage::open_in_memory().expect("storage"),
+            "rivet-test-token",
+        ));
+        let response = unauthorized
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/queue")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer")
+        );
+
+        let authorized = router(AppState::with_token(
+            Storage::open_in_memory().expect("storage"),
+            "rivet-test-token",
+        ));
+        let response = authorized
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/queue")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer rivet-test-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
