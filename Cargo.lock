@@ -907,6 +907,7 @@ dependencies = [
  "chrono",
  "clap",
  "rivet-core",
+ "rivet-migration",
  "rivet-runner",
  "rivet-scm",
  "rivet-server",
@@ -940,6 +941,14 @@ dependencies = [
  "thiserror",
  "toml",
  "uuid",
+]
+
+[[package]]
+name = "rivet-migration"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
 ]
 
 [[package]]

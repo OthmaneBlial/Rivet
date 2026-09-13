@@ -4,6 +4,7 @@ use rivet_core::{
     BuildEvent, BuildStatus, CronExpression, ExecutionPlan, LogStream, Pipeline, Project,
     ScheduleId, SourceSnapshot,
 };
+use rivet_migration::analyze_jenkinsfile_file;
 use rivet_runner::{QueueHandle, Scheduler};
 use rivet_scm::{GitPrepareOptions, GitRepository, ScmError};
 use rivet_storage::Storage;
@@ -97,6 +98,11 @@ enum Command {
         #[command(subcommand)]
         command: ScheduleCommand,
     },
+    /// Analyze a Jenkinsfile without executing Groovy or plugin code.
+    Analyze {
+        #[command(subcommand)]
+        command: AnalyzeCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -125,6 +131,12 @@ enum ScheduleCommand {
     Disable { project: String, id: ScheduleId },
     /// Delete a schedule by UUID.
     Delete { project: String, id: ScheduleId },
+}
+
+#[derive(Debug, Subcommand)]
+enum AnalyzeCommand {
+    /// Report supported, partial, and unsupported Jenkins constructs as JSON.
+    Jenkinsfile { path: PathBuf },
 }
 
 #[derive(Debug, Args)]
@@ -218,6 +230,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Scm { command } => inspect_scm(command).await?,
         Command::Schedule { command } => manage_schedule(&cli.data_dir, command)?,
+        Command::Analyze { command } => analyze_file(command)?,
+    }
+    Ok(())
+}
+
+fn analyze_file(command: AnalyzeCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        AnalyzeCommand::Jenkinsfile { path } => {
+            let analysis = analyze_jenkinsfile_file(&path)?;
+            let output = serde_json::json!({
+                "source": path,
+                "analysis": analysis,
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
     }
     Ok(())
 }
