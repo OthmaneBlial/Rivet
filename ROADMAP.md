@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **92 / 100 points** (**92.55 weighted evidence
+The current verified total is **92 / 100 points** (**92.63 weighted evidence
 points**, displayed conservatively as 92%).
 
 | Workstream | Weight | Current state | Gate for completion |
@@ -16,7 +16,7 @@ points**, displayed conservatively as 92%).
 | Queue and scheduler | 6 | partial | FIFO tie ordering, bounded priorities, global/per-project limits, live telemetry, priority-ordered queue snapshots with a rendered queue control room, pre-execution cancellation, authenticated pause/resume administration, executor/CPU/memory-aware remote resource reservations, dependency-ordered stage graph admission, and parallel independent stage execution pass; richer local resource dimensions remain |
 | SQLite persistence | 6 | verified | Migration, build graph projection, reopen/history test |
 | API and live transport | 6 | partial | REST/loopback WebSocket, durable event replay, queue telemetry, build retry, schedule endpoints/dispatch, graceful SIGINT/SIGTERM shutdown, safe request IDs with structured method/route/status tracing, exact CORS allow-list, body limits, security headers, and policy-backed identity/project authorization pass; deployment operations remain |
-| CLI operator workflow | 3 | partial | project/run/history, parameterized builds, artifact listing, retry, schedule management, and detailed build inspection work; richer cancellation remains |
+| CLI operator workflow | 3 | verified | project/run/history, parameterized builds, artifact listing, retry, schedule management, detailed build inspection, and one-shot authenticated remote build cancellation command |
 | Tauri desktop control room | 10 | partial | native bundle, embedded engine health, rendered light-default/dark-toggle UX, artifact/retry views, schedule controls, desktop SCM preparation and runtime parameter controls, credential lifecycle view, online/offline recovery, real client build flow, and an ephemeral loopback engine origin in the packaged launch pass; final Tauri-window interaction and release QA remain |
 | Git/SCM integration | 8 | partial | direct Git inspect/checkout/fetch/clean operations, bounded provider refspec fetches, REST/CLI surfaces, explicit build-admission preparation, persisted build source identity, provider-neutral credential IDs, ephemeral HTTP/SSH auth handoff, project-scoped credential resolution, provider push/PR adapters, and strict deployment-controlled SSH host-key policy pass; broader provider lifecycle remains |
 | Triggers and scheduling | 5 | partial | manual/API entry points, validated persistent UTC cron schedules/server dispatch, signed generic webhook delivery, and signed GitHub/GitLab push plus PR/MR adapters pass; broader repository-event and upstream triggers remain |

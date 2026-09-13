@@ -24,6 +24,7 @@ rivet-runner = { path = "../rivet-runner" }
 rivet-scm = { path = "../rivet-scm" }
 rivet-server = { path = "../rivet-server" }
 rivet-storage = { path = "../rivet-storage" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json.workspace = true
 sha2.workspace = true
 tar = "0.4"

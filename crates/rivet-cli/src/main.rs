@@ -251,6 +251,18 @@ enum Command {
         #[arg(long)]
         build: i64,
     },
+    /// Request cancellation of a build owned by a running Rivet server.
+    Cancel {
+        project: String,
+        #[arg(long)]
+        build: i64,
+        /// HTTP(S) origin of the Rivet server; mutations are never retried automatically.
+        #[arg(long, default_value = "http://127.0.0.1:7878")]
+        server: String,
+        /// Read the Bearer token from a private file without persisting it.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
     /// Show artifacts collected for a build.
     Artifacts {
         project: String,
@@ -660,6 +672,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Builds { project } => list_builds(&cli.data_dir, &project)?,
         Command::Inspect { project, build } => inspect_build(&cli.data_dir, &project, build)?,
         Command::Logs { project, build } => show_logs(&cli.data_dir, &project, build)?,
+        Command::Cancel {
+            project,
+            build,
+            server,
+            token_file,
+        } => cancel_remote_build(&project, build, &server, token_file.as_deref()).await?,
         Command::Artifacts { project, build } => list_artifacts(&cli.data_dir, &project, build)?,
         Command::Artifact { command } => manage_artifacts(&cli.data_dir, command)?,
         Command::Retry {
@@ -2536,6 +2554,85 @@ fn show_logs(data_dir: &Path, name: &str, number: i64) -> Result<(), Box<dyn std
     Ok(())
 }
 
+fn cancel_endpoint(
+    server: &str,
+    project: &str,
+    number: i64,
+) -> Result<reqwest::Url, Box<dyn std::error::Error>> {
+    let mut endpoint = reqwest::Url::parse(server.trim_end_matches('/'))?;
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err("server must be a credential-free HTTP(S) origin or base URL".into());
+    }
+    {
+        let mut segments = endpoint
+            .path_segments_mut()
+            .map_err(|_| "server URL cannot be used as a base URL")?;
+        segments.pop_if_empty();
+        segments
+            .push("api")
+            .push("v1")
+            .push("projects")
+            .push(project)
+            .push("builds")
+            .push(&number.to_string())
+            .push("cancel");
+    }
+    Ok(endpoint)
+}
+
+async fn cancel_remote_build(
+    project: &str,
+    number: i64,
+    server: &str,
+    token_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = cancel_endpoint(server, project, number)?;
+    let token = token_file.map(read_auth_token).transpose()?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let mut request = client
+        .post(endpoint)
+        .header("accept", "application/json")
+        .header("x-request-id", uuid::Uuid::new_v4().to_string());
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    // This is deliberately one request: retrying a mutation after a network
+    // interruption could turn an uncertain cancellation into duplicate work.
+    let response = request.send().await?;
+    let status = response.status();
+    let body = response.bytes().await?;
+    if body.len() > 64 * 1024 {
+        return Err("server returned an oversized cancellation response".into());
+    }
+    if status == reqwest::StatusCode::ACCEPTED {
+        println!("Cancellation requested for {project} #{number}");
+        return Ok(());
+    }
+    let message = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|error| error.as_str())
+                .map(str::to_owned)
+        })
+        .filter(|message| !message.trim().is_empty())
+        .or_else(|| {
+            let message = String::from_utf8_lossy(&body).trim().to_owned();
+            (!message.is_empty()).then_some(message)
+        })
+        .unwrap_or_else(|| status.to_string());
+    Err(format!("server refused cancellation for {project} #{number}: {message}").into())
+}
+
 fn list_artifacts(
     data_dir: &Path,
     name: &str,
@@ -2632,6 +2729,32 @@ impl StatusLabel for rivet_core::StepStatus {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_endpoint_appends_encoded_build_route_to_a_base_url() {
+        let endpoint = cancel_endpoint("https://ci.example.test/rivet/", "team alpha", 42)
+            .expect("cancel endpoint");
+        assert_eq!(
+            endpoint.as_str(),
+            "https://ci.example.test/rivet/api/v1/projects/team%20alpha/builds/42/cancel"
+        );
+    }
+
+    #[test]
+    fn cancel_endpoint_rejects_credentials_query_and_non_http_urls() {
+        for server in [
+            "https://user:secret@ci.example.test",
+            "https://ci.example.test?token=secret",
+            "ws://ci.example.test",
+        ] {
+            assert!(cancel_endpoint(server, "project", 1).is_err(), "{server}");
         }
     }
 }

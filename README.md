@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.55 / 100** · displayed conservatively as the
+Weighted evidence score: **92.63 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -162,6 +162,7 @@ cargo run -p rivet -- run rivet --priority 20
 cargo run -p rivet -- builds rivet
 cargo run -p rivet -- inspect rivet --build 1
 cargo run -p rivet -- logs rivet --build 1
+cargo run -p rivet -- cancel rivet --build 1 --server http://127.0.0.1:7878
 ```
 
 The build command uses the Rust queue, real child processes, live event
@@ -170,7 +171,10 @@ captures the commit, reference, remote, and dirty state observed at admission.
 Use `--priority -100..100` to move urgent builds ahead of older queued work;
 equal priorities retain FIFO order and per-project/global capacity limits still
 apply. The HTTP build body accepts the same `priority` field. Press Ctrl-C
-during a running step to exercise the cancellation path.
+during a running step to exercise the local cancellation path. The `cancel`
+command sends one authenticated request to a running server; pass
+`--token-file` for a private Bearer token. Mutations are not retried after a
+network interruption, avoiding duplicate operator actions.
 
 Administrators can stop new admissions without interrupting running builds with
 `POST /api/v1/queue/pause`, inspect the `paused` field from `GET
