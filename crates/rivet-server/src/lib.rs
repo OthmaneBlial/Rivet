@@ -119,6 +119,8 @@ enum ApiError {
     #[error("webhook event ID already belongs to another project")]
     WebhookEventConflict,
     #[error(transparent)]
+    Migration(#[from] rivet_migration::MigrationError),
+    #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
     Pipeline(#[from] rivet_core::PipelineError),
@@ -154,9 +156,11 @@ impl IntoResponse for ApiError {
                 | rivet_scm::ScmError::InvalidOutput { .. }
                 | rivet_scm::ScmError::Filesystem(_) => StatusCode::INTERNAL_SERVER_ERROR,
             },
-            Self::Storage(_) | Self::Pipeline(_) | Self::Model(_) | Self::Scheduler(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::Migration(_)
+            | Self::Storage(_)
+            | Self::Pipeline(_)
+            | Self::Model(_)
+            | Self::Scheduler(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }
@@ -213,6 +217,20 @@ pub struct WebhookBuildRequest {
     pub parameters: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct JenkinsfileAnalysisRequest {
+    pub source: String,
+    #[serde(default)]
+    pub draft: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct JenkinsfileAnalysisResponse {
+    analysis: rivet_migration::JenkinsfileAnalysis,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft: Option<rivet_migration::RivetfileDraft>,
+}
+
 fn default_schedule_enabled() -> bool {
     true
 }
@@ -248,6 +266,7 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
         .route("/api/v1/health", get(health))
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/agents/connect", get(connect_agent))
+        .route("/api/v1/migration/jenkinsfile", post(analyze_jenkinsfile))
         .route("/api/v1/webhooks/generic", post(webhook_build))
         .route("/api/v1/queue", get(queue_status))
         .route("/api/v1/projects", get(list_projects).post(create_project))
@@ -557,6 +576,23 @@ async fn health() -> Json<HealthResponse> {
         service: "rivet-server",
         timestamp: Utc::now(),
     })
+}
+
+async fn analyze_jenkinsfile(
+    Json(request): Json<JenkinsfileAnalysisRequest>,
+) -> Result<Json<JenkinsfileAnalysisResponse>, ApiError> {
+    const MAX_JENKINSFILE_BYTES: usize = 200 * 1024;
+    if request.source.len() > MAX_JENKINSFILE_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "Jenkinsfile source exceeds {MAX_JENKINSFILE_BYTES} bytes"
+        )));
+    }
+    let analysis = rivet_migration::analyze_jenkinsfile(&request.source);
+    let draft = request
+        .draft
+        .then(|| rivet_migration::generate_rivetfile_draft(&request.source))
+        .transpose()?;
+    Ok(Json(JenkinsfileAnalysisResponse { analysis, draft }))
 }
 
 async fn queue_status(State(state): State<AppState>) -> Json<QueueStatusResponse> {
@@ -1438,6 +1474,40 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn migration_route_reports_findings_and_a_valid_draft() {
+        let app = router(AppState::new(Storage::open_in_memory().expect("storage")));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "source": "pipeline {\n  agent any\n  stages {\n    stage('Test') {\n      steps {\n        sh 'cargo test'\n      }\n    }\n  }\n}\n",
+            "draft": true,
+        }))
+        .expect("request body");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/migration/jenkinsfile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("response body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
+        assert_eq!(payload["analysis"]["status"], "partial");
+        assert_eq!(payload["analysis"]["constructs"][0]["line"], 1);
+        assert_eq!(payload["draft"]["converted_steps"], 1);
+        assert!(
+            payload["draft"]["rivetfile_toml"]
+                .as_str()
+                .is_some_and(|draft| draft.contains("migrated-jenkinsfile"))
+        );
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ import {
   createSchedule,
   deleteSchedule,
   artifactUrl,
+  analyzeJenkinsfile,
   artifacts,
   ENGINE_OFFLINE_MESSAGE,
   eventUrl,
@@ -26,6 +27,7 @@ import type {
   BuildRecord,
   BuildStatus,
   LogRecord,
+  MigrationResponse,
   Project,
   ScheduleRecord,
   StageDetails,
@@ -37,6 +39,7 @@ const NAV_ITEMS = [
   { label: "Agents", mark: "⊙", active: false },
   { label: "Artifacts", mark: "□", active: false },
   { label: "Credentials", mark: "◈", active: false },
+  { label: "Migration", mark: "⇄", active: true },
 ];
 
 const STATUS_LABEL: Record<BuildStatus, string> = {
@@ -51,6 +54,22 @@ const STATUS_LABEL: Record<BuildStatus, string> = {
 type Theme = "light" | "dark";
 
 const THEME_STORAGE_KEY = "rivet-theme";
+
+const DEFAULT_JENKINSFILE = `pipeline {
+  agent any
+  stages {
+    stage('Test') {
+      steps {
+        sh 'cargo test --workspace'
+      }
+    }
+    stage('Deploy') {
+      steps {
+        input message: 'Approve production deploy?'
+      }
+    }
+  }
+}`;
 
 function initialTheme(): Theme {
   if (typeof window === "undefined") return "light";
@@ -120,6 +139,9 @@ function App() {
   const [activeNav, setActiveNav] = useState("Pipelines");
   const [showCreate, setShowCreate] = useState(false);
   const [showScheduleCreate, setShowScheduleCreate] = useState(false);
+  const [migrationSource, setMigrationSource] = useState(DEFAULT_JENKINSFILE);
+  const [migrationResult, setMigrationResult] = useState<MigrationResponse | null>(null);
+  const [migrationBusy, setMigrationBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -350,6 +372,23 @@ function App() {
     }
   }
 
+  async function runMigrationAnalysis() {
+    if (!migrationSource.trim()) {
+      setError("Paste a Jenkinsfile before running the migration analysis.");
+      return;
+    }
+    setMigrationBusy(true);
+    setError(null);
+    try {
+      setMigrationResult(await analyzeJenkinsfile(migrationSource, true));
+      setEngineOnline(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not analyze Jenkinsfile");
+    } finally {
+      setMigrationBusy(false);
+    }
+  }
+
   const latest = buildList[0] ?? null;
   const passed = buildList.filter((build) => build.status === "passed").length;
   const successRate = buildList.length ? Math.round((passed / buildList.length) * 100) : 0;
@@ -446,7 +485,16 @@ function App() {
           </div>
         )}
 
-        {projectsList.length === 0 ? (
+        {activeNav === "Migration" ? (
+          <MigrationPanel
+            source={migrationSource}
+            result={migrationResult}
+            busy={migrationBusy}
+            online={engineOnline}
+            onChange={setMigrationSource}
+            onAnalyze={() => void runMigrationAnalysis()}
+          />
+        ) : projectsList.length === 0 ? (
           <Onboarding onCreate={() => setShowCreate(true)} online={engineOnline} />
         ) : (
           <div className="content-wrap">
@@ -658,6 +706,124 @@ function EmptyState({ text }: { text: string }) { return <div className="empty-s
 
 function Onboarding({ onCreate, online }: { onCreate: () => void; online: boolean }) {
   return <div className="onboarding"><div className="onboarding-mark"><RivetMark /></div><span className="eyebrow"><span className="eyebrow-line" />First connection</span><h1>Give the engine<br /><em>a pipeline to watch.</em></h1><p>Rivet keeps the execution signal close: a local repository, an explicit `Rivetfile.toml`, and a durable history you can trust.</p><button className="button button-primary onboarding-button" disabled={!online} onClick={onCreate}>＋ Connect a project <span>→</span></button><div className="onboarding-note"><span className="note-rule" />{online ? "The local engine is ready for a repository." : "Start `rivet server` to connect the local engine."}</div></div>;
+}
+
+function MigrationPanel({
+  source,
+  result,
+  busy,
+  online,
+  onChange,
+  onAnalyze,
+}: {
+  source: string;
+  result: MigrationResponse | null;
+  busy: boolean;
+  online: boolean;
+  onChange: (source: string) => void;
+  onAnalyze: () => void;
+}) {
+  const summary = result?.analysis.summary;
+  return (
+    <div className="content-wrap migration-page">
+      <section className="page-heading migration-heading">
+        <div>
+          <span className="eyebrow"><span className="eyebrow-line" />Migration assistant</span>
+          <h1>Move with evidence.</h1>
+          <p>Read a Jenkinsfile, see the migration boundary, and keep every ambiguous behavior visible.</p>
+        </div>
+        <div className="migration-version">
+          <span className="overline">Analyzer</span>
+          <strong>{result ? `v${result.analysis.analyzer_version}` : "v1"}</strong>
+          <small>local · no Groovy execution</small>
+        </div>
+      </section>
+
+      <div className="migration-grid">
+        <section className="panel migration-source-panel">
+          <div className="panel-heading">
+            <div><span className="overline">Source review</span><h2>Jenkinsfile</h2></div>
+            <span className="panel-count">{source.split(/\r?\n/).length.toString().padStart(2, "0")} lines</span>
+          </div>
+          <textarea
+            className="migration-editor"
+            aria-label="Jenkinsfile source"
+            value={source}
+            onChange={(event) => onChange(event.target.value)}
+            spellCheck={false}
+          />
+          <div className="migration-source-footer">
+            <span><i className={online ? "online" : "offline"} />{online ? "engine connected" : "engine unavailable"}</span>
+            <button className="button button-primary" type="button" disabled={!online || busy} onClick={onAnalyze}>
+              {busy ? "Analyzing…" : "Analyze Jenkinsfile"} <span>→</span>
+            </button>
+          </div>
+        </section>
+
+        <section className="panel migration-report-panel" aria-live="polite">
+          <div className="panel-heading">
+            <div><span className="overline">Compatibility signal</span><h2>Migration report</h2></div>
+            {result && <span className={`migration-status migration-${result.analysis.status}`}>{migrationStatusLabel(result.analysis.status)}</span>}
+          </div>
+          {!result ? (
+            <div className="migration-empty">
+              <span className="migration-empty-mark">⇄</span>
+              <strong>Analysis is standing by</strong>
+              <p>Paste a Jenkinsfile and run the local analyzer to see exact line-level findings.</p>
+            </div>
+          ) : (
+            <>
+              <div className="migration-summary" aria-label="Migration summary">
+                <MigrationMetric label="Supported" value={summary?.supported ?? 0} tone="supported" />
+                <MigrationMetric label="Needs review" value={summary?.partial ?? 0} tone="partial" />
+                <MigrationMetric label="Blocked" value={summary?.unsupported ?? 0} tone="unsupported" />
+              </div>
+              <div className="finding-list">
+                {result.analysis.constructs.map((finding) => (
+                  <article className="finding-row" key={`${finding.kind}-${finding.line}`}>
+                    <span className={`finding-line migration-${finding.status}`}>L{finding.line}</span>
+                    <div className="finding-copy">
+                      <div><strong>{finding.kind.replaceAll("_", " ")}</strong><span className={`finding-state migration-${finding.status}`}>{migrationStatusLabel(finding.status)}</span></div>
+                      <p>{finding.message}</p>
+                      {finding.rivet_mapping && <small>↳ {finding.rivet_mapping}</small>}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </>
+          )}
+        </section>
+      </div>
+
+      {result?.draft && (
+        <section className="panel migration-draft-panel">
+          <div className="panel-heading">
+            <div><span className="overline">Deterministic output</span><h2>Rivetfile draft</h2></div>
+            <span className={`migration-status migration-${result.draft.status}`}>{result.draft.converted_steps} steps converted</span>
+          </div>
+          {result.draft.rivetfile_toml ? (
+            <pre className="migration-draft-code">{result.draft.rivetfile_toml}</pre>
+          ) : (
+            <EmptyState text="No valid draft was generated from the deterministic subset." />
+          )}
+          {result.draft.warnings.length > 0 && (
+            <div className="migration-warnings">
+              <span className="overline">Review queue</span>
+              {result.draft.warnings.map((warning) => <p key={warning}>⚠ {warning}</p>)}
+            </div>
+          )}
+        </section>
+      )}
+    </div>
+  );
+}
+
+function MigrationMetric({ label, value, tone }: { label: string; value: number; tone: string }) {
+  return <div className={`migration-metric migration-${tone}`}><strong>{String(value).padStart(2, "0")}</strong><span>{label}</span></div>;
+}
+
+function migrationStatusLabel(status: "supported" | "partial" | "unsupported"): string {
+  return status === "supported" ? "Supported" : status === "partial" ? "Partial" : "Unsupported";
 }
 
 function CreateProjectModal({ busy, onClose, onSubmit }: { busy: boolean; onClose: () => void; onSubmit: (event: React.FormEvent<HTMLFormElement>) => void }) {

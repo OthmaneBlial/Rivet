@@ -993,6 +993,7 @@ dependencies = [
  "hmac",
  "rivet-agent-protocol",
  "rivet-core",
+ "rivet-migration",
  "rivet-runner",
  "rivet-scm",
  "rivet-storage",

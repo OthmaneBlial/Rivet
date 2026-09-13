@@ -3,6 +3,7 @@ import type {
   BuildRecord,
   ArtifactRecord,
   LogRecord,
+  MigrationResponse,
   Project,
   QueueResponse,
   QueueStats,
@@ -109,6 +110,16 @@ export function projects(): Promise<Project[]> {
 
 export function queueStats(): Promise<QueueStats> {
   return request<QueueStats>("/api/v1/queue");
+}
+
+export function analyzeJenkinsfile(
+  source: string,
+  draft = true,
+): Promise<MigrationResponse> {
+  return request<MigrationResponse>("/api/v1/migration/jenkinsfile", {
+    method: "POST",
+    body: JSON.stringify({ source, draft }),
+  });
 }
 
 export function builds(project: string): Promise<BuildRecord[]> {

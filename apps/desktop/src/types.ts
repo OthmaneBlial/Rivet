@@ -114,3 +114,39 @@ export interface QueueStats {
   running: number;
   capacity: number;
 }
+
+export type MigrationSupportLevel = "supported" | "partial" | "unsupported";
+
+export interface MigrationFinding {
+  kind: string;
+  status: MigrationSupportLevel;
+  line: number;
+  evidence: string;
+  message: string;
+  rivet_mapping?: string;
+}
+
+export interface MigrationAnalysis {
+  analyzer_version: number;
+  status: MigrationSupportLevel;
+  summary: {
+    supported: number;
+    partial: number;
+    unsupported: number;
+  };
+  constructs: MigrationFinding[];
+  recommendations: string[];
+}
+
+export interface RivetfileDraft {
+  status: MigrationSupportLevel;
+  converted_steps: number;
+  skipped_stages: string[];
+  warnings: string[];
+  rivetfile_toml?: string;
+}
+
+export interface MigrationResponse {
+  analysis: MigrationAnalysis;
+  draft?: RivetfileDraft;
+}
