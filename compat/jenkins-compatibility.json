@@ -30,6 +30,13 @@
       "evidence": ["crates/rivet-storage/migrations/001_initial.sql"]
     },
     {
+      "category": "Builds",
+      "feature": "Retry completed builds with preserved parameters",
+      "status": "partial",
+      "evidence": ["crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
+      "notes": "A retry creates a new build and reuses persisted parameters; richer retry policies and attempt grouping remain planned."
+    },
+    {
       "category": "Logs",
       "feature": "Timestamped stdout and stderr streaming",
       "status": "supported",
