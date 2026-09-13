@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **87 / 100 points** (**87.03 weighted evidence
+The current verified total is **87 / 100 points** (**87.83 weighted evidence
 points**, displayed conservatively as 87%).
 
 | Workstream | Weight | Current state | Gate for completion |
@@ -18,8 +18,8 @@ points**, displayed conservatively as 87%).
 | API and live transport | 6 | partial | REST/loopback WebSocket, durable event replay, queue telemetry, build retry, schedule endpoints/dispatch, graceful SIGINT/SIGTERM shutdown, safe request IDs with structured method/route/status tracing, exact CORS allow-list, body limits, security headers, and policy-backed identity/project authorization pass; user sessions and deployment operations remain |
 | CLI operator workflow | 3 | partial | project/run/history, parameterized builds, artifact listing, retry, and schedule management work; richer cancellation and inspection remain |
 | Tauri desktop control room | 10 | partial | native bundle, embedded engine health, rendered light-default/dark-toggle UX, artifact/retry views, schedule controls, online/offline recovery, real client build flow, and an ephemeral loopback engine origin in the packaged launch pass; final Tauri-window interaction and release QA remain |
-| Git/SCM integration | 8 | partial | direct Git inspect/checkout/fetch/clean operations, REST/CLI surfaces, explicit build-admission preparation, persisted build source identity, provider-neutral credential IDs, ephemeral Git auth handoff, and provider push adapters pass; credential/project lifecycle remains |
-| Triggers and scheduling | 5 | partial | manual/API entry points, validated persistent UTC cron schedules/server dispatch, signed generic webhook delivery, and signed GitHub/GitLab push adapters pass; pull-request, broader repository-event, and upstream triggers remain |
+| Git/SCM integration | 8 | partial | direct Git inspect/checkout/fetch/clean operations, bounded provider refspec fetches, REST/CLI surfaces, explicit build-admission preparation, persisted build source identity, provider-neutral credential IDs, ephemeral Git auth handoff, and provider push/PR adapters pass; credential/project lifecycle remains |
+| Triggers and scheduling | 5 | partial | manual/API entry points, validated persistent UTC cron schedules/server dispatch, signed generic webhook delivery, and signed GitHub/GitLab push plus PR/MR adapters pass; broader repository-event and upstream triggers remain |
 | Remote agents | 10 | partial | authenticated versioned registration/heartbeat contract, explicit pipeline requirements with local safety refusal, reconnecting agent CLI, reconnect-safe sessions, stale detection, capacity-aware online matching, rendered fleet view, matching capacity reservation, bounded workspace and artifact transfer, shared-runner remote execution, typed event/output relay, cancellation, one bounded replacement-agent attempt with clean terminal failure, and idempotent startup reconciliation of persisted incomplete builds pass; resuming the same remote attempt after restart, exactly-once semantics, and richer retry policy remain |
 | Container execution | 4 | partial | validated container declarations and bounded Docker command assembly pass; Docker runtime cleanup, timeout/cancellation, image policy, and artifact extraction remain unverified |
 | Artifacts | 4 | partial | local and remote workspace collection, upload/download, bounded checksum-verified transfer, metadata, storage boundary, and explicit retention pruning for completed builds pass; remote object backends remain |
@@ -43,8 +43,8 @@ flow inside the packaged app, API
 deployment hardening, resuming remote attempts across server restart and
 richer retry policy, credential ownership/rotation/keychain integration, user
 sessions and external identity providers, live compatibility capture adapters
-and a permanent differential regression corpus, pull-request and broader
-repository-event mapping, upstream triggers, full Groovy/plugin migration
+and a permanent differential regression corpus, broader repository-event
+mapping, upstream triggers, full Groovy/plugin migration
 semantics, and generated Rivetfile conversion with fixture-backed migration
 regressions.
 Test clean checkout behavior

@@ -29,6 +29,9 @@ pub struct GitPrepareOptions {
     pub remote: String,
     pub fetch: bool,
     pub revision: Option<String>,
+    /// Optional provider refspec used to make a pull-request revision
+    /// available before detached checkout.
+    pub fetch_ref: Option<String>,
     pub clean: bool,
     pub clean_ignored: bool,
     /// Reference resolved by the hosting layer; the secret never enters this
@@ -42,6 +45,7 @@ impl Default for GitPrepareOptions {
             remote: "origin".to_owned(),
             fetch: false,
             revision: None,
+            fetch_ref: None,
             clean: false,
             clean_ignored: false,
             credential_id: None,
@@ -211,6 +215,23 @@ impl GitRepository {
             .map(|_| ())
     }
 
+    pub async fn fetch_ref_with_credential(
+        &self,
+        remote: &str,
+        refspec: &str,
+        credential: Option<&GitHttpCredential>,
+    ) -> Result<(), ScmError> {
+        validate_argument(remote, "remote")?;
+        validate_refspec(refspec)?;
+        self.run(
+            ["fetch", "--prune", remote, refspec],
+            "fetch refspec",
+            credential,
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub async fn checkout(&self, revision: &str) -> Result<(), ScmError> {
         validate_argument(revision, "revision")?;
         self.run(["checkout", "--detach", revision], "checkout", None)
@@ -237,8 +258,13 @@ impl GitRepository {
         credential: Option<&GitHttpCredential>,
     ) -> Result<GitSnapshot, ScmError> {
         if options.fetch {
-            self.fetch_with_credential(&options.remote, credential)
-                .await?;
+            if let Some(refspec) = options.fetch_ref.as_deref() {
+                self.fetch_ref_with_credential(&options.remote, refspec, credential)
+                    .await?;
+            } else {
+                self.fetch_with_credential(&options.remote, credential)
+                    .await?;
+            }
         }
         if let Some(revision) = options.revision.as_deref() {
             self.checkout(revision).await?;
@@ -363,6 +389,24 @@ fn validate_argument(value: &str, label: &'static str) -> Result<(), ScmError> {
     Ok(())
 }
 
+fn validate_refspec(refspec: &str) -> Result<(), ScmError> {
+    if refspec.is_empty()
+        || refspec.len() > 512
+        || refspec.starts_with('-')
+        || refspec.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric()
+                || matches!(byte, b'+' | b':' | b'/' | b'.' | b'_' | b'-' | b'*'))
+        })
+    {
+        return Err(ScmError::Command {
+            operation: "fetch refspec",
+            code: None,
+            message: "refspec contains unsupported characters or is too long".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +482,7 @@ mod tests {
         let snapshot = repository
             .prepare(&GitPrepareOptions {
                 revision: Some(first_revision.clone()),
+                fetch_ref: None,
                 clean: true,
                 credential_id: None,
                 ..GitPrepareOptions::default()
@@ -448,6 +493,35 @@ mod tests {
         assert_eq!(snapshot.branch, None);
         assert!(!dir.path().join("throwaway.txt").exists());
         assert!(!snapshot.dirty);
+    }
+
+    #[tokio::test]
+    async fn prepare_fetches_a_bounded_refspec_before_checkout() {
+        let repository_dir = repository().await;
+        let bare_dir = tempfile::tempdir().expect("bare repository");
+        git(bare_dir.path(), &["init", "--bare", "-q"]).await;
+        let remote = bare_dir.path().to_str().expect("remote path");
+        git(repository_dir.path(), &["remote", "add", "origin", remote]).await;
+        git(
+            repository_dir.path(),
+            &["push", "-q", "origin", "HEAD:refs/heads/main"],
+        )
+        .await;
+        let revision = git(repository_dir.path(), &["rev-parse", "HEAD"]).await;
+        let repository = GitRepository::open(repository_dir.path())
+            .await
+            .expect("open");
+        let snapshot = repository
+            .prepare(&GitPrepareOptions {
+                remote: "origin".into(),
+                fetch: true,
+                revision: Some(revision.clone()),
+                fetch_ref: Some("+refs/heads/main:refs/remotes/origin/pull/42".into()),
+                ..GitPrepareOptions::default()
+            })
+            .await
+            .expect("prepare refspec");
+        assert_eq!(snapshot.revision, revision);
     }
 
     #[tokio::test]
@@ -495,5 +569,12 @@ mod tests {
         assert!(!redacted.contains(&encoded));
         assert!(redacted.contains("[redacted]"));
         assert!(!format!("{credential:?}").contains("fixture-token-value"));
+    }
+
+    #[test]
+    fn rejects_unsafe_fetch_refspecs_before_git() {
+        assert!(validate_refspec("+refs/pull/42/head:refs/remotes/origin/pull/42").is_ok());
+        assert!(validate_refspec("--upload-pack=sh").is_err());
+        assert!(validate_refspec("refs/pull/42/head:refs/remotes/origin/pull/42\n").is_err());
     }
 }

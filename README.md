@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **87% verified** · `███████████████████░`<br>
-Weighted evidence score: **87.03 / 100** · displayed conservatively as the
+Weighted evidence score: **87.83 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -283,13 +283,16 @@ POST /api/v1/webhooks/github/<rivet-project>
 POST /api/v1/webhooks/gitlab/<rivet-project>
 ```
 
-GitHub accepts signed `push` deliveries (and acknowledges `ping`) using
-`X-Hub-Signature-256`, `X-GitHub-Event`, and `X-GitHub-Delivery`. GitLab accepts
-`Push Hook` and `Tag Push Hook` deliveries using the signed
+GitHub accepts signed `push` and `pull_request` deliveries (and acknowledges
+`ping`) using `X-Hub-Signature-256`, `X-GitHub-Event`, and `X-GitHub-Delivery`.
+GitLab accepts `Push Hook`, `Tag Push Hook`, and `Merge Request Hook` deliveries
+using the signed
 `webhook-id`/`webhook-timestamp`/`webhook-signature` headers; the legacy
 `X-Gitlab-Token` form is also accepted for installations that have not enabled
-the newer signing headers. Both adapters validate the commit SHA, normalize to
-the same idempotent build admission path, and can attach a default non-secret
+the newer signing headers. Push adapters validate the commit SHA; PR/MR
+adapters accept only opened, reopened, or updated/synchronized actions, fetch
+the provider head ref through a bounded refspec, and then normalize to the same
+idempotent build admission path. All adapters can attach a default non-secret
 Rivet credential ID for the fetch.
 
 Configure the provider keys through private files and, when needed, point each
@@ -310,8 +313,8 @@ cargo run -p rivet -- --data-dir .rivet server \
 The provider contracts are documented by [GitHub's webhook signature
 validation guide](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)
 and [GitLab's webhook integration documentation](https://docs.gitlab.com/user/project/integrations/webhooks/).
-Pull requests, upstream-trigger mapping, and broader provider event coverage
-remain future gates.
+Upstream-trigger mapping and broader provider event coverage remain future
+gates.
 
 SCM credentials use a local passphrase-encrypted vault. The CLI reads the
 passphrase and provider secret from private files, so neither value is placed
@@ -343,7 +346,8 @@ cargo run -p rivet -- --data-dir .rivet server \
 
 Build admission and explicit SCM preparation accept only the non-secret
 credential ID, for example `{ "remote": "origin", "fetch": true,
-"credential_id": "github" }`. Rivet resolves the ID locally, passes HTTP
+"credential_id": "github" }`. Provider PR/MR deliveries additionally carry a
+validated `fetch_ref`. Rivet resolves the ID locally, passes HTTP
 Basic auth to the Git child process through ephemeral configuration, and
 redacts the secret and encoded header from command errors. The vault stores
 authenticated ciphertext only; credential rotation, keychain integration, and

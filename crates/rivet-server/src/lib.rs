@@ -278,6 +278,9 @@ pub struct WebhookBuildRequest {
     pub project: String,
     #[serde(default)]
     pub revision: Option<String>,
+    /// Optional provider refspec fetched before checking out the revision.
+    #[serde(default)]
+    pub fetch_ref: Option<String>,
     #[serde(default)]
     pub remote: Option<String>,
     #[serde(default)]
@@ -457,6 +460,9 @@ pub struct PrepareScmRequest {
     #[serde(default)]
     pub fetch: bool,
     pub revision: Option<String>,
+    /// Optional bounded provider refspec fetched before checking out revision.
+    #[serde(default)]
+    pub fetch_ref: Option<String>,
     #[serde(default)]
     pub clean: bool,
     #[serde(default)]
@@ -495,6 +501,11 @@ async fn prepare_scm(
             "an SCM credential requires fetch=true".into(),
         ));
     }
+    if request.fetch_ref.is_some() && !request.fetch {
+        return Err(ApiError::BadRequest(
+            "an SCM fetch_ref requires fetch=true".into(),
+        ));
+    }
     let credential = resolve_git_credential(
         state.credentials.as_deref(),
         request.credential_id.as_deref(),
@@ -506,6 +517,7 @@ async fn prepare_scm(
                     remote: request.remote,
                     fetch: request.fetch,
                     revision: request.revision,
+                    fetch_ref: request.fetch_ref,
                     clean: request.clean,
                     clean_ignored: request.clean_ignored,
                     credential_id: request.credential_id,
@@ -1541,11 +1553,16 @@ async fn enqueue_webhook_build(
         ));
     }
 
-    let scm = if request.fetch || request.revision.is_some() || request.remote.is_some() {
+    let scm = if request.fetch
+        || request.revision.is_some()
+        || request.fetch_ref.is_some()
+        || request.remote.is_some()
+    {
         Some(PrepareScmRequest {
             remote: request.remote.unwrap_or_else(default_remote),
             fetch: request.fetch,
             revision: request.revision,
+            fetch_ref: request.fetch_ref,
             clean: false,
             clean_ignored: false,
             credential_id: request.credential_id,
@@ -1596,32 +1613,73 @@ fn normalize_github_webhook(
         return Ok(None);
     }
     let event_id = required_header(headers, "x-github-delivery")?;
-    if event != "push" {
-        return Err(ApiError::BadRequest(format!(
-            "unsupported GitHub webhook event: {event}"
-        )));
-    }
     let payload: serde_json::Value = serde_json::from_slice(body)
         .map_err(|error| ApiError::BadRequest(format!("invalid GitHub webhook JSON: {error}")))?;
-    if payload
-        .get("deleted")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Ok(None);
+    match event.as_str() {
+        "push" => {
+            if payload
+                .get("deleted")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Ok(None);
+            }
+            let Some(revision) = normalize_commit_revision(payload.get("after"), "GitHub after")?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(WebhookBuildRequest {
+                event_id,
+                project,
+                revision: Some(revision),
+                fetch_ref: None,
+                remote: Some("origin".into()),
+                fetch: true,
+                credential_id,
+                parameters: BTreeMap::new(),
+            }))
+        }
+        "pull_request" => {
+            let action = payload
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    ApiError::BadRequest("GitHub pull_request action is missing".into())
+                })?;
+            if !matches!(action, "opened" | "reopened" | "synchronize") {
+                return Ok(None);
+            }
+            let number = payload
+                .get("number")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    ApiError::BadRequest("GitHub pull_request number is missing".into())
+                })?;
+            let Some(revision) = normalize_commit_revision(
+                payload
+                    .get("pull_request")
+                    .and_then(|value| value.get("head"))
+                    .and_then(|value| value.get("sha")),
+                "GitHub pull_request head.sha",
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(WebhookBuildRequest {
+                event_id,
+                project,
+                revision: Some(revision),
+                fetch_ref: Some(github_pull_request_refspec(number)?),
+                remote: Some("origin".into()),
+                fetch: true,
+                credential_id,
+                parameters: BTreeMap::new(),
+            }))
+        }
+        _ => Err(ApiError::BadRequest(format!(
+            "unsupported GitHub webhook event: {event}"
+        ))),
     }
-    let Some(revision) = normalize_commit_revision(payload.get("after"), "GitHub after")? else {
-        return Ok(None);
-    };
-    Ok(Some(WebhookBuildRequest {
-        event_id,
-        project,
-        revision: Some(revision),
-        remote: Some("origin".into()),
-        fetch: true,
-        credential_id,
-        parameters: BTreeMap::new(),
-    }))
 }
 
 fn normalize_gitlab_webhook(
@@ -1633,11 +1691,6 @@ fn normalize_gitlab_webhook(
 ) -> Result<Option<WebhookBuildRequest>, ApiError> {
     verify_gitlab_webhook_signature(secret, headers, body)?;
     let event = required_header(headers, "x-gitlab-event")?;
-    if event != "Push Hook" && event != "Tag Push Hook" {
-        return Err(ApiError::BadRequest(format!(
-            "unsupported GitLab webhook event: {event}"
-        )));
-    }
     let event_id = first_header(
         headers,
         &["webhook-id", "x-gitlab-event-uuid", "idempotency-key"],
@@ -1645,18 +1698,86 @@ fn normalize_gitlab_webhook(
     .ok_or(ApiError::EmptyWebhookEventId)?;
     let payload: serde_json::Value = serde_json::from_slice(body)
         .map_err(|error| ApiError::BadRequest(format!("invalid GitLab webhook JSON: {error}")))?;
-    let Some(revision) = normalize_commit_revision(payload.get("after"), "GitLab after")? else {
-        return Ok(None);
-    };
-    Ok(Some(WebhookBuildRequest {
-        event_id,
-        project,
-        revision: Some(revision),
-        remote: Some("origin".into()),
-        fetch: true,
-        credential_id,
-        parameters: BTreeMap::new(),
-    }))
+    match event.as_str() {
+        "Push Hook" | "Tag Push Hook" => {
+            let Some(revision) = normalize_commit_revision(payload.get("after"), "GitLab after")?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(WebhookBuildRequest {
+                event_id,
+                project,
+                revision: Some(revision),
+                fetch_ref: None,
+                remote: Some("origin".into()),
+                fetch: true,
+                credential_id,
+                parameters: BTreeMap::new(),
+            }))
+        }
+        "Merge Request Hook" => {
+            let attributes = payload.get("object_attributes").ok_or_else(|| {
+                ApiError::BadRequest("GitLab merge request attributes are missing".into())
+            })?;
+            let action = attributes
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    ApiError::BadRequest("GitLab merge request action is missing".into())
+                })?;
+            if !matches!(action, "open" | "reopen" | "update") {
+                return Ok(None);
+            }
+            let iid = attributes
+                .get("iid")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    ApiError::BadRequest("GitLab merge request IID is missing".into())
+                })?;
+            let Some(revision) = normalize_commit_revision(
+                attributes
+                    .get("last_commit")
+                    .and_then(|value| value.get("id")),
+                "GitLab merge request last_commit.id",
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(WebhookBuildRequest {
+                event_id,
+                project,
+                revision: Some(revision),
+                fetch_ref: Some(gitlab_merge_request_refspec(iid)?),
+                remote: Some("origin".into()),
+                fetch: true,
+                credential_id,
+                parameters: BTreeMap::new(),
+            }))
+        }
+        _ => Err(ApiError::BadRequest(format!(
+            "unsupported GitLab webhook event: {event}"
+        ))),
+    }
+}
+
+fn github_pull_request_refspec(number: u64) -> Result<String, ApiError> {
+    provider_pull_request_refspec("refs/pull", number)
+}
+
+fn gitlab_merge_request_refspec(iid: u64) -> Result<String, ApiError> {
+    provider_pull_request_refspec("refs/merge-requests", iid)
+}
+
+fn provider_pull_request_refspec(prefix: &str, number: u64) -> Result<String, ApiError> {
+    if number == 0 || number > 9_999_999_999 {
+        return Err(ApiError::BadRequest(
+            "pull request number is outside the supported range".into(),
+        ));
+    }
+    let destination = prefix.strip_prefix("refs/").unwrap_or(prefix);
+    Ok(format!(
+        "+{prefix}/{number}/head:refs/remotes/origin/{destination}/{number}"
+    ))
 }
 
 fn normalize_commit_revision(
@@ -3118,6 +3239,11 @@ async fn capture_source_snapshot(
                             "an SCM credential requires fetch=true".into(),
                         ));
                     }
+                    if request.fetch_ref.is_some() && !request.fetch {
+                        return Err(ApiError::BadRequest(
+                            "an SCM fetch_ref requires fetch=true".into(),
+                        ));
+                    }
                     let credential =
                         resolve_git_credential(credentials, request.credential_id.as_deref())?;
                     repository
@@ -3126,6 +3252,7 @@ async fn capture_source_snapshot(
                                 remote: request.remote.clone(),
                                 fetch: request.fetch,
                                 revision: request.revision.clone(),
+                                fetch_ref: request.fetch_ref.clone(),
                                 clean: request.clean,
                                 clean_ignored: request.clean_ignored,
                                 credential_id: request.credential_id.clone(),
@@ -4495,6 +4622,61 @@ program = "true"
     }
 
     #[test]
+    fn github_pull_request_webhook_fetches_the_provider_ref() {
+        let body = br#"{"action":"synchronize","number":42,"pull_request":{"head":{"sha":"c783c3523482029c449dcdff1209ed06409b83bc"}}}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", HeaderValue::from_static("pull_request"));
+        headers.insert(
+            "x-github-delivery",
+            HeaderValue::from_static("github-pr-delivery-1"),
+        );
+        let signature = sign_webhook("github-fixture-secret", body);
+        headers.insert(
+            "x-hub-signature-256",
+            HeaderValue::from_str(&signature).expect("signature header"),
+        );
+
+        let request = normalize_github_webhook(
+            b"github-fixture-secret",
+            &headers,
+            body,
+            "demo".into(),
+            Some("github".into()),
+        )
+        .expect("normalize")
+        .expect("pull request request");
+        assert_eq!(request.event_id, "github-pr-delivery-1");
+        assert_eq!(
+            request.revision.as_deref(),
+            Some("c783c3523482029c449dcdff1209ed06409b83bc")
+        );
+        assert_eq!(
+            request.fetch_ref.as_deref(),
+            Some("+refs/pull/42/head:refs/remotes/origin/pull/42")
+        );
+        assert!(request.fetch);
+
+        let ignored = br#"{"action":"closed","number":42,"pull_request":{"head":{"sha":"c783c3523482029c449dcdff1209ed06409b83bc"}}}"#;
+        let mut ignored_headers = headers;
+        ignored_headers.insert(
+            "x-hub-signature-256",
+            HeaderValue::from_str(&sign_webhook("github-fixture-secret", ignored))
+                .expect("ignored signature"),
+        );
+        assert!(
+            normalize_github_webhook(
+                b"github-fixture-secret",
+                &ignored_headers,
+                ignored,
+                "demo".into(),
+                None,
+            )
+            .expect("ignored normalize")
+            .is_none()
+        );
+    }
+
+    #[test]
     fn gitlab_signed_push_webhook_checks_timestamp_and_normalizes_event_id() {
         let signing_key = b"gitlab-signing-fixture";
         let signing_token = format!("whsec_{}", STANDARD.encode(signing_key));
@@ -4532,6 +4714,51 @@ program = "true"
         assert_eq!(
             request.revision.as_deref(),
             Some("c783c3523482029c449dcdff1209ed06409b83bc")
+        );
+        assert!(request.fetch);
+    }
+
+    #[test]
+    fn gitlab_merge_request_webhook_fetches_the_provider_ref() {
+        let signing_key = b"gitlab-signing-fixture";
+        let signing_token = format!("whsec_{}", STANDARD.encode(signing_key));
+        let message_id = "gitlab-mr-delivery-1";
+        let timestamp = Utc::now().timestamp();
+        let body = br#"{"object_attributes":{"action":"update","iid":7,"last_commit":{"id":"c783c3523482029c449dcdff1209ed06409b83bc"}}}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-gitlab-event",
+            HeaderValue::from_static("Merge Request Hook"),
+        );
+        headers.insert("webhook-id", HeaderValue::from_static(message_id));
+        headers.insert(
+            "webhook-timestamp",
+            HeaderValue::from_str(&timestamp.to_string()).expect("timestamp"),
+        );
+        headers.insert(
+            "webhook-signature",
+            HeaderValue::from_str(&sign_gitlab_webhook(
+                signing_key,
+                message_id,
+                timestamp,
+                body,
+            ))
+            .expect("signature"),
+        );
+
+        let request = normalize_gitlab_webhook(
+            signing_token.as_bytes(),
+            &headers,
+            body,
+            "demo".into(),
+            None,
+        )
+        .expect("normalize")
+        .expect("merge request request");
+        assert_eq!(request.event_id, message_id);
+        assert_eq!(
+            request.fetch_ref.as_deref(),
+            Some("+refs/merge-requests/7/head:refs/remotes/origin/merge-requests/7")
         );
         assert!(request.fetch);
     }
