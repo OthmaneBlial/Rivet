@@ -110,6 +110,18 @@ enum Command {
         /// Read the generic webhook HMAC secret from a private file.
         #[arg(long)]
         webhook_secret_file: Option<PathBuf>,
+        /// Read the GitHub webhook HMAC secret from a private file.
+        #[arg(long)]
+        github_webhook_secret_file: Option<PathBuf>,
+        /// Read the GitLab webhook signing/secret token from a private file.
+        #[arg(long)]
+        gitlab_webhook_secret_file: Option<PathBuf>,
+        /// Default Rivet credential ID for GitHub push fetches.
+        #[arg(long)]
+        github_webhook_credential_id: Option<String>,
+        /// Default Rivet credential ID for GitLab push fetches.
+        #[arg(long)]
+        gitlab_webhook_credential_id: Option<String>,
         /// Open the passphrase-encrypted SCM credential vault.
         #[arg(long)]
         credentials_file: Option<PathBuf>,
@@ -338,6 +350,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             token_file,
             auth_policy_file,
             webhook_secret_file,
+            github_webhook_secret_file,
+            gitlab_webhook_secret_file,
+            github_webhook_credential_id,
+            gitlab_webhook_credential_id,
             credentials_file,
             credentials_passphrase_file,
             allowed_origins,
@@ -346,6 +362,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let webhook_secret = webhook_secret_file
                 .as_deref()
                 .map(read_webhook_secret)
+                .transpose()?;
+            let github_webhook_secret = github_webhook_secret_file
+                .as_deref()
+                .map(|path| read_private_value(path, "GitHub webhook secret"))
+                .transpose()?;
+            let gitlab_webhook_secret = gitlab_webhook_secret_file
+                .as_deref()
+                .map(|path| read_private_value(path, "GitLab webhook secret"))
                 .transpose()?;
             let credentials_passphrase = credentials_passphrase_file
                 .as_deref()
@@ -358,6 +382,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     auth_token,
                     auth_policy_file,
                     webhook_secret,
+                    github_webhook_secret,
+                    gitlab_webhook_secret,
+                    github_webhook_credential_id,
+                    gitlab_webhook_credential_id,
                     credentials_file,
                     credentials_passphrase,
                     allowed_origins,

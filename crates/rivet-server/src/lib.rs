@@ -12,6 +12,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use rivet_agent_protocol::{
@@ -68,6 +69,10 @@ pub struct AppState {
     auth_digest: Option<[u8; 32]>,
     auth_policy: Option<Arc<AuthPolicy>>,
     webhook_secret: Option<Vec<u8>>,
+    github_webhook_secret: Option<Vec<u8>>,
+    gitlab_webhook_secret: Option<Vec<u8>>,
+    github_webhook_credential_id: Option<String>,
+    gitlab_webhook_credential_id: Option<String>,
     credentials: Option<Arc<CredentialVault>>,
     agents: AgentRegistry,
     remote_messages: Arc<Mutex<HashMap<BuildId, RemoteBuildRoute>>>,
@@ -85,6 +90,10 @@ pub struct ServerConfig {
     pub auth_token: Option<String>,
     pub auth_policy_file: Option<PathBuf>,
     pub webhook_secret: Option<String>,
+    pub github_webhook_secret: Option<String>,
+    pub gitlab_webhook_secret: Option<String>,
+    pub github_webhook_credential_id: Option<String>,
+    pub gitlab_webhook_credential_id: Option<String>,
     pub credentials_file: Option<PathBuf>,
     pub credentials_passphrase: Option<String>,
     pub allowed_origins: Vec<String>,
@@ -106,6 +115,10 @@ pub enum ServerError {
     AuthPolicy(#[from] AuthError),
     #[error("Rivet webhook secret cannot be empty")]
     EmptyWebhookSecret,
+    #[error("{provider} webhook secret cannot be empty")]
+    EmptyProviderWebhookSecret { provider: &'static str },
+    #[error("{provider} webhook credential ID cannot be empty")]
+    EmptyProviderWebhookCredential { provider: &'static str },
     #[error("credential vault configuration requires both a file and a passphrase")]
     IncompleteCredentialVaultConfig,
     #[error("could not open credential vault: {0}")]
@@ -139,6 +152,10 @@ enum ApiError {
     Forbidden(String),
     #[error("webhook delivery signatures are not configured")]
     WebhookNotConfigured,
+    #[error("GitHub webhook delivery signatures are not configured")]
+    GitHubWebhookNotConfigured,
+    #[error("GitLab webhook delivery signatures are not configured")]
+    GitLabWebhookNotConfigured,
     #[error("invalid webhook signature")]
     InvalidWebhookSignature,
     #[error("webhook event ID cannot be empty")]
@@ -173,7 +190,9 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST
             }
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
-            Self::WebhookNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
+            Self::WebhookNotConfigured
+            | Self::GitHubWebhookNotConfigured
+            | Self::GitLabWebhookNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
             Self::InvalidWebhookSignature => StatusCode::UNAUTHORIZED,
             Self::EmptyWebhookEventId
             | Self::WebhookEventIdTooLong
@@ -319,6 +338,8 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
         .route("/api/v1/agents/connect", get(connect_agent))
         .route("/api/v1/migration/jenkinsfile", post(analyze_jenkinsfile))
         .route("/api/v1/webhooks/generic", post(webhook_build))
+        .route("/api/v1/webhooks/github/{project}", post(github_webhook))
+        .route("/api/v1/webhooks/gitlab/{project}", post(gitlab_webhook))
         .route("/api/v1/queue", get(queue_status))
         .route("/api/v1/projects", get(list_projects).post(create_project))
         .route(
@@ -487,6 +508,10 @@ pub async fn serve(storage_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(
             auth_token: None,
             auth_policy_file: None,
             webhook_secret: None,
+            github_webhook_secret: None,
+            gitlab_webhook_secret: None,
+            github_webhook_credential_id: None,
+            gitlab_webhook_credential_id: None,
             credentials_file: None,
             credentials_passphrase: None,
             allowed_origins: default_allowed_origins(),
@@ -539,6 +564,18 @@ pub async fn serve_with_listener(
         credentials,
     );
     state.auth_policy = auth_policy;
+    state.github_webhook_secret = config
+        .github_webhook_secret
+        .as_deref()
+        .map(str::as_bytes)
+        .map(ToOwned::to_owned);
+    state.gitlab_webhook_secret = config
+        .gitlab_webhook_secret
+        .as_deref()
+        .map(str::as_bytes)
+        .map(ToOwned::to_owned);
+    state.github_webhook_credential_id = config.github_webhook_credential_id;
+    state.gitlab_webhook_credential_id = config.gitlab_webhook_credential_id;
     let allowed_origins = if config.allowed_origins.is_empty() {
         default_allowed_origins()
     } else {
@@ -570,6 +607,34 @@ fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
         .is_some_and(|secret| secret.trim().is_empty())
     {
         return Err(ServerError::EmptyWebhookSecret);
+    }
+    if config
+        .github_webhook_secret
+        .as_deref()
+        .is_some_and(|secret| secret.trim().is_empty())
+    {
+        return Err(ServerError::EmptyProviderWebhookSecret { provider: "GitHub" });
+    }
+    if config
+        .gitlab_webhook_secret
+        .as_deref()
+        .is_some_and(|secret| secret.trim().is_empty())
+    {
+        return Err(ServerError::EmptyProviderWebhookSecret { provider: "GitLab" });
+    }
+    if config
+        .github_webhook_credential_id
+        .as_deref()
+        .is_some_and(|credential| credential.trim().is_empty())
+    {
+        return Err(ServerError::EmptyProviderWebhookCredential { provider: "GitHub" });
+    }
+    if config
+        .gitlab_webhook_credential_id
+        .as_deref()
+        .is_some_and(|credential| credential.trim().is_empty())
+    {
+        return Err(ServerError::EmptyProviderWebhookCredential { provider: "GitLab" });
     }
     if config.credentials_file.is_some() != config.credentials_passphrase.is_some() {
         return Err(ServerError::IncompleteCredentialVaultConfig);
@@ -631,6 +696,10 @@ impl AppState {
             auth_digest: None,
             auth_policy: None,
             webhook_secret: None,
+            github_webhook_secret: None,
+            gitlab_webhook_secret: None,
+            github_webhook_credential_id: None,
+            gitlab_webhook_credential_id: None,
             credentials: None,
             agents: AgentRegistry::default(),
             remote_messages: Arc::new(Mutex::new(HashMap::new())),
@@ -1244,9 +1313,79 @@ async fn webhook_build(
     verify_webhook_signature(secret, &headers, &body)?;
     let request: WebhookBuildRequest = serde_json::from_slice(&body)
         .map_err(|error| ApiError::BadRequest(format!("invalid webhook JSON: {error}")))?;
+    enqueue_webhook_build(&state, &principal, request).await
+}
+
+async fn github_webhook(
+    State(state): State<AppState>,
+    AxumPath(project): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<WebhookBuildResponse>), ApiError> {
+    let secret = state
+        .github_webhook_secret
+        .as_deref()
+        .ok_or(ApiError::GitHubWebhookNotConfigured)?;
+    let Some(request) = normalize_github_webhook(
+        secret,
+        &headers,
+        &body,
+        project,
+        state.github_webhook_credential_id.clone(),
+    )?
+    else {
+        return Ok((
+            StatusCode::OK,
+            Json(WebhookBuildResponse {
+                status: "ignored",
+                deduplicated: false,
+                build: None,
+            }),
+        ));
+    };
+    enqueue_webhook_build(&state, &principal, request).await
+}
+
+async fn gitlab_webhook(
+    State(state): State<AppState>,
+    AxumPath(project): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<WebhookBuildResponse>), ApiError> {
+    let secret = state
+        .gitlab_webhook_secret
+        .as_deref()
+        .ok_or(ApiError::GitLabWebhookNotConfigured)?;
+    let Some(request) = normalize_gitlab_webhook(
+        secret,
+        &headers,
+        &body,
+        project,
+        state.gitlab_webhook_credential_id.clone(),
+    )?
+    else {
+        return Ok((
+            StatusCode::OK,
+            Json(WebhookBuildResponse {
+                status: "ignored",
+                deduplicated: false,
+                build: None,
+            }),
+        ));
+    };
+    enqueue_webhook_build(&state, &principal, request).await
+}
+
+async fn enqueue_webhook_build(
+    state: &AppState,
+    principal: &Principal,
+    request: WebhookBuildRequest,
+) -> Result<(StatusCode, Json<WebhookBuildResponse>), ApiError> {
     let event_id = validate_webhook_event_id(request.event_id)?;
     let project_name = request.project.trim();
-    require_project(&principal, Permission::Build, project_name)?;
+    require_project(principal, Permission::Build, project_name)?;
     let project = project_by_name(&state.storage, project_name)?;
 
     if !state
@@ -1295,7 +1434,7 @@ async fn webhook_build(
         None
     };
     let queued = match enqueue_project_build(
-        &state,
+        state,
         project,
         QueueBuildRequest {
             scm,
@@ -1323,22 +1462,191 @@ async fn webhook_build(
     ))
 }
 
-fn verify_webhook_signature(
+fn normalize_github_webhook(
     secret: &[u8],
     headers: &HeaderMap,
     body: &[u8],
+    project: String,
+    credential_id: Option<String>,
+) -> Result<Option<WebhookBuildRequest>, ApiError> {
+    verify_hmac_hex_signature(secret, headers, "x-hub-signature-256", body)?;
+    let event = required_header(headers, "x-github-event")?;
+    if event == "ping" {
+        return Ok(None);
+    }
+    let event_id = required_header(headers, "x-github-delivery")?;
+    if event != "push" {
+        return Err(ApiError::BadRequest(format!(
+            "unsupported GitHub webhook event: {event}"
+        )));
+    }
+    let payload: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| ApiError::BadRequest(format!("invalid GitHub webhook JSON: {error}")))?;
+    if payload
+        .get("deleted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    let Some(revision) = normalize_commit_revision(payload.get("after"), "GitHub after")? else {
+        return Ok(None);
+    };
+    Ok(Some(WebhookBuildRequest {
+        event_id,
+        project,
+        revision: Some(revision),
+        remote: Some("origin".into()),
+        fetch: true,
+        credential_id,
+        parameters: BTreeMap::new(),
+    }))
+}
+
+fn normalize_gitlab_webhook(
+    secret: &[u8],
+    headers: &HeaderMap,
+    body: &[u8],
+    project: String,
+    credential_id: Option<String>,
+) -> Result<Option<WebhookBuildRequest>, ApiError> {
+    verify_gitlab_webhook_signature(secret, headers, body)?;
+    let event = required_header(headers, "x-gitlab-event")?;
+    if event != "Push Hook" && event != "Tag Push Hook" {
+        return Err(ApiError::BadRequest(format!(
+            "unsupported GitLab webhook event: {event}"
+        )));
+    }
+    let event_id = first_header(
+        headers,
+        &["webhook-id", "x-gitlab-event-uuid", "idempotency-key"],
+    )
+    .ok_or(ApiError::EmptyWebhookEventId)?;
+    let payload: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| ApiError::BadRequest(format!("invalid GitLab webhook JSON: {error}")))?;
+    let Some(revision) = normalize_commit_revision(payload.get("after"), "GitLab after")? else {
+        return Ok(None);
+    };
+    Ok(Some(WebhookBuildRequest {
+        event_id,
+        project,
+        revision: Some(revision),
+        remote: Some("origin".into()),
+        fetch: true,
+        credential_id,
+        parameters: BTreeMap::new(),
+    }))
+}
+
+fn normalize_commit_revision(
+    value: Option<&serde_json::Value>,
+    field: &str,
+) -> Result<Option<String>, ApiError> {
+    let revision = value
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::BadRequest(format!("{field} is missing from webhook payload")))?;
+    if revision.chars().all(|character| character == '0') {
+        return Ok(None);
+    }
+    if (revision.len() != 40 && revision.len() != 64)
+        || revision.bytes().any(|byte| !byte.is_ascii_hexdigit())
+    {
+        return Err(ApiError::BadRequest(format!(
+            "{field} must be a 40- or 64-character commit SHA"
+        )));
+    }
+    Ok(Some(revision.to_owned()))
+}
+
+fn required_header(headers: &HeaderMap, name: &'static str) -> Result<String, ApiError> {
+    first_header(headers, &[name])
+        .ok_or_else(|| ApiError::BadRequest(format!("required webhook header is missing: {name}")))
+}
+
+fn first_header(headers: &HeaderMap, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn verify_hmac_hex_signature(
+    secret: &[u8],
+    headers: &HeaderMap,
+    header_name: &'static str,
+    body: &[u8],
 ) -> Result<(), ApiError> {
-    let encoded = headers
-        .get("x-rivet-signature")
+    let value = headers
+        .get(header_name)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("sha256="))
         .ok_or(ApiError::InvalidWebhookSignature)?;
-    let signature = hex::decode(encoded).map_err(|_| ApiError::InvalidWebhookSignature)?;
+    let signature = hex::decode(value).map_err(|_| ApiError::InvalidWebhookSignature)?;
     let mut mac =
         Hmac::<Sha256>::new_from_slice(secret).map_err(|_| ApiError::InvalidWebhookSignature)?;
     mac.update(body);
     mac.verify_slice(&signature)
         .map_err(|_| ApiError::InvalidWebhookSignature)
+}
+
+fn verify_gitlab_webhook_signature(
+    secret: &[u8],
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), ApiError> {
+    if let Some(signature_header) = first_header(headers, &["webhook-signature"]) {
+        let message_id = required_header(headers, "webhook-id")?;
+        let timestamp = required_header(headers, "webhook-timestamp")?;
+        let timestamp = timestamp
+            .parse::<i64>()
+            .map_err(|_| ApiError::InvalidWebhookSignature)?;
+        if Utc::now().timestamp().abs_diff(timestamp) > 300 {
+            return Err(ApiError::InvalidWebhookSignature);
+        }
+        let encoded_key = secret
+            .strip_prefix(b"whsec_")
+            .ok_or(ApiError::InvalidWebhookSignature)?;
+        let key = STANDARD
+            .decode(encoded_key)
+            .map_err(|_| ApiError::InvalidWebhookSignature)?;
+        let mut message =
+            Vec::with_capacity(message_id.len() + timestamp.to_string().len() + body.len() + 2);
+        message.extend_from_slice(message_id.as_bytes());
+        message.push(b'.');
+        message.extend_from_slice(timestamp.to_string().as_bytes());
+        message.push(b'.');
+        message.extend_from_slice(body);
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&key).map_err(|_| ApiError::InvalidWebhookSignature)?;
+        mac.update(&message);
+        let expected = format!("v1,{}", STANDARD.encode(mac.finalize().into_bytes()));
+        let valid = signature_header
+            .split_whitespace()
+            .any(|received| bool::from(expected.as_bytes().ct_eq(received.as_bytes())));
+        if !valid {
+            return Err(ApiError::InvalidWebhookSignature);
+        }
+        return Ok(());
+    }
+
+    let supplied = required_header(headers, "x-gitlab-token")?;
+    if bool::from(supplied.as_bytes().ct_eq(secret)) {
+        Ok(())
+    } else {
+        Err(ApiError::InvalidWebhookSignature)
+    }
+}
+
+fn verify_webhook_signature(
+    secret: &[u8],
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), ApiError> {
+    verify_hmac_hex_signature(secret, headers, "x-rivet-signature", body)
 }
 
 fn validate_webhook_event_id(event_id: String) -> Result<String, ApiError> {
@@ -3535,6 +3843,131 @@ program = "true"
     }
 
     #[tokio::test]
+    async fn github_provider_route_uses_explicit_project_and_deduplicates_builds() {
+        let directory = tempdir().expect("tempdir");
+        let repository = directory.path().join("repository");
+        fs::create_dir_all(&repository).expect("repository");
+        let pipeline_path = repository.join("Rivetfile.toml");
+        fs::write(
+            &pipeline_path,
+            r#"
+version = 1
+name = "provider-webhook"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline file");
+        let pipeline = Pipeline::load(&pipeline_path).expect("pipeline");
+        let project = Project::new(
+            "github-demo",
+            repository.to_string_lossy().into_owned(),
+            pipeline_path.to_string_lossy().into_owned(),
+        )
+        .expect("project");
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let mut state = AppState::new(storage.clone());
+        state.github_webhook_secret = Some(b"github-route-secret".to_vec());
+
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repository)
+                .output()
+                .expect("git available");
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "rivet@example.test"]);
+        git(&["config", "user.name", "Rivet Tests"]);
+        git(&["add", "Rivetfile.toml"]);
+        git(&["commit", "-qm", "provider fixture"]);
+        let revision = git(&["rev-parse", "HEAD"]);
+        let repository_string = repository.to_string_lossy().into_owned();
+        let output = std::process::Command::new("git")
+            .args(["remote", "add", "origin"])
+            .arg(&repository_string)
+            .current_dir(&repository)
+            .output()
+            .expect("git available");
+        assert!(
+            output.status.success(),
+            "git remote add: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let body = format!(r#"{{"after":"{revision}","deleted":false}}"#).into_bytes();
+        let signature = sign_webhook("github-route-secret", &body);
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/webhooks/github/github-demo")
+                .header("content-type", "application/json")
+                .header("x-github-event", "push")
+                .header("x-github-delivery", "github-route-delivery-1")
+                .header("x-hub-signature-256", &signature)
+                .body(Body::from(body.clone()))
+                .expect("request")
+        };
+
+        let response = router(state.clone())
+            .oneshot(request())
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let queued: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("body"),
+        )
+        .expect("queued response");
+        assert_eq!(queued["status"], "queued");
+        assert_eq!(queued["deduplicated"], false);
+        assert!(queued["build"]["id"].as_str().is_some());
+
+        let response = router(state.clone())
+            .oneshot(request())
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let duplicate: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("duplicate body"),
+        )
+        .expect("duplicate response");
+        assert_eq!(duplicate["status"], "already_queued");
+        assert_eq!(duplicate["deduplicated"], true);
+
+        for _ in 0..50 {
+            if storage
+                .list_builds(project.id)
+                .expect("builds")
+                .first()
+                .is_some_and(|build| build.status.is_terminal())
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let builds = storage.list_builds(project.id).expect("builds");
+        assert_eq!(builds.len(), 1);
+        assert!(builds[0].status.is_terminal());
+    }
+
+    #[tokio::test]
     async fn retry_requires_explicit_secret_values() {
         let directory = tempdir().expect("tempdir");
         let repository = directory.path().join("repository");
@@ -3657,6 +4090,173 @@ program = "true"
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("secret");
         mac.update(body);
         format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    fn sign_gitlab_webhook(
+        signing_key: &[u8],
+        message_id: &str,
+        timestamp: i64,
+        body: &[u8],
+    ) -> String {
+        let mut message =
+            Vec::with_capacity(message_id.len() + timestamp.to_string().len() + body.len() + 2);
+        message.extend_from_slice(message_id.as_bytes());
+        message.push(b'.');
+        message.extend_from_slice(timestamp.to_string().as_bytes());
+        message.push(b'.');
+        message.extend_from_slice(body);
+        let mut mac = Hmac::<Sha256>::new_from_slice(signing_key).expect("signing key");
+        mac.update(&message);
+        format!("v1,{}", STANDARD.encode(mac.finalize().into_bytes()))
+    }
+
+    #[test]
+    fn github_push_webhook_uses_official_signature_and_delivery_headers() {
+        let body = br#"{"after":"c783c3523482029c449dcdff1209ed06409b83bc","deleted":false}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", HeaderValue::from_static("push"));
+        headers.insert(
+            "x-github-delivery",
+            HeaderValue::from_static("github-delivery-1"),
+        );
+        let signature = sign_webhook("github-fixture-secret", body);
+        headers.insert(
+            "x-hub-signature-256",
+            HeaderValue::from_str(&signature).expect("signature header"),
+        );
+
+        let request = normalize_github_webhook(
+            b"github-fixture-secret",
+            &headers,
+            body,
+            "demo".into(),
+            Some("github".into()),
+        )
+        .expect("normalize")
+        .expect("push request");
+        assert_eq!(request.event_id, "github-delivery-1");
+        assert_eq!(request.project, "demo");
+        assert_eq!(
+            request.revision.as_deref(),
+            Some("c783c3523482029c449dcdff1209ed06409b83bc")
+        );
+        assert!(request.fetch);
+        assert_eq!(request.credential_id.as_deref(), Some("github"));
+    }
+
+    #[test]
+    fn gitlab_signed_push_webhook_checks_timestamp_and_normalizes_event_id() {
+        let signing_key = b"gitlab-signing-fixture";
+        let signing_token = format!("whsec_{}", STANDARD.encode(signing_key));
+        let message_id = "gitlab-delivery-1";
+        let timestamp = Utc::now().timestamp();
+        let body = br#"{"after":"c783c3523482029c449dcdff1209ed06409b83bc"}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", HeaderValue::from_static("Push Hook"));
+        headers.insert("webhook-id", HeaderValue::from_static(message_id));
+        headers.insert(
+            "webhook-timestamp",
+            HeaderValue::from_str(&timestamp.to_string()).expect("timestamp"),
+        );
+        headers.insert(
+            "webhook-signature",
+            HeaderValue::from_str(&sign_gitlab_webhook(
+                signing_key,
+                message_id,
+                timestamp,
+                body,
+            ))
+            .expect("signature"),
+        );
+
+        let request = normalize_gitlab_webhook(
+            signing_token.as_bytes(),
+            &headers,
+            body,
+            "demo".into(),
+            None,
+        )
+        .expect("normalize")
+        .expect("push request");
+        assert_eq!(request.event_id, message_id);
+        assert_eq!(
+            request.revision.as_deref(),
+            Some("c783c3523482029c449dcdff1209ed06409b83bc")
+        );
+        assert!(request.fetch);
+    }
+
+    #[test]
+    fn gitlab_legacy_token_webhook_remains_supported_as_a_fallback() {
+        let body = br#"{"after":"c783c3523482029c449dcdff1209ed06409b83bc"}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", HeaderValue::from_static("Push Hook"));
+        headers.insert(
+            "x-gitlab-event-uuid",
+            HeaderValue::from_static("gitlab-legacy-delivery-1"),
+        );
+        headers.insert(
+            "x-gitlab-token",
+            HeaderValue::from_static("gitlab-legacy-secret"),
+        );
+
+        let request =
+            normalize_gitlab_webhook(b"gitlab-legacy-secret", &headers, body, "demo".into(), None)
+                .expect("normalize")
+                .expect("push request");
+        assert_eq!(request.event_id, "gitlab-legacy-delivery-1");
+        assert_eq!(request.project, "demo");
+    }
+
+    #[test]
+    fn provider_webhooks_reject_bad_signatures_and_stale_gitlab_messages() {
+        let body = br#"{"after":"c783c3523482029c449dcdff1209ed06409b83bc"}"#;
+        let mut github_headers = HeaderMap::new();
+        github_headers.insert("x-github-event", HeaderValue::from_static("push"));
+        github_headers.insert("x-github-delivery", HeaderValue::from_static("delivery"));
+        github_headers.insert("x-hub-signature-256", HeaderValue::from_static("sha256=00"));
+        assert!(matches!(
+            normalize_github_webhook(
+                b"github-fixture-secret",
+                &github_headers,
+                body,
+                "demo".into(),
+                None,
+            ),
+            Err(ApiError::InvalidWebhookSignature)
+        ));
+
+        let signing_key = b"gitlab-signing-fixture";
+        let message_id = "gitlab-delivery-stale";
+        let timestamp = Utc::now().timestamp() - 301;
+        let mut gitlab_headers = HeaderMap::new();
+        gitlab_headers.insert("x-gitlab-event", HeaderValue::from_static("Push Hook"));
+        gitlab_headers.insert("webhook-id", HeaderValue::from_static(message_id));
+        gitlab_headers.insert(
+            "webhook-timestamp",
+            HeaderValue::from_str(&timestamp.to_string()).expect("timestamp"),
+        );
+        gitlab_headers.insert(
+            "webhook-signature",
+            HeaderValue::from_str(&sign_gitlab_webhook(
+                signing_key,
+                message_id,
+                timestamp,
+                body,
+            ))
+            .expect("signature"),
+        );
+        let signing_token = format!("whsec_{}", STANDARD.encode(signing_key));
+        assert!(matches!(
+            normalize_gitlab_webhook(
+                signing_token.as_bytes(),
+                &gitlab_headers,
+                body,
+                "demo".into(),
+                None,
+            ),
+            Err(ApiError::InvalidWebhookSignature)
+        ));
     }
 
     #[tokio::test]

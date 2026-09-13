@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
+base64.workspace = true
 chrono.workspace = true
 hex.workspace = true
 futures-util = "0.3"
