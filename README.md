@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **93% verified** · `███████████████████░`<br>
-Weighted evidence score: **93.93 / 100** · displayed conservatively as the
+Weighted evidence score: **93.98 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -389,6 +389,13 @@ cargo run -p rivet -- --data-dir .rivet server \
 The same `event_id` can be retried safely: the first request queues one build,
 and later deliveries return a deduplicated response without creating another
 build. A non-loopback server still requires the separate Bearer token.
+
+The signed generic webhook also accepts an optional upstream reference:
+`{"upstream":{"project":"build","build":4,"status":"passed"}}`.
+Only a positive, explicitly passed upstream build admits the downstream build;
+failed or cancelled upstream deliveries return `ignored`, and unknown statuses
+are rejected. This is a bounded trigger contract, not a claim of Jenkins
+upstream-job compatibility.
 
 Provider webhook adapters are available when their provider secret is supplied.
 The project name is part of the route, so the receiver never guesses a Rivet

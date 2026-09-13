@@ -511,6 +511,18 @@ pub struct WebhookBuildRequest {
     pub credential_id: Option<String>,
     #[serde(default)]
     pub parameters: BTreeMap<String, String>,
+    /// Optional upstream build proof used by the signed generic webhook
+    /// adapter. Downstream builds are admitted only after an explicit
+    /// `passed` upstream status.
+    #[serde(default)]
+    pub upstream: Option<UpstreamBuildReference>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpstreamBuildReference {
+    pub project: String,
+    pub build: i64,
+    pub status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2648,6 +2660,34 @@ async fn enqueue_webhook_build(
     request: WebhookBuildRequest,
 ) -> Result<(StatusCode, Json<WebhookBuildResponse>), ApiError> {
     let event_id = validate_webhook_event_id(request.event_id)?;
+    if let Some(upstream) = request.upstream.as_ref() {
+        if upstream.project.trim().is_empty() {
+            return Err(ApiError::BadRequest(
+                "upstream project cannot be empty".into(),
+            ));
+        }
+        if upstream.build <= 0 {
+            return Err(ApiError::BadRequest(
+                "upstream build must be a positive number".into(),
+            ));
+        }
+        let upstream_status = upstream.status.trim();
+        if !matches!(upstream_status, "passed" | "failed" | "cancelled") {
+            return Err(ApiError::BadRequest(
+                "upstream status must be passed, failed, or cancelled".into(),
+            ));
+        }
+        if upstream_status != "passed" {
+            return Ok((
+                StatusCode::OK,
+                Json(WebhookBuildResponse {
+                    status: "ignored",
+                    deduplicated: false,
+                    build: None,
+                }),
+            ));
+        }
+    }
     let project_name = request.project.trim();
     require_project(principal, Permission::Build, project_name)?;
     let project = project_by_name(&state.storage, project_name)?;
@@ -2769,6 +2809,7 @@ fn normalize_github_webhook(
                 fetch: true,
                 credential_id,
                 parameters: BTreeMap::new(),
+                upstream: None,
             }))
         }
         "pull_request" => {
@@ -2806,6 +2847,7 @@ fn normalize_github_webhook(
                 fetch: true,
                 credential_id,
                 parameters: BTreeMap::new(),
+                upstream: None,
             }))
         }
         _ => Err(ApiError::BadRequest(format!(
@@ -2845,6 +2887,7 @@ fn normalize_gitlab_webhook(
                 fetch: true,
                 credential_id,
                 parameters: BTreeMap::new(),
+                upstream: None,
             }))
         }
         "Merge Request Hook" => {
@@ -2884,6 +2927,7 @@ fn normalize_gitlab_webhook(
                 fetch: true,
                 credential_id,
                 parameters: BTreeMap::new(),
+                upstream: None,
             }))
         }
         _ => Err(ApiError::BadRequest(format!(
@@ -7265,7 +7309,33 @@ program = "true"
             .create_project(&project, &pipeline)
             .expect("project");
         let state = AppState::with_webhook_secret(storage.clone(), "webhook-test-secret");
-        let body = br#"{"event_id":"delivery-1","project":"webhook-demo"}"#.to_vec();
+        let failed_upstream = br#"{"event_id":"upstream-failed-1","project":"webhook-demo","upstream":{"project":"upstream-demo","build":4,"status":"failed"}}"#.to_vec();
+        let failed_signature = sign_webhook("webhook-test-secret", &failed_upstream);
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/webhooks/generic")
+                    .header("content-type", "application/json")
+                    .header("x-rivet-signature", &failed_signature)
+                    .body(Body::from(failed_upstream))
+                    .expect("failed upstream request"),
+            )
+            .await
+            .expect("failed upstream response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let ignored: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("ignored upstream body"),
+        )
+        .expect("ignored upstream response");
+        assert_eq!(ignored["status"], "ignored");
+        assert_eq!(ignored["deduplicated"], false);
+        assert!(ignored["build"].is_null());
+        assert!(storage.list_builds(project.id).expect("builds").is_empty());
+
+        let body = br#"{"event_id":"delivery-1","project":"webhook-demo","upstream":{"project":"upstream-demo","build":4,"status":"passed"}}"#.to_vec();
 
         let response = router(state.clone())
             .oneshot(
