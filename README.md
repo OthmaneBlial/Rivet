@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.07 / 100** · displayed conservatively as the
+Weighted evidence score: **92.12 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -43,7 +43,9 @@ steps can declare exact remote requirements; the local runner refuses those step
 until assignment exists. A matching agent can now reserve capacity, receive a
 bounded workspace archive, execute the assigned pipeline through the shared Rust
 runner, and relay typed events, output, and cancellation. Remote artifact
-bundles now return through a bounded, checksum-verified channel. If the assigned
+bundles now return through a bounded, checksum-verified channel. Persisted event
+projection also ignores exact redelivery of an already recorded domain event by
+its SHA-256 identity. If the assigned
 agent disconnects, the server makes at most one replacement-agent attempt and
 closes unfinished steps, stages, and builds as failed when recovery is
 unavailable. Steps may also use a bounded, cancellation-aware retry policy

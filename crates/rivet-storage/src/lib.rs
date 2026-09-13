@@ -304,6 +304,12 @@ impl Storage {
             9,
             Some(include_str!("../migrations/009_auth_sessions.sql")),
         )?;
+        apply_migration(
+            &connection,
+            10,
+            Some(include_str!("../migrations/010_event_idempotency.sql")),
+        )?;
+        backfill_event_hashes(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             artifact_root: Arc::new(artifact_root),
@@ -828,15 +834,22 @@ impl Storage {
     pub fn apply_event(&self, event: &BuildEvent) -> Result<(), StorageError> {
         let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO build_events(build_id, timestamp, event_json)
-             VALUES (?1, ?2, ?3)",
+        let event_json = serde_json::to_string(event)?;
+        let digest = event_hash(&event_json);
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO build_events(build_id, timestamp, event_json, event_hash)
+             VALUES (?1, ?2, ?3, ?4)",
             params![
                 event_build_id(event).to_string(),
                 event.timestamp().to_rfc3339(),
-                serde_json::to_string(event)?,
+                event_json,
+                digest,
             ],
         )?;
+        if inserted == 0 {
+            transaction.commit()?;
+            return Ok(());
+        }
         match event {
             BuildEvent::BuildQueued {
                 build_id,
@@ -1447,6 +1460,35 @@ fn validate_session_field(value: &str, field: &'static str) -> Result<(), Storag
     Ok(())
 }
 
+fn event_hash(event_json: &str) -> String {
+    hex::encode(Sha256::digest(event_json.as_bytes()))
+}
+
+fn backfill_event_hashes(connection: &Connection) -> Result<(), StorageError> {
+    let rows = {
+        let mut statement =
+            connection.prepare("SELECT sequence, event_json FROM build_events WHERE event_hash IS NULL ORDER BY sequence ASC")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut seen = BTreeSet::new();
+    for (sequence, event_json) in rows {
+        let digest = event_hash(&event_json);
+        // Keep pre-existing duplicate rows readable during the one-time
+        // migration; future writes will still converge on the canonical hash.
+        if seen.insert(digest.clone()) {
+            connection.execute(
+                "UPDATE build_events SET event_hash = ?1 WHERE sequence = ?2",
+                params![digest, sequence],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn raw_audit_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAuditEvent> {
     Ok((
         row.get(0)?,
@@ -1915,6 +1957,39 @@ program = "true"
         assert_eq!(events.len(), 8);
         assert!(matches!(events[0], BuildEvent::BuildQueued { .. }));
         assert!(matches!(events[7], BuildEvent::BuildFinished { .. }));
+    }
+
+    #[test]
+    fn applying_the_same_event_twice_is_idempotent() {
+        let (project, pipeline, plan) = fixture();
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let build = storage
+            .create_build(&project, &plan, &pipeline, None)
+            .expect("build");
+        let timestamp = Utc
+            .with_ymd_and_hms(2026, 9, 13, 12, 0, 0)
+            .single()
+            .expect("timestamp");
+        let event = BuildEvent::BuildQueued {
+            build_id: build.id,
+            project_id: project.id,
+            timestamp,
+        };
+        storage.apply_event(&event).expect("first event");
+        storage.apply_event(&event).expect("duplicate event");
+        assert_eq!(storage.events(build.id).expect("events").len(), 1);
+        assert_eq!(
+            storage
+                .get_build_details(build.id)
+                .expect("details")
+                .expect("build")
+                .build
+                .status,
+            BuildStatus::Queued
+        );
     }
 
     #[test]
