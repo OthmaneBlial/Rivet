@@ -104,6 +104,9 @@ enum Command {
         /// Read a Bearer token from a private file without persisting it.
         #[arg(long)]
         token_file: Option<PathBuf>,
+        /// Open a private SHA-256 token policy with roles and project scopes.
+        #[arg(long)]
+        auth_policy_file: Option<PathBuf>,
         /// Read the generic webhook HMAC secret from a private file.
         #[arg(long)]
         webhook_secret_file: Option<PathBuf>,
@@ -333,6 +336,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Server {
             bind,
             token_file,
+            auth_policy_file,
             webhook_secret_file,
             credentials_file,
             credentials_passphrase_file,
@@ -352,6 +356,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rivet_server::ServerConfig {
                     bind,
                     auth_token,
+                    auth_policy_file,
                     webhook_secret,
                     credentials_file,
                     credentials_passphrase,

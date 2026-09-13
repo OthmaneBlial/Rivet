@@ -75,6 +75,24 @@ pub struct Principal {
 }
 
 impl Principal {
+    /// Identity used by an unauthenticated loopback/local instance.
+    pub fn local_admin() -> Self {
+        Self {
+            id: "local".into(),
+            role: Role::Admin,
+            projects: BTreeSet::from(["*".into()]),
+        }
+    }
+
+    /// Compatibility identity for the legacy single Bearer-token setting.
+    pub fn legacy_admin() -> Self {
+        Self {
+            id: "legacy-token".into(),
+            role: Role::Admin,
+            projects: BTreeSet::from(["*".into()]),
+        }
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }

@@ -6,7 +6,7 @@
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -17,6 +17,7 @@ use hmac::{Hmac, Mac};
 use rivet_agent_protocol::{
     AgentMessage, AgentRequirements, MAX_WORKSPACE_CHUNK_BYTES, PROTOCOL_VERSION, WorkspaceTransfer,
 };
+use rivet_auth::{AuthError, AuthPolicy, Principal};
 use rivet_core::{
     BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, Pipeline, Project, ScheduleId,
     SourceSnapshot,
@@ -65,6 +66,7 @@ pub struct AppState {
     active_builds: Arc<Mutex<HashMap<BuildId, CancellationToken>>>,
     events: broadcast::Sender<BuildEvent>,
     auth_digest: Option<[u8; 32]>,
+    auth_policy: Option<Arc<AuthPolicy>>,
     webhook_secret: Option<Vec<u8>>,
     credentials: Option<Arc<CredentialVault>>,
     agents: AgentRegistry,
@@ -81,6 +83,7 @@ struct RemoteBuildRoute {
 pub struct ServerConfig {
     pub bind: SocketAddr,
     pub auth_token: Option<String>,
+    pub auth_policy_file: Option<PathBuf>,
     pub webhook_secret: Option<String>,
     pub credentials_file: Option<PathBuf>,
     pub credentials_passphrase: Option<String>,
@@ -97,6 +100,10 @@ pub enum ServerError {
     AuthRequired(SocketAddr),
     #[error("Rivet authentication token cannot be empty")]
     EmptyAuthToken,
+    #[error("could not read authentication policy file {path}: {message}")]
+    AuthPolicyFile { path: PathBuf, message: String },
+    #[error("authentication policy is invalid: {0}")]
+    AuthPolicy(#[from] AuthError),
     #[error("Rivet webhook secret cannot be empty")]
     EmptyWebhookSecret,
     #[error("credential vault configuration requires both a file and a passphrase")]
@@ -194,6 +201,14 @@ struct HealthResponse {
     status: &'static str,
     service: &'static str,
     timestamp: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthMeResponse {
+    id: String,
+    role: rivet_auth::Role,
+    projects: Vec<String>,
+    local_mode: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,6 +310,7 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
     let cors = cors_layer(allowed_origins)?;
     Ok(Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/auth/me", get(auth_me))
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/agents/match", post(match_agents))
         .route("/api/v1/agents/connect", get(connect_agent))
@@ -462,6 +478,7 @@ pub async fn serve(storage_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(
         ServerConfig {
             bind,
             auth_token: None,
+            auth_policy_file: None,
             webhook_secret: None,
             credentials_file: None,
             credentials_passphrase: None,
@@ -494,6 +511,12 @@ pub async fn serve_with_listener(
     let bind = listener.local_addr()?;
     let config = ServerConfig { bind, ..config };
     validate_config(&config)?;
+    let auth_policy = config
+        .auth_policy_file
+        .as_deref()
+        .map(load_auth_policy)
+        .transpose()?
+        .map(Arc::new);
     let credentials = match (
         config.credentials_file.as_ref(),
         config.credentials_passphrase.as_deref(),
@@ -502,12 +525,13 @@ pub async fn serve_with_listener(
         (None, None) => None,
         _ => return Err(ServerError::IncompleteCredentialVaultConfig),
     };
-    let state = AppState::with_security(
+    let mut state = AppState::with_security(
         Storage::open(storage_path)?,
         config.auth_token.as_deref(),
         config.webhook_secret.as_deref(),
         credentials,
     );
+    state.auth_policy = auth_policy;
     let allowed_origins = if config.allowed_origins.is_empty() {
         default_allowed_origins()
     } else {
@@ -520,7 +544,10 @@ pub async fn serve_with_listener(
 }
 
 fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
-    if !config.bind.ip().is_loopback() && config.auth_token.is_none() {
+    if !config.bind.ip().is_loopback()
+        && config.auth_token.is_none()
+        && config.auth_policy_file.is_none()
+    {
         return Err(ServerError::AuthRequired(config.bind));
     }
     if config
@@ -550,6 +577,41 @@ fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
     Ok(())
 }
 
+fn load_auth_policy(path: &Path) -> Result<AuthPolicy, ServerError> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| ServerError::AuthPolicyFile {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    if metadata.file_type().is_symlink() {
+        return Err(ServerError::AuthPolicyFile {
+            path: path.to_path_buf(),
+            message: "symbolic links are not accepted".into(),
+        });
+    }
+    if !metadata.is_file() {
+        return Err(ServerError::AuthPolicyFile {
+            path: path.to_path_buf(),
+            message: "path is not a regular file".into(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(ServerError::AuthPolicyFile {
+                path: path.to_path_buf(),
+                message: "file must not be group- or world-readable".into(),
+            });
+        }
+    }
+    let bytes = std::fs::read(path).map_err(|error| ServerError::AuthPolicyFile {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    AuthPolicy::from_json(&bytes).map_err(ServerError::AuthPolicy)
+}
+
 impl AppState {
     pub fn new(storage: Storage) -> Self {
         let (events, _) = broadcast::channel(1024);
@@ -560,6 +622,7 @@ impl AppState {
             active_builds: Arc::new(Mutex::new(HashMap::new())),
             events,
             auth_digest: None,
+            auth_policy: None,
             webhook_secret: None,
             credentials: None,
             agents: AgentRegistry::default(),
@@ -591,25 +654,47 @@ impl AppState {
     }
 }
 
+async fn auth_me(Extension(principal): Extension<Principal>) -> Json<AuthMeResponse> {
+    Json(AuthMeResponse {
+        local_mode: principal.id() == "local",
+        id: principal.id().to_owned(),
+        role: principal.role(),
+        projects: principal.projects().map(str::to_owned).collect(),
+    })
+}
+
 async fn authenticate(
     State(state): State<AppState>,
-    request: axum::http::Request<Body>,
+    mut request: axum::http::Request<Body>,
     next: Next,
 ) -> Response {
-    if state.auth_digest.is_none() || request.uri().path() == "/api/v1/health" {
+    let auth_enabled = state.auth_digest.is_some() || state.auth_policy.is_some();
+    if !auth_enabled {
+        request.extensions_mut().insert(Principal::local_admin());
         return next.run(request).await;
     }
-    let authorized = request
+    if request.uri().path() == "/api/v1/health" {
+        return next.run(request).await;
+    }
+    let principal = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .map(|token| {
-            let candidate = hash_token(token.as_bytes());
-            bool::from(candidate.ct_eq(state.auth_digest.as_ref().expect("auth digest")))
-        })
-        .unwrap_or(false);
-    if authorized {
+        .and_then(|token| {
+            state
+                .auth_policy
+                .as_deref()
+                .and_then(|policy| policy.authenticate(token))
+                .or_else(|| {
+                    state.auth_digest.as_ref().and_then(|digest| {
+                        let candidate = hash_token(token.as_bytes());
+                        bool::from(candidate.ct_eq(digest)).then(Principal::legacy_admin)
+                    })
+                })
+        });
+    if let Some(principal) = principal {
+        request.extensions_mut().insert(principal);
         next.run(request).await
     } else {
         let mut response = (
@@ -2685,6 +2770,7 @@ mod tests {
     use rivet_agent_protocol::{
         AgentCapabilities, AgentHeartbeat, AgentRegistration, AgentRequirements, PROTOCOL_VERSION,
     };
+    use rivet_auth::{ApiTokenRecord, AuthPolicyDocument, Role};
     use std::fs;
     use tempfile::tempdir;
     use tokio::time::sleep;
@@ -3046,6 +3132,59 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn policy_tokens_report_identity_without_exposing_raw_tokens() {
+        let raw_token = "operator-policy-fixture-token";
+        let policy = AuthPolicy::from_document(AuthPolicyDocument {
+            version: 1,
+            tokens: vec![ApiTokenRecord {
+                id: "operator".into(),
+                sha256: hex::encode(Sha256::digest(raw_token.as_bytes())),
+                role: Role::Operator,
+                projects: vec!["demo".into()],
+            }],
+        })
+        .expect("policy");
+        let mut state = AppState::new(Storage::open_in_memory().expect("storage"));
+        state.auth_policy = Some(Arc::new(policy));
+
+        let unauthorized = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {raw_token}"),
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("body");
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(!body_text.contains(raw_token));
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(payload["id"], "operator");
+        assert_eq!(payload["role"], "operator");
+        assert_eq!(payload["projects"][0], "demo");
+        assert_eq!(payload["local_mode"], false);
     }
 
     #[tokio::test]
