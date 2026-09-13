@@ -10,15 +10,18 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rivet_core::{
-    BuildEvent, BuildId, BuildStatus, ExecutionPlan, Pipeline, Project, SourceSnapshot,
+    BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, Pipeline, Project, ScheduleId,
+    SourceSnapshot,
 };
 use rivet_runner::{QueueHandle, QueueStats, Scheduler};
 use rivet_scm::{GitPrepareOptions, GitRepository, GitSnapshot, ScmError};
-use rivet_storage::{ArtifactRecord, BuildDetails, BuildRecord, LogRecord, Storage, StorageError};
+use rivet_storage::{
+    ArtifactRecord, BuildDetails, BuildRecord, LogRecord, ScheduleRecord, Storage, StorageError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -30,6 +33,7 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::time::{Duration, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -66,6 +70,11 @@ enum ApiError {
     ProjectNotFound(String),
     #[error("build not found: {project} #{number}")]
     BuildNotFound { project: String, number: i64 },
+    #[error("schedule not found: {project} {schedule_id}")]
+    ScheduleNotFound {
+        project: String,
+        schedule_id: ScheduleId,
+    },
     #[error("repository path is not a directory: {0}")]
     InvalidRepository(PathBuf),
     #[error("pipeline path is not a file: {0}")]
@@ -91,7 +100,9 @@ enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self {
-            Self::ProjectNotFound(_) | Self::BuildNotFound { .. } => StatusCode::NOT_FOUND,
+            Self::ProjectNotFound(_)
+            | Self::BuildNotFound { .. }
+            | Self::ScheduleNotFound { .. } => StatusCode::NOT_FOUND,
             Self::InvalidRepository(_) | Self::InvalidPipeline(_) | Self::BadRequest(_) => {
                 StatusCode::BAD_REQUEST
             }
@@ -134,6 +145,23 @@ pub struct QueueBuildRequest {
     pub parameters: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateScheduleRequest {
+    pub name: String,
+    pub expression: String,
+    #[serde(default = "default_schedule_enabled")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateScheduleRequest {
+    pub enabled: bool,
+}
+
+fn default_schedule_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize)]
 struct QueueBuildResponse {
     build: BuildRecord,
@@ -157,6 +185,14 @@ pub fn router(state: AppState) -> Router {
             get(list_builds).post(queue_build),
         )
         .route("/api/v1/projects/{name}/builds/{number}", get(get_build))
+        .route(
+            "/api/v1/projects/{name}/schedules",
+            get(list_schedules).post(create_schedule),
+        )
+        .route(
+            "/api/v1/projects/{name}/schedules/{schedule_id}",
+            patch(update_schedule).delete(delete_schedule),
+        )
         .route(
             "/api/v1/projects/{name}/builds/{number}/logs",
             get(get_logs),
@@ -270,6 +306,7 @@ pub async fn serve_with_config(
     };
     let listener = TcpListener::bind(config.bind).await?;
     tracing::info!(bind = %config.bind, "Rivet server listening");
+    spawn_schedule_dispatcher(state.clone());
     axum::serve(listener, router(state)).await?;
     Ok(())
 }
@@ -353,6 +390,143 @@ async fn queue_status(State(state): State<AppState>) -> Json<QueueStatusResponse
 
 async fn list_projects(State(state): State<AppState>) -> Result<Json<Vec<Project>>, ApiError> {
     Ok(Json(state.storage.list_projects()?))
+}
+
+async fn list_schedules(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<Vec<ScheduleRecord>>, ApiError> {
+    let project = project_by_name(&state.storage, &name)?;
+    Ok(Json(state.storage.list_schedules(project.id)?))
+}
+
+async fn create_schedule(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(request): Json<CreateScheduleRequest>,
+) -> Result<(StatusCode, Json<ScheduleRecord>), ApiError> {
+    let project = project_by_name(&state.storage, &name)?;
+    let schedule_name = validate_schedule_name(request.name)?;
+    let expression = CronExpression::parse(&request.expression)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let now = Utc::now();
+    let next_run_at = expression
+        .next_after(now)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let schedule = state.storage.create_schedule(
+        project.id,
+        schedule_name,
+        expression.expression(),
+        request.enabled,
+        next_run_at,
+    )?;
+    Ok((StatusCode::CREATED, Json(schedule)))
+}
+
+async fn update_schedule(
+    State(state): State<AppState>,
+    AxumPath((name, schedule_id)): AxumPath<(String, ScheduleId)>,
+    Json(request): Json<UpdateScheduleRequest>,
+) -> Result<Json<ScheduleRecord>, ApiError> {
+    let project = project_by_name(&state.storage, &name)?;
+    state
+        .storage
+        .set_schedule_enabled(project.id, schedule_id, request.enabled)?
+        .map(Json)
+        .ok_or(ApiError::ScheduleNotFound {
+            project: name,
+            schedule_id,
+        })
+}
+
+async fn delete_schedule(
+    State(state): State<AppState>,
+    AxumPath((name, schedule_id)): AxumPath<(String, ScheduleId)>,
+) -> Result<StatusCode, ApiError> {
+    let project = project_by_name(&state.storage, &name)?;
+    if state.storage.delete_schedule(project.id, schedule_id)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::ScheduleNotFound {
+            project: name,
+            schedule_id,
+        })
+    }
+}
+
+fn spawn_schedule_dispatcher(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(error) = dispatch_due_schedules(&state, Utc::now()).await {
+                tracing::error!(?error, "Rivet schedule dispatcher failed");
+            }
+        }
+    });
+}
+
+async fn dispatch_due_schedules(state: &AppState, now: DateTime<Utc>) -> Result<usize, ApiError> {
+    let due = state.storage.due_schedules(now)?;
+    let mut dispatched = 0;
+    for schedule in due {
+        let expression = match CronExpression::parse(&schedule.expression) {
+            Ok(expression) => expression,
+            Err(error) => {
+                tracing::error!(
+                    schedule = %schedule.id,
+                    ?error,
+                    "persisted schedule expression is invalid"
+                );
+                continue;
+            }
+        };
+        let next_run_at = match expression.next_after(now) {
+            Ok(next_run_at) => next_run_at,
+            Err(error) => {
+                tracing::error!(
+                    schedule = %schedule.id,
+                    ?error,
+                    "could not calculate next schedule occurrence"
+                );
+                continue;
+            }
+        };
+        if !state.storage.claim_schedule(
+            schedule.id,
+            schedule.next_run_at,
+            schedule.next_run_at,
+            next_run_at,
+        )? {
+            continue;
+        }
+        let Some(project) = state.storage.get_project_by_id(schedule.project_id)? else {
+            tracing::error!(schedule = %schedule.id, "schedule project disappeared");
+            continue;
+        };
+        if let Err(error) =
+            enqueue_project_build(state, project, QueueBuildRequest::default()).await
+        {
+            tracing::error!(schedule = %schedule.id, ?error, "scheduled build could not be queued");
+            continue;
+        }
+        dispatched += 1;
+    }
+    Ok(dispatched)
+}
+
+fn validate_schedule_name(name: String) -> Result<String, ApiError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("schedule name cannot be empty".into()));
+    }
+    if name.contains('/') || name.contains('\\') || name.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest(
+            "schedule name cannot contain path separators or control characters".into(),
+        ));
+    }
+    Ok(name.to_owned())
 }
 
 async fn create_project(
@@ -753,6 +927,10 @@ mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
+    use chrono::TimeZone;
+    use std::fs;
+    use tempfile::tempdir;
+    use tokio::time::sleep;
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -841,5 +1019,172 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn schedule_api_validates_lists_toggles_and_deletes() {
+        let storage = Storage::open_in_memory().expect("storage");
+        let project = Project::new("demo", ".", "Rivetfile.toml").expect("project");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "demo"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let state = AppState::new(storage);
+
+        let invalid = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/projects/demo/schedules")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"bad","expression":"61 * * * *"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/projects/demo/schedules")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"every-five","expression":"*/5 * * * *"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 8192).await.expect("body");
+        let schedule: ScheduleRecord = serde_json::from_slice(&body).expect("schedule");
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/demo/schedules")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8192).await.expect("body");
+        let schedules: Vec<ScheduleRecord> = serde_json::from_slice(&body).expect("schedules");
+        assert_eq!(schedules, vec![schedule.clone()]);
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/projects/demo/schedules/{}", schedule.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"enabled":false}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8192).await.expect("body");
+        let disabled: ScheduleRecord = serde_json::from_slice(&body).expect("disabled schedule");
+        assert!(!disabled.enabled);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/projects/demo/schedules/{}", schedule.id))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_claims_due_schedule_and_queues_one_build() {
+        let directory = tempdir().expect("tempdir");
+        let repository = directory.path().join("repository");
+        fs::create_dir_all(&repository).expect("repository");
+        let pipeline_path = repository.join("Rivetfile.toml");
+        fs::write(
+            &pipeline_path,
+            r#"
+version = 1
+name = "scheduled"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline file");
+        let pipeline = Pipeline::load(&pipeline_path).expect("pipeline");
+        let project = Project::new(
+            "scheduled",
+            repository.to_string_lossy().into_owned(),
+            pipeline_path.to_string_lossy().into_owned(),
+        )
+        .expect("project");
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let due_at = Utc
+            .with_ymd_and_hms(2026, 9, 13, 12, 0, 0)
+            .single()
+            .expect("due timestamp");
+        let schedule = storage
+            .create_schedule(project.id, "every-minute", "* * * * *", true, due_at)
+            .expect("schedule");
+        let state = AppState::new(storage.clone());
+
+        assert_eq!(
+            dispatch_due_schedules(&state, due_at)
+                .await
+                .expect("dispatch"),
+            1
+        );
+        assert_eq!(
+            dispatch_due_schedules(&state, due_at)
+                .await
+                .expect("duplicate dispatch"),
+            0
+        );
+        for _ in 0..50 {
+            if storage
+                .list_builds(project.id)
+                .expect("builds")
+                .first()
+                .is_some_and(|build| build.status.is_terminal())
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let builds = storage.list_builds(project.id).expect("builds");
+        assert_eq!(builds.len(), 1);
+        assert_eq!(builds[0].status, BuildStatus::Passed);
+        let persisted_schedule = storage
+            .get_schedule(project.id, schedule.id)
+            .expect("schedule")
+            .expect("schedule exists");
+        assert_eq!(persisted_schedule.last_run_at, Some(due_at));
+        assert!(persisted_schedule.next_run_at > due_at);
     }
 }
