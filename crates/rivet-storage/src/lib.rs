@@ -11,6 +11,7 @@ use rivet_core::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -84,6 +85,7 @@ pub struct BuildRecord {
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub source: Option<SourceSnapshot>,
+    pub parameters: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -154,6 +156,11 @@ impl Storage {
             &connection,
             3,
             Some(include_str!("../migrations/003_event_log.sql")),
+        )?;
+        apply_migration(
+            &connection,
+            4,
+            Some(include_str!("../migrations/004_build_parameters.sql")),
         )?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -233,6 +240,17 @@ impl Storage {
         pipeline: &Pipeline,
         source: Option<&SourceSnapshot>,
     ) -> Result<BuildRecord, StorageError> {
+        self.create_build_with_parameters(project, plan, pipeline, source, &BTreeMap::new())
+    }
+
+    pub fn create_build_with_parameters(
+        &self,
+        project: &Project,
+        plan: &ExecutionPlan,
+        pipeline: &Pipeline,
+        source: Option<&SourceSnapshot>,
+        parameters: &BTreeMap<String, String>,
+    ) -> Result<BuildRecord, StorageError> {
         let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let transaction = connection.transaction()?;
         let number: i64 = transaction.query_row(
@@ -246,8 +264,8 @@ impl Storage {
             "INSERT INTO builds(
                 id, project_id, number, status, queued_at,
                 source_provider, source_revision, source_reference,
-                source_remote, source_dirty
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                source_remote, source_dirty, parameters_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 id.to_string(),
                 project.id.to_string(),
@@ -259,6 +277,7 @@ impl Storage {
                 source.and_then(|snapshot| snapshot.reference.as_deref()),
                 source.and_then(|snapshot| snapshot.remote.as_deref()),
                 source.map(|snapshot| i64::from(snapshot.dirty)),
+                serde_json::to_string(parameters)?,
             ],
         )?;
         for stage in &plan.stages {
@@ -301,6 +320,7 @@ impl Storage {
             started_at: None,
             finished_at: None,
             source: source.cloned(),
+            parameters: parameters.clone(),
         })
     }
 
@@ -432,7 +452,8 @@ impl Storage {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
             "SELECT id, project_id, number, status, queued_at, started_at, finished_at,
-                    source_provider, source_revision, source_reference, source_remote, source_dirty
+                    source_provider, source_revision, source_reference, source_remote, source_dirty,
+                    parameters_json
              FROM builds WHERE project_id = ?1 ORDER BY number DESC",
         )?;
         let rows = statement.query_map(params![project_id.to_string()], raw_build)?;
@@ -448,7 +469,8 @@ impl Storage {
         let raw = connection
             .query_row(
                 "SELECT id, project_id, number, status, queued_at, started_at, finished_at,
-                        source_provider, source_revision, source_reference, source_remote, source_dirty
+                        source_provider, source_revision, source_reference, source_remote, source_dirty,
+                        parameters_json
                  FROM builds WHERE id = ?1",
                 params![build_id.to_string()],
                 raw_build,
@@ -535,6 +557,7 @@ type RawBuild = (
     Option<String>,
     Option<String>,
     Option<i64>,
+    String,
 );
 type RawStage = (
     String,
@@ -594,6 +617,7 @@ fn raw_build(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawBuild> {
         row.get(9)?,
         row.get(10)?,
         row.get(11)?,
+        row.get(12)?,
     ))
 }
 
@@ -607,6 +631,7 @@ fn parse_build(raw: RawBuild) -> Result<BuildRecord, StorageError> {
         started_at: raw.5.as_deref().map(parse_timestamp).transpose()?,
         finished_at: raw.6.as_deref().map(parse_timestamp).transpose()?,
         source: parse_source(&raw)?,
+        parameters: serde_json::from_str(&raw.12)?,
     })
 }
 
@@ -767,6 +792,7 @@ fn transition_build(
 mod tests {
     use super::*;
     use rivet_core::{BuildEvent, ExecutionPlan, Pipeline, SourceSnapshot};
+    use std::collections::BTreeMap;
     use tempfile::tempdir;
 
     fn fixture() -> (Project, Pipeline, ExecutionPlan) {
@@ -803,8 +829,9 @@ program = "true"
             remote: Some("origin".to_owned()),
             dirty: false,
         };
+        let parameters = BTreeMap::from([("target".to_owned(), "release".to_owned())]);
         let build = storage
-            .create_build(&project, &plan, &pipeline, Some(&source))
+            .create_build_with_parameters(&project, &plan, &pipeline, Some(&source), &parameters)
             .expect("build");
         storage
             .apply_event(&BuildEvent::BuildQueued {
@@ -884,6 +911,7 @@ program = "true"
             .expect("build exists");
         assert_eq!(details.build.status, BuildStatus::Passed);
         assert_eq!(details.build.source, Some(source));
+        assert_eq!(details.build.parameters, parameters);
         assert_eq!(details.stages[0].steps[0].status, StepStatus::Passed);
         assert_eq!(reopened.logs(build.id).expect("logs")[0].line, "hello");
         let events = reopened.events(build.id).expect("events");
