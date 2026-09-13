@@ -306,23 +306,62 @@ fn analyze_file(command: AnalyzeCommand) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentSessionResult {
+    Stopped,
+    Disconnected,
+}
+
 async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
     let agent_id = args.id.unwrap_or_else(uuid::Uuid::new_v4);
     let registration = AgentRegistration {
         protocol_version: PROTOCOL_VERSION,
         agent_id,
-        name: args.name,
+        name: args.name.clone(),
         capabilities: AgentCapabilities {
-            os: args.os,
-            arch: args.arch,
+            os: args.os.clone(),
+            arch: args.arch.clone(),
             docker: args.docker,
-            labels: args.labels,
+            labels: args.labels.clone(),
             executors: args.executors,
         },
     };
     registration.validate()?;
 
-    let mut request = args.server.into_client_request()?;
+    let mut reconnect_delay = Duration::from_secs(1);
+    loop {
+        match run_agent_session(&args, &registration).await {
+            Ok(AgentSessionResult::Stopped) => break,
+            Ok(AgentSessionResult::Disconnected) => {
+                eprintln!(
+                    "Agent connection closed; reconnecting in {}s...",
+                    reconnect_delay.as_secs()
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "Agent connection failed: {error}; reconnecting in {}s...",
+                    reconnect_delay.as_secs()
+                );
+            }
+        }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("Stopping agent heartbeat...");
+                break;
+            }
+            _ = tokio::time::sleep(reconnect_delay) => {}
+        }
+        reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(10));
+    }
+    Ok(())
+}
+
+async fn run_agent_session(
+    args: &AgentArgs,
+    registration: &AgentRegistration,
+) -> Result<AgentSessionResult, Box<dyn std::error::Error>> {
+    let mut request = args.server.clone().into_client_request()?;
     if let Some(token_file) = args.token_file.as_deref() {
         let token = read_auth_token(token_file)?;
         request.headers_mut().insert(
@@ -361,10 +400,12 @@ async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut sequence = 0;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    let mut session_result = AgentSessionResult::Disconnected;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("Stopping agent heartbeat...");
+                session_result = AgentSessionResult::Stopped;
                 break;
             }
             _ = heartbeat.tick() => {
@@ -412,7 +453,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let _ = socket.close(None).await;
-    Ok(())
+    Ok(session_result)
 }
 
 async fn send_agent_socket_message(
