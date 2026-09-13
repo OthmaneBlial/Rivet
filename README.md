@@ -76,8 +76,9 @@ identity providers remain future gates.
 
 The repository includes a local-only release gate. It runs the workspace tests,
 builds the optimized CLI, builds the desktop web client, checks the native
-Tauri host, copies the CLI into a temporary release directory, and writes a
-versioned SHA-256 manifest:
+Tauri host, exercises a real create-project/run/history/inspect/logs workflow
+against temporary SQLite data, copies the CLI into a temporary release
+directory, and writes a versioned SHA-256 manifest:
 
 ```sh
 ./scripts/local-release-check.sh

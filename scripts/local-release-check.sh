@@ -10,22 +10,22 @@ fi
 
 cd "$repo_root"
 
-echo "[1/7] checking local progress and repository boundaries"
+echo "[1/8] checking local progress and repository boundaries"
 ./scripts/local-progress-check.sh
 
-echo "[2/7] checking Rust formatting"
+echo "[2/8] checking Rust formatting"
 cargo fmt --all -- --check
 
-echo "[3/7] running the local Rust workspace tests"
+echo "[3/8] running the local Rust workspace tests"
 cargo test --workspace
 
-echo "[4/7] building the release CLI"
+echo "[4/8] building the release CLI"
 cargo build --release -p rivet
 
-echo "[5/7] building the desktop client"
+echo "[5/8] building the desktop client"
 (cd apps/desktop && npm run build)
 
-echo "[6/7] checking the native Tauri host"
+echo "[6/8] checking the native Tauri host"
 cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
 
 mkdir -p "$release_output"
@@ -40,7 +40,10 @@ else
     exit 1
 fi
 
-echo "[7/7] writing the local release manifest"
+echo "[7/8] exercising the real local CLI workflow"
+./scripts/local-e2e-smoke.sh
+
+echo "[8/8] writing the local release manifest"
 jq -n \
     --arg commit "$(git rev-parse HEAD)" \
     --arg generated_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
@@ -48,7 +51,8 @@ jq -n \
     --arg sha256 "$binary_checksum" \
     '{schema_version: 1, source_commit: $commit, generated_at: $generated_at,
       github_actions: false, checks: {format: true, workspace_tests: true,
-      cli_release_build: true, desktop_web_build: true, tauri_host_check: true},
+      cli_release_build: true, desktop_web_build: true, tauri_host_check: true,
+      local_e2e_smoke: true},
       artifacts: [{name: $binary, path: $binary, sha256: $sha256}]}' \
     > "$release_output/manifest.json"
 test -x "$release_output/rivet"
