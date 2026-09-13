@@ -19,7 +19,7 @@ use rivet_scm::{GitPrepareOptions, GitRepository, GitSnapshot, ScmError};
 use rivet_storage::{BuildDetails, BuildRecord, LogRecord, Storage, StorageError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -109,6 +109,8 @@ pub struct CreateProjectRequest {
 pub struct QueueBuildRequest {
     #[serde(default)]
     pub scm: Option<PrepareScmRequest>,
+    #[serde(default)]
+    pub parameters: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -320,10 +322,15 @@ async fn queue_build(
     let repository_root = PathBuf::from(&project.repository_path);
     let source = capture_source_snapshot(&repository_root, request.scm.as_ref()).await?;
     let pipeline = Pipeline::load(&project.pipeline_path)?;
+    let parameters = pipeline.resolve_parameters(&request.parameters)?;
     let plan = ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), project.id);
-    let build = state
-        .storage
-        .create_build(&project, &plan, &pipeline, source.as_ref())?;
+    let build = state.storage.create_build_with_parameters(
+        &project,
+        &plan,
+        &pipeline,
+        source.as_ref(),
+        &parameters,
+    )?;
     let cancellation = CancellationToken::new();
     state
         .active_builds
@@ -346,10 +353,11 @@ async fn queue_build(
 
     let handle = state
         .scheduler
-        .enqueue(
+        .enqueue_with_parameters(
             plan,
             pipeline,
             repository_root,
+            parameters,
             cancellation.clone(),
             events,
         )

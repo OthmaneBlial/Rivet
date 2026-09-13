@@ -5,6 +5,7 @@ use rivet_core::{
 use rivet_runner::{QueueHandle, Scheduler};
 use rivet_scm::{GitPrepareOptions, GitRepository, ScmError};
 use rivet_storage::Storage;
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -96,6 +97,8 @@ struct RunArgs {
     clean: bool,
     #[arg(long)]
     clean_ignored: bool,
+    #[arg(long = "param", value_name = "NAME=VALUE")]
+    parameters: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -241,9 +244,17 @@ async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::
     };
     let source = capture_source_snapshot(&project.repository_path, scm.as_ref()).await?;
     let pipeline = Pipeline::load(&project.pipeline_path)?;
+    let supplied_parameters = parse_parameters(&args.parameters)?;
+    let parameters = pipeline.resolve_parameters(&supplied_parameters)?;
     let build_id = uuid::Uuid::new_v4();
     let plan = ExecutionPlan::from_pipeline(&pipeline, build_id, project.id);
-    let build = storage.create_build(&project, &plan, &pipeline, source.as_ref())?;
+    let build = storage.create_build_with_parameters(
+        &project,
+        &plan,
+        &pipeline,
+        source.as_ref(),
+        &parameters,
+    )?;
     println!("Queued {} #{} ({})", project.name, build.number, build.id);
 
     let (events, mut received_events) = mpsc::channel(512);
@@ -259,10 +270,11 @@ async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::
     let cancellation = CancellationToken::new();
     let scheduler = Scheduler::new(1, Some(1));
     let handle = scheduler
-        .enqueue(
+        .enqueue_with_parameters(
             plan,
             pipeline,
             PathBuf::from(project.repository_path.clone()),
+            parameters,
             cancellation.clone(),
             events,
         )
@@ -276,6 +288,25 @@ async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::
         return Err(format!("build finished {}", status_label(&status)).into());
     }
     Ok(())
+}
+
+fn parse_parameters(values: &[String]) -> Result<BTreeMap<String, String>, String> {
+    let mut parameters = BTreeMap::new();
+    for value in values {
+        let (name, parameter) = value
+            .split_once('=')
+            .ok_or_else(|| format!("parameter must use NAME=VALUE syntax: {value:?}"))?;
+        if name.is_empty() {
+            return Err(format!("parameter name cannot be empty: {value:?}"));
+        }
+        if parameters
+            .insert(name.to_owned(), parameter.to_owned())
+            .is_some()
+        {
+            return Err(format!("parameter {name:?} was provided more than once"));
+        }
+    }
+    Ok(parameters)
 }
 
 async fn capture_source_snapshot(

@@ -91,7 +91,10 @@ export function logs(project: string, number: number): Promise<LogRecord[]> {
 
 export function queueBuild(
   project: string,
-  options: { scm?: ScmPrepareOptions } = {},
+  options: {
+    scm?: ScmPrepareOptions;
+    parameters?: Record<string, string>;
+  } = {},
 ): Promise<QueueResponse> {
   return request<QueueResponse>(
     `/api/v1/projects/${encodeURIComponent(project)}/builds`,
