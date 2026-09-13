@@ -1,4 +1,3 @@
-# Jenkins is a local reference checkout, never part of Rivet's source tree.
 /base/
 
 # Rust build output

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The default capability for the Rivet control room window.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

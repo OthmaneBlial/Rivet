@@ -24,6 +24,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
+use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -118,6 +119,16 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/projects/{name}/builds/{number}/cancel",
             post(cancel_build),
+        )
+        // The default server binds only to loopback and is consumed by the
+        // local Tauri webview. Remote deployments should put an explicit
+        // authenticated reverse proxy in front of this transport before
+        // widening the bind address.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
         )
         .with_state(state)
 }

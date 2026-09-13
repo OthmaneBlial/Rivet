@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+
+[package]
+name = "rivet-desktop"
+version = "0.1.0"
+description = "Rivet CI/CD control room"
+authors = ["Othmane Blial"]
+edition = "2024"
+license = "Apache-2.0"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+rivet-server = { path = "../../../crates/rivet-server" }
+tauri = { version = "2", features = [] }
