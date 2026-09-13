@@ -50,8 +50,12 @@ declared permissions, relative entrypoints, and bounded length-prefixed JSON
 frames. An optional local manifest directory is loaded with strict regular
 file checks and duplicate-ID rejection, then exposed through
 `GET /api/v1/extensions`; the desktop control room mirrors that model and
-reports the validated catalog without pretending that a lifecycle manager or
-third-party catalog already exists.
+reports the validated catalog. The extension crate also provides a bounded
+subprocess lifecycle manager: it resolves only regular executables below an
+explicit root, rejects symlink/path escapes, permits one session per ID, and
+checks the declared permission on every host request. WASM execution and
+server/desktop lifecycle controls remain gated until their sandbox and UX are
+implemented.
 
 The project is being developed as working vertical slices. The current slice
 defines a versioned TOML pipeline model with explicit executable/argument
