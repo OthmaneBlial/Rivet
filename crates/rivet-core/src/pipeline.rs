@@ -9,6 +9,8 @@ const MAX_AGENT_REQUIREMENT_LABELS: usize = 64;
 const MAX_ENVIRONMENT_VARIABLES: usize = 128;
 const MAX_ENVIRONMENT_NAME_BYTES: usize = 256;
 const MAX_ENVIRONMENT_VALUE_BYTES: usize = 16 * 1024;
+const MAX_STEP_RETRIES: u8 = 5;
+const MAX_STEP_RETRY_DELAY_SECONDS: u64 = 300;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Pipeline {
@@ -77,6 +79,12 @@ pub struct Step {
     pub working_dir: Option<PathBuf>,
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    /// Number of additional attempts after a failed or timed-out process.
+    #[serde(default)]
+    pub retries: u8,
+    /// Delay between attempts. Cancellation interrupts the delay.
+    #[serde(default)]
+    pub retry_delay_seconds: u64,
     #[serde(default)]
     pub container: Option<ContainerSpec>,
     /// Optional remote-agent requirements. A local runner must reject this
@@ -131,6 +139,10 @@ pub enum PipelineError {
     EmptyProgram { stage: String, step: String },
     #[error("step {step:?} in stage {stage:?} has an invalid timeout")]
     InvalidTimeout { stage: String, step: String },
+    #[error("step {step:?} in stage {stage:?} declares too many retries")]
+    TooManyRetries { stage: String, step: String },
+    #[error("step {step:?} in stage {stage:?} declares an invalid retry delay")]
+    InvalidRetryDelay { stage: String, step: String },
     #[error("step {step:?} in stage {stage:?} has no container image")]
     EmptyContainerImage { stage: String, step: String },
     #[error("container image for step {step:?} in stage {stage:?} is invalid")]
@@ -433,6 +445,18 @@ impl Pipeline {
                 }
                 if step.timeout_seconds == Some(0) {
                     return Err(PipelineError::InvalidTimeout {
+                        stage: stage.name.clone(),
+                        step: step.name.clone(),
+                    });
+                }
+                if step.retries > MAX_STEP_RETRIES {
+                    return Err(PipelineError::TooManyRetries {
+                        stage: stage.name.clone(),
+                        step: step.name.clone(),
+                    });
+                }
+                if step.retry_delay_seconds > MAX_STEP_RETRY_DELAY_SECONDS {
+                    return Err(PipelineError::InvalidRetryDelay {
                         stage: stage.name.clone(),
                         step: step.name.clone(),
                     });
@@ -740,6 +764,47 @@ executors = 0
         )
         .expect_err("zero remote executors must be rejected");
         assert!(matches!(invalid, PipelineError::ZeroAgentExecutors { .. }));
+    }
+
+    #[test]
+    fn bounds_step_retry_policy() {
+        let too_many = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "too-many-retries"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+retries = 6
+"#,
+        )
+        .expect_err("retry count must be bounded");
+        assert!(matches!(
+            too_many,
+            PipelineError::TooManyRetries { stage, step }
+                if stage == "Test" && step == "unit"
+        ));
+
+        let too_slow = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "slow-retries"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+retry_delay_seconds = 301
+"#,
+        )
+        .expect_err("retry delay must be bounded");
+        assert!(matches!(
+            too_slow,
+            PipelineError::InvalidRetryDelay { stage, step }
+                if stage == "Test" && step == "unit"
+        ));
     }
 
     #[test]

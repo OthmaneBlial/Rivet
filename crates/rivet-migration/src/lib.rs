@@ -522,6 +522,8 @@ pub fn generate_rivetfile_draft(source: &str) -> Result<RivetfileDraft, Migratio
             env: BTreeMap::new(),
             working_dir: None,
             timeout_seconds: None,
+            retries: 0,
+            retry_delay_seconds: 0,
             container: None,
             agent: None,
         });

@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **90% verified** · `██████████████████░░`<br>
-Weighted evidence score: **90.76 / 100** · displayed conservatively as the
+Weighted evidence score: **90.86 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -46,7 +46,8 @@ runner, and relay typed events, output, and cancellation. Remote artifact
 bundles now return through a bounded, checksum-verified channel. If the assigned
 agent disconnects, the server makes at most one replacement-agent attempt and
 closes unfinished steps, stages, and builds as failed when recovery is
-unavailable. On startup, persisted incomplete builds are reconciled
+unavailable. Steps may also use a bounded, cancellation-aware retry policy
+shared by local and assigned-agent execution. On startup, persisted incomplete builds are reconciled
 idempotently so a crashed server cannot leave history stuck forever; resuming
 the same remote attempt after restart and richer retry policy remain future
 gates. Authenticated deployments persist bounded success/failure audit records
@@ -485,6 +486,8 @@ name = "unit"
 program = "cargo"
 args = ["test"]
 timeout_seconds = 300
+retries = 2
+retry_delay_seconds = 3
 [stages.steps.container]
 image = "rust:1.85"
 
@@ -522,6 +525,10 @@ vault, never in the versioned pipeline file. Parameters are resolved per
 build and exposed to direct processes as environment variables. Non-secret values are persisted for history; secret
 parameters cannot define defaults, are represented as `[redacted]` in stored
 build data and API responses, and are replaced with `***` in emitted logs.
+Failed or timed-out steps may request up to five additional attempts with a
+bounded, cancellation-aware delay. Every attempt emits its own step state and
+output while the build keeps one stable identity; this is distinct from
+retrying a completed build into a new build number.
 Cache paths use exact project-scoped primary and fallback keys, restore before
 the first stage, and save only after a successful build to an atomic archive
 under Rivet's local data directory; a missing or corrupt cache never fails the

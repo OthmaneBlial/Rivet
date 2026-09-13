@@ -199,6 +199,63 @@ async fn execute_step(
             step: step.definition.name.clone(),
         });
     }
+    let retries = step.definition.retries;
+    for attempt in 0..=retries {
+        let status = execute_step_attempt(
+            plan,
+            stage,
+            step,
+            pipeline,
+            workspace,
+            parameters,
+            secret_values,
+            cancellation,
+            events,
+        )
+        .await?;
+        if status != StepStatus::Failed || attempt == retries {
+            return Ok(status);
+        }
+        if cancellation.is_cancelled() {
+            return Ok(StepStatus::Cancelled);
+        }
+        send(
+            events,
+            BuildEvent::StepOutput {
+                build_id: plan.build_id,
+                stage_id: stage.id,
+                step_id: step.id,
+                stream: rivet_core::LogStream::System,
+                line: format!(
+                    "retrying step after failed attempt {} of {}",
+                    attempt + 1,
+                    retries + 1
+                ),
+                timestamp: Utc::now(),
+            },
+        )
+        .await?;
+        if step.definition.retry_delay_seconds > 0 {
+            tokio::select! {
+                _ = cancellation.cancelled() => return Ok(StepStatus::Cancelled),
+                _ = tokio::time::sleep(Duration::from_secs(step.definition.retry_delay_seconds)) => {}
+            }
+        }
+    }
+    unreachable!("a retry loop always returns after its final attempt")
+}
+
+async fn execute_step_attempt(
+    plan: &ExecutionPlan,
+    stage: &ExecutionStage,
+    step: &ExecutionStep,
+    pipeline: &Pipeline,
+    workspace: &Path,
+    parameters: &BTreeMap<String, String>,
+    secret_values: &[String],
+    cancellation: &CancellationToken,
+    events: &mpsc::Sender<BuildEvent>,
+) -> Result<StepStatus, RunnerError> {
     let working_dir = resolve_working_dir(workspace, step.definition.working_dir.as_deref())?;
     send(
         events,
@@ -533,6 +590,91 @@ env = { BUILD_CHANNEL = "step" }
         .expect("runner");
 
         assert_eq!(status, BuildStatus::Passed);
+        while rx.recv().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn retries_a_failed_step_and_keeps_one_step_identity() {
+        let dir = tempdir().expect("tempdir");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "retry-step"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "eventual-pass"
+program = "sh"
+args = ["-c", "if test -f .rivet-first-attempt; then exit 0; else touch .rivet-first-attempt; exit 17; fi"]
+retries = 1
+retry_delay_seconds = 0
+"#,
+        )
+        .expect("pipeline");
+        let plan =
+            ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let (tx, mut rx) = mpsc::channel(64);
+        let status = execute_pipeline(&plan, &pipeline, dir.path(), CancellationToken::new(), tx)
+            .await
+            .expect("runner");
+
+        assert_eq!(status, BuildStatus::Passed);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, BuildEvent::StepStarted { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, BuildEvent::StepFinished { .. }))
+                .count(),
+            2
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            BuildEvent::StepOutput { stream: rivet_core::LogStream::System, line, .. }
+                if line.contains("retrying step")
+        )));
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_retry_delay() {
+        let dir = tempdir().expect("tempdir");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "cancel-retry"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "always-fails"
+program = "false"
+retries = 5
+retry_delay_seconds = 300
+"#,
+        )
+        .expect("pipeline");
+        let plan =
+            ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let cancellation = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel(64);
+        let execution = execute_pipeline(&plan, &pipeline, dir.path(), cancellation.clone(), tx);
+        tokio::pin!(execution);
+        let result = tokio::select! {
+            result = &mut execution => result,
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                cancellation.cancel();
+                execution.await
+            }
+        };
+        assert_eq!(result.expect("runner result"), BuildStatus::Cancelled);
         while rx.recv().await.is_some() {}
     }
 
