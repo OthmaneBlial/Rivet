@@ -363,6 +363,10 @@ has a vault configured: it shows credential IDs and usernames, supports secure
 replacement/removal, and clears the entered secret after each save. The API
 response still contains no secret material.
 
+The Pipelines view can pass the same non-secret SCM preparation options to a
+manual run or retry: explicit remote fetch, revision checkout, controlled
+cleanup, and a vault credential ID selected from the loaded summaries.
+
 The same `--credential-id`, `--credentials-file`, and
 `--credentials-passphrase-file` flags can be passed to `rivet run` when a
 local build needs an authenticated fetch.

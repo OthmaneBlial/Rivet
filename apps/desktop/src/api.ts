@@ -33,8 +33,10 @@ export interface ScmPrepareOptions {
   remote?: string;
   fetch?: boolean;
   revision?: string;
+  fetch_ref?: string;
   clean?: boolean;
   clean_ignored?: boolean;
+  credential_id?: string;
 }
 
 export interface BuildRequestOptions {

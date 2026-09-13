@@ -161,6 +161,13 @@ function App() {
   const [artifactList, setArtifactList] = useState<ArtifactRecord[]>([]);
   const [scheduleList, setScheduleList] = useState<ScheduleRecord[]>([]);
   const [activeNav, setActiveNav] = useState("Pipelines");
+  const [showScmOptions, setShowScmOptions] = useState(false);
+  const [scmRemote, setScmRemote] = useState("origin");
+  const [scmFetch, setScmFetch] = useState(false);
+  const [scmRevision, setScmRevision] = useState("");
+  const [scmClean, setScmClean] = useState(false);
+  const [scmCleanIgnored, setScmCleanIgnored] = useState(false);
+  const [scmCredentialId, setScmCredentialId] = useState("");
   const [showCreate, setShowCreate] = useState(false);
   const [showScheduleCreate, setShowScheduleCreate] = useState(false);
   const [migrationSource, setMigrationSource] = useState(DEFAULT_JENKINSFILE);
@@ -259,16 +266,18 @@ function App() {
     }
   }, []);
 
-  const loadCredentialList = useCallback(async () => {
-    if (!engineOnline || activeNav !== "Credentials") return;
+  const loadCredentialList = useCallback(async (showError = activeNav === "Credentials") => {
+    if (!engineOnline) return;
     try {
       setCredentialList(await fetchCredentials());
       setCredentialsReady(true);
-      setCredentialError(null);
+      if (showError) setCredentialError(null);
     } catch (cause) {
       setCredentialList([]);
       setCredentialsReady(false);
-      setCredentialError(cause instanceof Error ? cause.message : "Credential vault unavailable");
+      if (showError) {
+        setCredentialError(cause instanceof Error ? cause.message : "Credential vault unavailable");
+      }
     }
   }, [activeNav, engineOnline]);
 
@@ -345,7 +354,7 @@ function App() {
     setBusy(true);
     setError(null);
     try {
-      const queued = await queueBuild(projectName);
+      const queued = await queueBuild(projectName, buildRequestOptions());
       setSelectedBuild(queued.build.number);
       await loadBuildList();
     } catch (cause) {
@@ -373,7 +382,7 @@ function App() {
     setBusy(true);
     setError(null);
     try {
-      const queued = await retryBuild(projectName, selectedBuild);
+      const queued = await retryBuild(projectName, selectedBuild, buildRequestOptions());
       setSelectedBuild(queued.build.number);
       await loadBuildList();
       await loadBuildView();
@@ -382,6 +391,30 @@ function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  function buildRequestOptions() {
+    const revision = scmRevision.trim();
+    const credential = scmFetch ? scmCredentialId.trim() : "";
+    if (!scmFetch && !revision && !scmClean) return {};
+    return {
+      scm: {
+        remote: scmFetch ? scmRemote.trim() || "origin" : undefined,
+        fetch: scmFetch,
+        revision: revision || undefined,
+        clean: scmClean,
+        clean_ignored: scmClean && scmCleanIgnored,
+        credential_id: credential || undefined,
+      },
+    };
+  }
+
+  function toggleScmOptions() {
+    setShowScmOptions((current) => {
+      const next = !current;
+      if (next && credentialList.length === 0) void loadCredentialList(false);
+      return next;
+    });
   }
 
   async function toggleQueue() {
@@ -690,6 +723,24 @@ function App() {
               <MetricCard label="Last signal" value={latest ? formatTime(latest.finished_at ?? latest.started_at) : "—"} detail={latest ? duration(latest) : "Waiting for first run"} accent="neutral" />
             </section>
 
+            <SourcePreparationPanel
+              open={showScmOptions}
+              remote={scmRemote}
+              fetchEnabled={scmFetch}
+              revision={scmRevision}
+              clean={scmClean}
+              cleanIgnored={scmCleanIgnored}
+              credentialId={scmCredentialId}
+              credentials={credentialList}
+              onToggle={toggleScmOptions}
+              onRemoteChange={setScmRemote}
+              onFetchChange={setScmFetch}
+              onRevisionChange={setScmRevision}
+              onCleanChange={setScmClean}
+              onCleanIgnoredChange={setScmCleanIgnored}
+              onCredentialChange={setScmCredentialId}
+            />
+
             <SchedulePanel
               schedules={scheduleList}
               busy={busy || !engineOnline}
@@ -757,6 +808,67 @@ function App() {
 
 function MetricCard({ label, value, detail, accent }: { label: string; value: string; detail: string; accent: string }) {
   return <div className={`metric-card metric-${accent}`}><span className="overline">{label}</span><strong>{value}</strong><span className="metric-detail"><i />{detail}</span></div>;
+}
+
+function SourcePreparationPanel({
+  open,
+  remote,
+  fetchEnabled,
+  revision,
+  clean,
+  cleanIgnored,
+  credentialId,
+  credentials,
+  onToggle,
+  onRemoteChange,
+  onFetchChange,
+  onRevisionChange,
+  onCleanChange,
+  onCleanIgnoredChange,
+  onCredentialChange,
+}: {
+  open: boolean;
+  remote: string;
+  fetchEnabled: boolean;
+  revision: string;
+  clean: boolean;
+  cleanIgnored: boolean;
+  credentialId: string;
+  credentials: CredentialSummary[];
+  onToggle: () => void;
+  onRemoteChange: (value: string) => void;
+  onFetchChange: (value: boolean) => void;
+  onRevisionChange: (value: string) => void;
+  onCleanChange: (value: boolean) => void;
+  onCleanIgnoredChange: (value: boolean) => void;
+  onCredentialChange: (value: string) => void;
+}) {
+  return (
+    <section className="panel scm-options-panel" aria-label="Source preparation options">
+      <div className="panel-heading">
+        <div><span className="overline">Source admission</span><h2>Prepare SCM before run</h2></div>
+        <div className="scm-heading-actions">
+          <span className="scm-mode">{open ? "OPTIONAL" : "INSPECT ONLY"}</span>
+          <button className="button button-quiet" type="button" onClick={onToggle}>{open ? "Close" : "Configure"}</button>
+        </div>
+      </div>
+      {open ? (
+        <div className="scm-options-form">
+          <label className="scm-toggle"><input type="checkbox" checked={fetchEnabled} onChange={(event) => onFetchChange(event.target.checked)} /><span><strong>Fetch from remote</strong><small>Fetch is explicit and runs before revision checkout.</small></span></label>
+          <label>Remote<input value={remote} onChange={(event) => onRemoteChange(event.target.value)} disabled={!fetchEnabled} placeholder="origin" /></label>
+          <label>Revision <span className="optional">(optional)</span><input value={revision} onChange={(event) => onRevisionChange(event.target.value)} placeholder="main or commit SHA" /></label>
+          <label>Vault credential ID <span className="optional">(fetch only)</span><input list="rivet-credential-ids" value={credentialId} onChange={(event) => onCredentialChange(event.target.value)} disabled={!fetchEnabled} placeholder="github-ci" autoComplete="off" /><datalist id="rivet-credential-ids">{credentials.map((credential) => <option key={credential.id} value={credential.id}>{credential.username}</option>)}</datalist><small>{credentials.length ? `${credentials.length} known vault ID${credentials.length === 1 ? "" : "s"} available` : "Type an ID configured in the encrypted server vault."}</small></label>
+          <div className="scm-checks">
+            <label className="scm-check"><input type="checkbox" checked={clean} onChange={(event) => onCleanChange(event.target.checked)} /><span>Remove untracked files</span></label>
+            <label className="scm-check"><input type="checkbox" checked={cleanIgnored} onChange={(event) => onCleanIgnoredChange(event.target.checked)} disabled={!clean} /><span>Include ignored files</span></label>
+          </div>
+          <p className="scm-notice"><span>!</span>Credential values never enter this request. Only the non-secret ID is sent to the engine.</p>
+        </div>
+      ) : (
+        <div className="scm-collapsed"><span className="scm-collapsed-mark">⎇</span><p>Rivet inspects the current checkout by default. Open this panel to fetch a revision, clean untracked files, or attach a vault credential ID.</p><span className="scm-collapsed-status">NO MUTATION</span></div>
+      )}
+    </section>
+  );
 }
 
 function SchedulePanel({
