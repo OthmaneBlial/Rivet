@@ -1,6 +1,6 @@
 use crate::{RunnerError, execute_pipeline_with_parameters};
 use chrono::Utc;
-use rivet_core::{BuildEvent, BuildId, BuildStatus, ExecutionPlan, Pipeline};
+use rivet_core::{BuildEvent, BuildId, BuildStatus, ExecutionPlan, Pipeline, ProjectId};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -76,7 +76,7 @@ impl Scheduler {
         });
         let project_limit = per_project_concurrency.unwrap_or(global_concurrency);
         let project_slots = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-            BuildId,
+            ProjectId,
             Arc<Semaphore>,
         >::new()));
         let worker_metrics = metrics.clone();
