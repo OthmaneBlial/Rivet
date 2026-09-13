@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**77% verified** · `███████████████▌░░░░`<br>
-Weighted evidence score: **77.52 / 100** · displayed conservatively as the
+**78% verified** · `███████████████▌░░░░`<br>
+Weighted evidence score: **78.52 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -22,6 +22,7 @@ transport, build retry, pre-execution queue cancellation, build artifact
 downloads, and a light-default desktop theme with an accessible dark-mode
 toggle, persistent UTC cron schedules, server dispatch, desktop schedule
 controls, signed generic webhook delivery with idempotent redelivery,
+policy-backed API identities with role/project authorization,
 secret-parameter redaction/masking, a passphrase-encrypted SCM credential vault
 with non-secret credential references, and a packaged desktop launch with an
 ephemeral loopback engine origin, project-scoped local CI cache restore and
@@ -118,6 +119,31 @@ rejected:
 cargo run -p rivet -- --data-dir .rivet server \
   --allow-origin https://console.example
 ```
+
+For a server deployment with multiple roles, use a private authentication
+policy file. It stores only token digests, never raw Bearer tokens:
+
+```json
+{
+  "version": 1,
+  "tokens": [
+    {
+      "id": "operator",
+      "sha256": "<64 lowercase hex characters>",
+      "role": "operator",
+      "projects": ["rivet"]
+    }
+  ]
+}
+```
+
+Protect the file and pass it to the server with
+`--auth-policy-file /secure/path/rivet.auth.json`. Supported roles are
+`admin`, `operator`, `viewer`, and `agent`; project routes are filtered and
+mutations require the corresponding role and scope. The legacy private
+`--token-file` remains available for a single unrestricted deployment. User
+accounts, sessions, token rotation, audit history, and external identity
+providers remain future gates.
 
 The versioned API currently exposes health, projects, queued builds, build
 details, persisted logs, cancellation, a live queue snapshot, durable replay,
