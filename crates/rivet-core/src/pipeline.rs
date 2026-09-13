@@ -11,6 +11,9 @@ const MAX_ENVIRONMENT_NAME_BYTES: usize = 256;
 const MAX_ENVIRONMENT_VALUE_BYTES: usize = 16 * 1024;
 const MAX_STEP_RETRIES: u8 = 5;
 const MAX_STEP_RETRY_DELAY_SECONDS: u64 = 300;
+const MAX_CONTAINER_IMAGE_BYTES: usize = 512;
+const MAX_CONTAINER_NETWORK_BYTES: usize = 128;
+const MAX_CONTAINER_VOLUMES: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Pipeline {
@@ -96,6 +99,43 @@ pub struct Step {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContainerSpec {
     pub image: String,
+    /// Ask the runtime to refresh the image before every container start.
+    #[serde(default)]
+    pub pull: ContainerPullPolicy,
+    /// Optional Docker network name or one of Docker's built-in network names.
+    #[serde(default)]
+    pub network: Option<String>,
+    /// Additional bind mounts. Sources are always relative to the workspace and
+    /// targets are confined to the container workspace.
+    #[serde(default)]
+    pub volumes: Vec<ContainerVolume>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerPullPolicy {
+    #[default]
+    IfNotPresent,
+    Always,
+    Never,
+}
+
+impl ContainerPullPolicy {
+    pub fn docker_value(self) -> &'static str {
+        match self {
+            Self::IfNotPresent => "missing",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerVolume {
+    pub source: PathBuf,
+    pub target: PathBuf,
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -147,6 +187,12 @@ pub enum PipelineError {
     EmptyContainerImage { stage: String, step: String },
     #[error("container image for step {step:?} in stage {stage:?} is invalid")]
     InvalidContainerImage { stage: String, step: String },
+    #[error("container network for step {step:?} in stage {stage:?} is invalid")]
+    InvalidContainerNetwork { stage: String, step: String },
+    #[error("container volumes for step {step:?} in stage {stage:?} exceed the limit")]
+    TooManyContainerVolumes { stage: String, step: String },
+    #[error("container volume for step {step:?} in stage {stage:?} is invalid")]
+    InvalidContainerVolume { stage: String, step: String },
     #[error("agent requirement {field} for step {step:?} in stage {stage:?} cannot be empty")]
     EmptyAgentRequirement {
         stage: String,
@@ -472,11 +518,57 @@ impl Pipeline {
                         .image
                         .chars()
                         .any(|character| character.is_whitespace() || character.is_control())
+                        || container.image.len() > MAX_CONTAINER_IMAGE_BYTES
+                        || container.image.starts_with('-')
                     {
                         return Err(PipelineError::InvalidContainerImage {
                             stage: stage.name.clone(),
                             step: step.name.clone(),
                         });
+                    }
+                    if let Some(network) = &container.network {
+                        if network.trim().is_empty()
+                            || network.len() > MAX_CONTAINER_NETWORK_BYTES
+                            || network.starts_with('-')
+                            || network.chars().any(|character| {
+                                !(character.is_ascii_alphanumeric()
+                                    || matches!(character, '.' | '_' | '-'))
+                            })
+                        {
+                            return Err(PipelineError::InvalidContainerNetwork {
+                                stage: stage.name.clone(),
+                                step: step.name.clone(),
+                            });
+                        }
+                    }
+                    if container.volumes.len() > MAX_CONTAINER_VOLUMES {
+                        return Err(PipelineError::TooManyContainerVolumes {
+                            stage: stage.name.clone(),
+                            step: step.name.clone(),
+                        });
+                    }
+                    for volume in &container.volumes {
+                        let source_invalid = volume.source.as_os_str().is_empty()
+                            || volume.source.is_absolute()
+                            || volume.source == Path::new(".")
+                            || volume.source.components().any(|component| {
+                                matches!(component, std::path::Component::ParentDir)
+                            });
+                        let target_invalid = volume.target.is_relative()
+                            || !volume.target.starts_with(Path::new("/rivet/workspace"))
+                            || volume.target.components().any(|component| {
+                                matches!(component, std::path::Component::ParentDir)
+                            });
+                        let source = volume.source.to_string_lossy();
+                        let target = volume.target.to_string_lossy();
+                        let contains_control =
+                            source.chars().chain(target.chars()).any(char::is_control);
+                        if source_invalid || target_invalid || contains_control {
+                            return Err(PipelineError::InvalidContainerVolume {
+                                stage: stage.name.clone(),
+                                step: step.name.clone(),
+                            });
+                        }
                     }
                 }
                 if let Some(agent) = &step.agent {
@@ -718,6 +810,51 @@ program = "true"
         assert!(matches!(
             invalid,
             PipelineError::InvalidEnvironmentVariableName(name) if name == "RIVET_BUILD_ID"
+        ));
+    }
+
+    #[test]
+    fn validates_container_network_and_workspace_volume_boundaries() {
+        let invalid_network = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "invalid-container-network"
+[[stages]]
+name = "Build"
+[[stages.steps]]
+name = "unit"
+program = "true"
+[stages.steps.container]
+image = "rust:1.85"
+network = "unsafe/network"
+"#,
+        )
+        .expect_err("network names must be bounded");
+        assert!(matches!(
+            invalid_network,
+            PipelineError::InvalidContainerNetwork { .. }
+        ));
+
+        let invalid_volume = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "invalid-container-volume"
+[[stages]]
+name = "Build"
+[[stages.steps]]
+name = "unit"
+program = "true"
+[stages.steps.container]
+image = "rust:1.85"
+[[stages.steps.container.volumes]]
+source = "../secrets"
+target = "/rivet/workspace/secrets"
+"#,
+        )
+        .expect_err("volume sources must remain in the workspace");
+        assert!(matches!(
+            invalid_volume,
+            PipelineError::InvalidContainerVolume { .. }
         ));
     }
 

@@ -376,11 +376,29 @@ fn build_process_spec(
         "run".to_owned(),
         "--rm".to_owned(),
         "--init".to_owned(),
+        "--sig-proxy=true".to_owned(),
+        "--pull".to_owned(),
+        container.pull.docker_value().to_owned(),
+    ];
+    if let Some(network) = &container.network {
+        args.push("--network".to_owned());
+        args.push(network.clone());
+    }
+    args.extend([
         "--workdir".to_owned(),
         container_working_dir.to_string_lossy().into_owned(),
         "--volume".to_owned(),
         format!("{}:/rivet/workspace:rw", workspace.display()),
-    ];
+    ]);
+    for volume in &container.volumes {
+        args.push("--volume".to_owned());
+        args.push(format!(
+            "{}:{}:{}",
+            workspace.join(&volume.source).display(),
+            volume.target.display(),
+            if volume.read_only { "ro" } else { "rw" }
+        ));
+    }
     for name in env.keys() {
         args.push("--env".to_owned());
         args.push(name.clone());
@@ -802,6 +820,12 @@ env = { TARGET = "release" }
 working_dir = "subdir"
 [stages.steps.container]
 image = "rust:1.85"
+pull = "always"
+network = "ci-net"
+[[stages.steps.container.volumes]]
+source = "cache"
+target = "/rivet/workspace/cache"
+read_only = true
 "#,
         )
         .expect("container pipeline");
@@ -817,15 +841,22 @@ image = "rust:1.85"
 
         assert_eq!(spec.program, "docker");
         assert_eq!(
-            spec.args[0..7],
+            spec.args[0..14],
             [
                 "run",
                 "--rm",
                 "--init",
+                "--sig-proxy=true",
+                "--pull",
+                "always",
+                "--network",
+                "ci-net",
                 "--workdir",
                 "/rivet/workspace/subdir",
                 "--volume",
                 "/tmp/rivet-workspace:/rivet/workspace:rw",
+                "--volume",
+                "/tmp/rivet-workspace/cache:/rivet/workspace/cache:ro",
             ]
         );
         assert!(spec.args.windows(2).any(|args| args == ["--env", "CI"]));
@@ -835,6 +866,92 @@ image = "rust:1.85"
             ["rust:1.85", "cargo", "test", "--workspace"]
         );
         assert_eq!(spec.env["TARGET"], "release");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executes_container_command_through_a_runtime_shim_without_shell_interpolation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().expect("workspace");
+        fs::create_dir(directory.path().join("cache")).expect("cache directory");
+        let fake_runtime = directory.path().join("fake-runtime");
+        fs::create_dir(&fake_runtime).expect("runtime directory");
+        let docker = fake_runtime.join("docker");
+        fs::write(
+            &docker,
+            r#"#!/bin/sh
+set -eu
+workspace=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    run) shift ;;
+    --volume)
+      [ -n "$workspace" ] || workspace=${2%%:/rivet/workspace:rw}
+      shift 2
+      ;;
+    --env|--network|--pull|--workdir) shift 2 ;;
+    --rm|--init|--sig-proxy=true) shift ;;
+    *)
+      image=$1
+      shift
+      break
+      ;;
+  esac
+done
+test -n "$workspace"
+cd "$workspace"
+exec "$@"
+"#,
+        )
+        .expect("write runtime shim");
+        let mut permissions = fs::metadata(&docker)
+            .expect("runtime metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&docker, permissions).expect("make runtime executable");
+
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "container-runtime"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "sh"
+args = ["-c", "printf 'container-ok\\n'"]
+[stages.steps.container]
+image = "fixture/runtime:1"
+pull = "never"
+network = "none"
+"#,
+        )
+        .expect("container pipeline");
+        let plan =
+            ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut spec = build_process_spec(
+            &plan.stages[0].steps[0],
+            directory.path(),
+            directory.path().to_owned(),
+            BTreeMap::from([(String::from("CI"), String::from("true"))]),
+        );
+        let original_path = std::env::var_os("PATH").expect("PATH");
+        let mut runtime_path = fake_runtime.into_os_string();
+        runtime_path.push(":");
+        runtime_path.push(original_path);
+        spec.env
+            .insert("PATH".into(), runtime_path.to_string_lossy().into_owned());
+        let (tx, mut rx) = mpsc::channel(64);
+        let result = run_process(spec, CancellationToken::new(), tx)
+            .await
+            .expect("container runtime shim");
+        let mut lines = Vec::new();
+        while let Some(line) = rx.recv().await {
+            lines.push(line.line);
+        }
+        assert_eq!(result.outcome, ProcessOutcome::Passed);
+        assert!(lines.iter().any(|line| line == "container-ok"));
     }
 
     #[tokio::test]

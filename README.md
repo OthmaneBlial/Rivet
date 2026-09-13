@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **91% verified** · `██████████████████░░`<br>
-Weighted evidence score: **91.39 / 100** · displayed conservatively as the
+Weighted evidence score: **91.99 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -559,10 +559,12 @@ cargo run -p rivet -- artifact prune --max-bytes 10737418240
 ```
 
 A step can opt into explicit Docker execution with `[stages.steps.container]`.
-Rivet assembles a direct `docker run` invocation with a private workspace mount,
-the validated working directory, separated arguments, and automatic container
-cleanup. Docker runtime execution, image policy, and end-to-end artifact and
-cancellation behavior remain unverified on machines without Docker.
+The declaration supports bounded image pull policy, network selection, workspace
+relative bind volumes, environment forwarding, validated working directories,
+separated arguments, `--init`, signal proxying, and automatic container cleanup.
+A local runtime-shim test exercises the direct command handoff and output path;
+real Docker/Podman runtime execution, image policy enforcement by the daemon, and
+end-to-end artifact and cancellation behavior remain unverified on this machine.
 
 Inspect a Jenkinsfile locally before attempting a migration, or request a
 safe draft for simple quoted commands:
