@@ -96,6 +96,8 @@ pub enum StorageError {
     InvalidArtifactSize(i64),
     #[error("invalid schedule enabled flag in database: {0}")]
     InvalidScheduleEnabled(i64),
+    #[error("webhook delivery {0} does not exist")]
+    MissingWebhookDelivery(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -178,6 +180,15 @@ pub struct ScheduleRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebhookDeliveryRecord {
+    pub event_id: String,
+    pub project_id: ProjectId,
+    pub received_at: DateTime<Utc>,
+    pub build_id: Option<BuildId>,
+    pub build_number: Option<i64>,
+}
+
 impl Storage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
@@ -225,6 +236,11 @@ impl Storage {
             &connection,
             6,
             Some(include_str!("../migrations/006_schedules.sql")),
+        )?;
+        apply_migration(
+            &connection,
+            7,
+            Some(include_str!("../migrations/007_webhook_deliveries.sql")),
         )?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -465,6 +481,67 @@ impl Storage {
             params![project_id.to_string(), schedule_id.to_string()],
         )?;
         Ok(changed == 1)
+    }
+
+    /// Reserve a webhook event ID. The primary key makes this safe across
+    /// concurrent deliveries and server processes sharing the database.
+    pub fn claim_webhook_delivery(
+        &self,
+        event_id: &str,
+        project_id: ProjectId,
+        received_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "INSERT OR IGNORE INTO webhook_deliveries(event_id, project_id, received_at)
+             VALUES (?1, ?2, ?3)",
+            params![event_id, project_id.to_string(), received_at.to_rfc3339()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn webhook_delivery(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<WebhookDeliveryRecord>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let row = connection
+            .query_row(
+                "SELECT event_id, project_id, received_at, build_id, build_number
+                 FROM webhook_deliveries WHERE event_id = ?1",
+                params![event_id],
+                raw_webhook_delivery,
+            )
+            .optional()?;
+        row.map(parse_webhook_delivery).transpose()
+    }
+
+    pub fn complete_webhook_delivery(
+        &self,
+        event_id: &str,
+        build_id: BuildId,
+        build_number: i64,
+    ) -> Result<(), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "UPDATE webhook_deliveries
+             SET build_id = ?1, build_number = ?2
+             WHERE event_id = ?3",
+            params![build_id.to_string(), build_number, event_id],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::MissingWebhookDelivery(event_id.to_owned()));
+        }
+        Ok(())
+    }
+
+    pub fn release_webhook_delivery(&self, event_id: &str) -> Result<(), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        connection.execute(
+            "DELETE FROM webhook_deliveries WHERE event_id = ?1 AND build_id IS NULL",
+            params![event_id],
+        )?;
+        Ok(())
     }
 
     pub fn create_build(
@@ -987,6 +1064,7 @@ type RawSchedule = (
     Option<String>,
     String,
 );
+type RawWebhookDelivery = (String, String, String, Option<String>, Option<i64>);
 
 fn parse_project(raw: RawProject) -> Result<Project, StorageError> {
     Ok(Project {
@@ -1167,6 +1245,26 @@ fn parse_schedule(raw: RawSchedule) -> Result<ScheduleRecord, StorageError> {
         next_run_at: parse_timestamp(&raw.5)?,
         last_run_at: raw.6.as_deref().map(parse_timestamp).transpose()?,
         created_at: parse_timestamp(&raw.7)?,
+    })
+}
+
+fn raw_webhook_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawWebhookDelivery> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
+fn parse_webhook_delivery(raw: RawWebhookDelivery) -> Result<WebhookDeliveryRecord, StorageError> {
+    Ok(WebhookDeliveryRecord {
+        event_id: raw.0,
+        project_id: parse_uuid(&raw.1)?,
+        received_at: parse_timestamp(&raw.2)?,
+        build_id: raw.3.as_deref().map(parse_uuid).transpose()?,
+        build_number: raw.4,
     })
 }
 
@@ -1505,5 +1603,66 @@ program = "true"
             .expect("schedule exists");
         assert_eq!(persisted.next_run_at, next_at);
         assert_eq!(persisted.last_run_at, Some(due_at));
+    }
+
+    #[test]
+    fn webhook_deliveries_are_idempotent_and_reopenable() {
+        let directory = tempdir().expect("tempdir");
+        let database = directory.path().join("rivet.db");
+        let (project, pipeline, plan) = fixture();
+        let storage = Storage::open(&database).expect("open");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let received_at = Utc::now();
+        assert!(
+            storage
+                .claim_webhook_delivery("delivery-1", project.id, received_at)
+                .expect("claim")
+        );
+        assert!(
+            !storage
+                .claim_webhook_delivery("delivery-1", project.id, received_at)
+                .expect("duplicate claim")
+        );
+        let build = storage
+            .create_build(&project, &plan, &pipeline, None)
+            .expect("build");
+        storage
+            .complete_webhook_delivery("delivery-1", build.id, build.number)
+            .expect("complete");
+        let delivery = storage
+            .webhook_delivery("delivery-1")
+            .expect("lookup")
+            .expect("delivery");
+        assert_eq!(delivery.project_id, project.id);
+        assert_eq!(delivery.build_id, Some(build.id));
+        assert_eq!(delivery.build_number, Some(build.number));
+
+        assert!(
+            storage
+                .claim_webhook_delivery("delivery-2", project.id, received_at)
+                .expect("second claim")
+        );
+        storage
+            .release_webhook_delivery("delivery-2")
+            .expect("release");
+        assert!(
+            storage
+                .webhook_delivery("delivery-2")
+                .expect("released lookup")
+                .is_none()
+        );
+
+        drop(storage);
+        let reopened = Storage::open(&database).expect("reopen");
+        assert_eq!(
+            reopened
+                .webhook_delivery("delivery-1")
+                .expect("reopened lookup")
+                .expect("reopened delivery")
+                .build_number,
+            Some(build.number)
+        );
     }
 }
