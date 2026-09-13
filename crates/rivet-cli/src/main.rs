@@ -81,6 +81,9 @@ enum Command {
         /// Read the generic webhook HMAC secret from a private file.
         #[arg(long)]
         webhook_secret_file: Option<PathBuf>,
+        /// Allow an additional exact browser origin for the API.
+        #[arg(long = "allow-origin", value_name = "ORIGIN")]
+        allowed_origins: Vec<String>,
     },
     /// Inspect or explicitly prepare a local Git repository.
     Scm {
@@ -189,6 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bind,
             token_file,
             webhook_secret_file,
+            allowed_origins,
         } => {
             let auth_token = token_file.as_deref().map(read_auth_token).transpose()?;
             let webhook_secret = webhook_secret_file
@@ -201,6 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     bind,
                     auth_token,
                     webhook_secret,
+                    allowed_origins,
                 },
             )
             .await?

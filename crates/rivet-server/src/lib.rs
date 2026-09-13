@@ -7,7 +7,7 @@
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
@@ -37,11 +37,18 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 mod agent_registry;
 
 use agent_registry::{AgentRegistry, AgentSummary};
+
+const DEFAULT_ALLOWED_ORIGINS: [&str; 4] = [
+    "http://127.0.0.1:1420",
+    "http://localhost:1420",
+    "tauri://localhost",
+    "https://tauri.localhost",
+];
 
 #[derive(Clone)]
 pub struct AppState {
@@ -59,6 +66,7 @@ pub struct ServerConfig {
     pub bind: SocketAddr,
     pub auth_token: Option<String>,
     pub webhook_secret: Option<String>,
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -73,6 +81,8 @@ pub enum ServerError {
     EmptyAuthToken,
     #[error("Rivet webhook secret cannot be empty")]
     EmptyWebhookSecret,
+    #[error("invalid allowed origin: {0}")]
+    InvalidAllowedOrigin(String),
 }
 
 #[derive(Debug, Error)]
@@ -228,14 +238,17 @@ struct QueueStatusResponse {
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    router_with_origins(state, &default_allowed_origins())
+        .expect("default Rivet origins must be valid")
+}
+
+fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Router, ServerError> {
+    let cors = cors_layer(allowed_origins)?;
+    Ok(Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/agents/connect", get(connect_agent))
-        .route(
-            "/api/v1/webhooks/generic",
-            post(webhook_build).layer(DefaultBodyLimit::max(256 * 1024)),
-        )
+        .route("/api/v1/webhooks/generic", post(webhook_build))
         .route("/api/v1/queue", get(queue_status))
         .route("/api/v1/projects", get(list_projects).post(create_project))
         .route(
@@ -283,14 +296,51 @@ pub fn router(state: AppState) -> Router {
         // local Tauri webview. Remote deployments should put an explicit
         // authenticated reverse proxy in front of this transport before
         // widening the bind address.
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(DefaultBodyLimit::max(256 * 1024))
+        .layer(cors)
+        .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
-        .with_state(state)
+        .with_state(state))
+}
+
+fn default_allowed_origins() -> Vec<String> {
+    DEFAULT_ALLOWED_ORIGINS
+        .iter()
+        .map(|origin| (*origin).to_owned())
+        .collect()
+}
+
+fn cors_layer(allowed_origins: &[String]) -> Result<CorsLayer, ServerError> {
+    let origins = if allowed_origins.is_empty() {
+        default_allowed_origins()
+    } else {
+        allowed_origins.to_vec()
+    };
+    let mut values = Vec::with_capacity(origins.len());
+    for origin in origins {
+        let origin = origin.trim();
+        if origin.is_empty() || origin == "*" {
+            return Err(ServerError::InvalidAllowedOrigin(origin.to_owned()));
+        }
+        values.push(
+            HeaderValue::from_str(origin)
+                .map_err(|_| ServerError::InvalidAllowedOrigin(origin.to_owned()))?,
+        );
+    }
+    Ok(CorsLayer::new()
+        .allow_origin(AllowOrigin::list(values))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static("x-rivet-signature"),
+        ]))
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -346,6 +396,7 @@ pub async fn serve(storage_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(
             bind,
             auth_token: None,
             webhook_secret: None,
+            allowed_origins: default_allowed_origins(),
         },
     )
     .await
@@ -377,10 +428,15 @@ pub async fn serve_with_config(
         config.auth_token.as_deref(),
         config.webhook_secret.as_deref(),
     );
+    let allowed_origins = if config.allowed_origins.is_empty() {
+        default_allowed_origins()
+    } else {
+        config.allowed_origins
+    };
     let listener = TcpListener::bind(config.bind).await?;
     tracing::info!(bind = %config.bind, "Rivet server listening");
     spawn_schedule_dispatcher(state.clone());
-    axum::serve(listener, router(state)).await?;
+    axum::serve(listener, router_with_origins(state, &allowed_origins)?).await?;
     Ok(())
 }
 
@@ -447,6 +503,25 @@ async fn authenticate(
             .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         response
     }
+}
+
+async fn security_headers(request: axum::http::Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    response
 }
 
 fn hash_token(token: &[u8]) -> [u8; 32] {
@@ -1368,6 +1443,77 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 4096).await.expect("body");
         assert_eq!(&body[..], b"[]");
+    }
+
+    #[tokio::test]
+    async fn api_uses_exact_origins_and_security_headers() {
+        let app = router(AppState::new(Storage::open_in_memory().expect("storage")));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .header("origin", "http://127.0.0.1:1420")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("http://127.0.0.1:1420")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-content-type-options")
+                .and_then(|value| value.to_str().ok()),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-frame-options")
+                .and_then(|value| value.to_str().ok()),
+            Some("DENY")
+        );
+
+        let mut custom_origins = vec!["https://console.example".to_owned()];
+        let response = router_with_origins(
+            AppState::new(Storage::open_in_memory().expect("storage")),
+            &custom_origins,
+        )
+        .expect("custom origins")
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health")
+                .header("origin", "http://127.0.0.1:1420")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+        custom_origins[0] = "*".to_owned();
+        assert!(matches!(
+            cors_layer(&custom_origins),
+            Err(ServerError::InvalidAllowedOrigin(_))
+        ));
     }
 
     #[tokio::test]
