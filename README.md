@@ -378,6 +378,13 @@ The Pipelines view can pass the same non-secret SCM preparation options to a
 manual run or retry: explicit remote fetch, revision checkout, controlled
 cleanup, and a vault credential ID selected from the loaded summaries.
 
+It also loads the project's declared pipeline parameters through
+`GET /api/v1/projects/<name>/parameters`. Non-secret defaults and required
+fields are shown in the run form; secret parameters use password inputs, are
+sent only with the explicit queue/retry request, and are cleared from the form
+after a successful admission. The server remains the source of truth for
+unknown or missing values and never returns secret parameter contents.
+
 The same `--credential-id`, `--credentials-file`, and
 `--credentials-passphrase-file` flags can be passed to `rivet run` when a
 local build needs an authenticated fetch.

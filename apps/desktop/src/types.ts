@@ -124,6 +124,13 @@ export interface QueueItem {
   position: number;
 }
 
+export interface PipelineParameter {
+  name: string;
+  secret: boolean;
+  default: string | null;
+  required: boolean;
+}
+
 export interface CredentialSummary {
   id: string;
   username: string;

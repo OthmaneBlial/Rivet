@@ -371,6 +371,14 @@ struct QueueItemResponse {
     position: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct PipelineParameterResponse {
+    name: String,
+    secret: bool,
+    default: Option<String>,
+    required: bool,
+}
+
 pub fn router(state: AppState) -> Router {
     router_with_origins(state, &default_allowed_origins())
         .expect("default Rivet origins must be valid")
@@ -400,6 +408,10 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
         .route("/api/v1/queue/pause", post(pause_queue))
         .route("/api/v1/queue/resume", post(resume_queue))
         .route("/api/v1/projects", get(list_projects).post(create_project))
+        .route(
+            "/api/v1/projects/{name}/parameters",
+            get(list_pipeline_parameters),
+        )
         .route(
             "/api/v1/projects/{name}/builds",
             get(list_builds).post(queue_build),
@@ -1163,6 +1175,28 @@ async fn list_projects(
         .filter(|project| principal.can_project(Permission::Read, &project.name))
         .collect();
     Ok(Json(projects))
+}
+
+async fn list_pipeline_parameters(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<PipelineParameterResponse>>, ApiError> {
+    require_project(&principal, Permission::Read, &name)?;
+    let project = project_by_name(&state.storage, &name)?;
+    let pipeline = Pipeline::load(&project.pipeline_path)?;
+    Ok(Json(
+        pipeline
+            .parameters
+            .into_iter()
+            .map(|parameter| PipelineParameterResponse {
+                required: parameter.default.is_none(),
+                name: parameter.name,
+                secret: parameter.secret,
+                default: parameter.default,
+            })
+            .collect(),
+    ))
 }
 
 async fn list_extensions(
@@ -3708,6 +3742,49 @@ mod tests {
             &body[..],
             br#"{"queued":0,"running":0,"capacity":2,"paused":false}"#
         );
+    }
+
+    #[tokio::test]
+    async fn pipeline_parameters_expose_definitions_without_secret_values() {
+        let directory = tempdir().expect("tempdir");
+        let pipeline_path = directory.path().join("Rivetfile.toml");
+        fs::write(
+            &pipeline_path,
+            "version = 1\nname = \"parameters\"\n\n[[parameters]]\nname = \"TARGET\"\ndefault = \"release\"\n\n[[parameters]]\nname = \"TOKEN\"\nsecret = true\n\n[[stages]]\nname = \"Test\"\n[[stages.steps]]\nname = \"noop\"\nprogram = \"true\"\n",
+        )
+        .expect("pipeline");
+        let pipeline = Pipeline::load(&pipeline_path).expect("pipeline");
+        let storage = Storage::open_in_memory().expect("storage");
+        let project = Project::new(
+            "parameters",
+            directory.path().to_string_lossy().into_owned(),
+            pipeline_path.to_string_lossy().into_owned(),
+        )
+        .expect("project");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("create project");
+
+        let response = router(AppState::new(storage))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/parameters/parameters")
+                    .body(Body::empty())
+                    .expect("parameters request"),
+            )
+            .await
+            .expect("parameters response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("parameters body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("parameters JSON");
+        assert_eq!(payload[0]["name"], "TARGET");
+        assert_eq!(payload[0]["default"], "release");
+        assert_eq!(payload[0]["required"], false);
+        assert_eq!(payload[1]["name"], "TOKEN");
+        assert_eq!(payload[1]["secret"], true);
+        assert!(payload[1]["default"].is_null());
     }
 
     #[tokio::test]

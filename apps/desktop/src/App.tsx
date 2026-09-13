@@ -19,6 +19,7 @@ import {
   initializeEngineOrigin,
   logs,
   pauseQueue,
+  pipelineParameters as fetchPipelineParameters,
   queueItems as fetchQueueItems,
   projects,
   queueStats as fetchQueueStats,
@@ -38,6 +39,7 @@ import type {
   CredentialSummary,
   LogRecord,
   MigrationResponse,
+  PipelineParameter,
   Project,
   QueueItem,
   QueueStats,
@@ -163,6 +165,8 @@ function App() {
   const [logLines, setLogLines] = useState<LogRecord[]>([]);
   const [artifactList, setArtifactList] = useState<ArtifactRecord[]>([]);
   const [scheduleList, setScheduleList] = useState<ScheduleRecord[]>([]);
+  const [parameterDefinitions, setParameterDefinitions] = useState<PipelineParameter[]>([]);
+  const [parameterValues, setParameterValues] = useState<Record<string, string>>({});
   const [activeNav, setActiveNav] = useState("Pipelines");
   const [showScmOptions, setShowScmOptions] = useState(false);
   const [scmRemote, setScmRemote] = useState("origin");
@@ -306,6 +310,33 @@ function App() {
   }, [loadScheduleList]);
 
   useEffect(() => {
+    if (!engineOnline || !projectName) {
+      setParameterDefinitions([]);
+      return;
+    }
+    let active = true;
+    void fetchPipelineParameters(projectName)
+      .then((definitions) => {
+        if (active) setParameterDefinitions(definitions);
+      })
+      .catch(() => {
+        if (active) setParameterDefinitions([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [engineOnline, projectName]);
+
+  useEffect(() => {
+    setParameterValues((current) => {
+      const declared = new Set(parameterDefinitions.map((definition) => definition.name));
+      return Object.fromEntries(
+        Object.entries(current).filter(([name]) => declared.has(name)),
+      );
+    });
+  }, [parameterDefinitions]);
+
+  useEffect(() => {
     void loadBuildView();
     if (!projectName || selectedBuild === null) return;
     const socket = new WebSocket(eventUrl(projectName, selectedBuild));
@@ -372,11 +403,13 @@ function App() {
 
   async function runSelectedPipeline() {
     if (!projectName) return;
+    if (!validateParameterValues()) return;
     setBusy(true);
     setError(null);
     try {
       const queued = await queueBuild(projectName, buildRequestOptions());
       setSelectedBuild(queued.build.number);
+      clearSecretParameterValues();
       await loadBuildList();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not queue build");
@@ -400,11 +433,13 @@ function App() {
 
   async function retrySelectedBuild() {
     if (!projectName || selectedBuild === null) return;
+    if (!validateParameterValues()) return;
     setBusy(true);
     setError(null);
     try {
       const queued = await retryBuild(projectName, selectedBuild, buildRequestOptions());
       setSelectedBuild(queued.build.number);
+      clearSecretParameterValues();
       await loadBuildList();
       await loadBuildView();
     } catch (cause) {
@@ -417,17 +452,53 @@ function App() {
   function buildRequestOptions() {
     const revision = scmRevision.trim();
     const credential = scmFetch ? scmCredentialId.trim() : "";
-    if (!scmFetch && !revision && !scmClean) return {};
-    return {
-      scm: {
+    const options: {
+      scm?: {
+        remote?: string;
+        fetch?: boolean;
+        revision?: string;
+        clean?: boolean;
+        clean_ignored?: boolean;
+        credential_id?: string;
+      };
+      parameters?: Record<string, string>;
+    } = {};
+    const parameters = Object.fromEntries(
+      Object.entries(parameterValues).filter(([name, value]) =>
+        parameterDefinitions.some((definition) => definition.name === name) && value.length > 0,
+      ),
+    );
+    if (Object.keys(parameters).length > 0) options.parameters = parameters;
+    if (scmFetch || revision || scmClean) {
+      options.scm = {
         remote: scmFetch ? scmRemote.trim() || "origin" : undefined,
         fetch: scmFetch,
         revision: revision || undefined,
         clean: scmClean,
         clean_ignored: scmClean && scmCleanIgnored,
         credential_id: credential || undefined,
-      },
-    };
+      };
+    }
+    return options;
+  }
+
+  function validateParameterValues(): boolean {
+    const missing = parameterDefinitions
+      .filter((definition) => definition.required && !(parameterValues[definition.name] ?? "").trim())
+      .map((definition) => definition.name);
+    if (missing.length === 0) return true;
+    setError(`Required pipeline parameter${missing.length === 1 ? "" : "s"} missing: ${missing.join(", ")}`);
+    return false;
+  }
+
+  function clearSecretParameterValues() {
+    setParameterValues((current) => {
+      const next = { ...current };
+      for (const definition of parameterDefinitions) {
+        if (definition.secret) delete next[definition.name];
+      }
+      return next;
+    });
   }
 
   function toggleScmOptions() {
@@ -738,6 +809,8 @@ function App() {
                   onChange={(event) => {
                     setProjectName(event.target.value);
                     setSelectedBuild(null);
+                    setParameterDefinitions([]);
+                    setParameterValues({});
                   }}
                 >
                   {projectsList.map((project) => <option key={project.id} value={project.name}>{project.name}</option>)}
@@ -769,6 +842,14 @@ function App() {
               onCleanIgnoredChange={setScmCleanIgnored}
               onCredentialChange={setScmCredentialId}
             />
+
+            {parameterDefinitions.length > 0 && (
+              <ParameterPanel
+                definitions={parameterDefinitions}
+                values={parameterValues}
+                onChange={(name, value) => setParameterValues((current) => ({ ...current, [name]: value }))}
+              />
+            )}
 
             <SchedulePanel
               schedules={scheduleList}
@@ -896,6 +977,55 @@ function SourcePreparationPanel({
       ) : (
         <div className="scm-collapsed"><span className="scm-collapsed-mark">⎇</span><p>Rivet inspects the current checkout by default. Open this panel to fetch a revision, clean untracked files, or attach a vault credential ID.</p><span className="scm-collapsed-status">NO MUTATION</span></div>
       )}
+    </section>
+  );
+}
+
+function ParameterPanel({
+  definitions,
+  values,
+  onChange,
+}: {
+  definitions: PipelineParameter[];
+  values: Record<string, string>;
+  onChange: (name: string, value: string) => void;
+}) {
+  return (
+    <section className="panel parameter-panel" aria-label="Pipeline parameters">
+      <div className="panel-heading">
+        <div>
+          <span className="overline">Runtime inputs</span>
+          <h2>Pipeline parameters</h2>
+        </div>
+        <span className="panel-count">{String(definitions.length).padStart(2, "0")}</span>
+      </div>
+      <div className="parameter-form">
+        {definitions.map((definition) => (
+          <label className="parameter-field" key={definition.name}>
+            <span className="parameter-label">
+              <span>{definition.name}</span>
+              {definition.required ? <em>required</em> : <em>optional</em>}
+            </span>
+            <input
+              type={definition.secret ? "password" : "text"}
+              value={values[definition.name] ?? ""}
+              onChange={(event) => onChange(definition.name, event.target.value)}
+              placeholder={definition.secret ? "enter secret at run time" : definition.default ?? "value"}
+              autoComplete={definition.secret ? "new-password" : "off"}
+              spellCheck={false}
+              aria-required={definition.required}
+            />
+            <small>
+              {definition.secret
+                ? "Secret · required at run time; never returned or persisted in clear text."
+                : definition.default
+                  ? `Default: ${definition.default}`
+                  : "No default · enter a value before running."}
+            </small>
+          </label>
+        ))}
+      </div>
+      <p className="parameter-notice"><span>⌁</span>Values are sent only with the run request. Secret fields are cleared after a successful queue or retry.</p>
     </section>
   );
 }

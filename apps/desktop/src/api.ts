@@ -6,6 +6,7 @@ import type {
   CredentialSummary,
   LogRecord,
   MigrationResponse,
+  PipelineParameter,
   Project,
   QueueItem,
   QueueResponse,
@@ -165,6 +166,12 @@ export function queueStats(): Promise<QueueStats> {
 
 export function queueItems(): Promise<QueueItem[]> {
   return request<QueueItem[]>("/api/v1/queue/items");
+}
+
+export function pipelineParameters(project: string): Promise<PipelineParameter[]> {
+  return request<PipelineParameter[]>(
+    `/api/v1/projects/${encodeURIComponent(project)}/parameters`,
+  );
 }
 
 export function pauseQueue(): Promise<QueueStats> {
