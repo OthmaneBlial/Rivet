@@ -159,8 +159,8 @@
       "category": "Differential testing",
       "feature": "Normalized recorded behavior comparison",
       "status": "partial",
-      "evidence": ["crates/rivet-compat/src/lib.rs", "crates/rivet-cli/src/main.rs", "compat/fixtures/sequential-build.json"],
-      "notes": "The local harness validates bounded JSON snapshots, normalizes provider status spelling, line endings, checksum prefixes, and redaction markers, then returns a non-zero result for semantic differences. Live Jenkins/Rivet capture adapters and a permanent live regression corpus remain planned."
+      "evidence": ["crates/rivet-compat/src/lib.rs", "crates/rivet-cli/src/main.rs", "compat/fixtures/sequential-build.json", "scripts/local-compat-capture-smoke.sh"],
+      "notes": "The harness validates bounded JSON snapshots, normalizes provider status spelling, line endings, checksum prefixes, and redaction markers, then returns a non-zero result for semantic differences. CLI adapters capture Rivet and Jenkins HTTP build/stage/artifact metadata with private token-file authentication and bounded responses; a local smoke test exercises a real Rivet server plus a protocol-compatible Jenkins fixture. A permanent corpus from deployed Jenkins remains planned."
     }
   ]
 }

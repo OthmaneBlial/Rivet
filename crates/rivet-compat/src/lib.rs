@@ -151,6 +151,13 @@ impl BehaviorFixture {
     }
 }
 
+impl BehaviorSnapshot {
+    /// Validate a provider snapshot before it is persisted or compared.
+    pub fn validate(&self) -> Result<(), CompatError> {
+        validate_snapshot(self)
+    }
+}
+
 pub fn compare_fixture(fixture: &BehaviorFixture) -> Result<CompatibilityReport, CompatError> {
     fixture.validate()?;
     let jenkins = normalize_snapshot(&fixture.jenkins)?;

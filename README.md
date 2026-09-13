@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**92% verified** · `██████████████████░░`<br>
-Weighted evidence score: **92.75 / 100** · displayed conservatively as the
+**93% verified** · `███████████████████░`<br>
+Weighted evidence score: **93.45 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -297,7 +297,7 @@ the administrator audit stream. External identity providers remain a future
 gate.
 
 Recorded Jenkins/Rivet behavior snapshots can be compared locally with the
-same explicit normalizer used by future live adapters:
+same explicit normalizer used by the live capture adapters:
 
 ```sh
 cargo run -p rivet -- compat compare ./compat/fixtures/sequential-build.json
@@ -305,8 +305,30 @@ cargo run -p rivet -- compat compare ./compat/fixtures/sequential-build.json
 
 The command exits non-zero when normalized stage, step, parameter, artifact, or
 log semantics differ. The checked-in fixture exercises provider status spelling,
-CRLF handling, checksum prefixes, and redaction markers; live Jenkins/Rivet
-capture adapters and a permanent live regression corpus remain future gates.
+CRLF handling, checksum prefixes, and redaction markers. Capture a real Rivet
+build or a Jenkins build through their HTTP APIs, using private token files and
+private `0600` snapshot outputs:
+
+```sh
+cargo run -p rivet -- compat capture-rivet rivet-e2e \
+  --server http://127.0.0.1:7878 --build 1 \
+  --output /secure/path/rivet.snapshot.json
+cargo run -p rivet -- compat capture-jenkins "folder/service" \
+  --server https://jenkins.example.test --build 42 \
+  --username ci-bot --token-file /secure/path/jenkins.token \
+  --output /secure/path/jenkins.snapshot.json
+cargo run -p rivet -- compat assemble \
+  --scenario sequential-build \
+  --jenkins /secure/path/jenkins.snapshot.json \
+  --rivet /secure/path/rivet.snapshot.json \
+  --output /secure/path/comparison.json
+```
+
+Responses are bounded before JSON parsing, Jenkins secret-looking parameter
+names are redacted, and console/log capture is opt-in with `--include-logs`.
+The local release gate exercises both adapters against a real local Rivet server
+and a protocol-compatible Jenkins HTTP fixture; a permanent corpus captured
+from a deployed Jenkins instance remains a future gate.
 
 Extension manifests can be loaded by the headless server from an explicit
 local directory:

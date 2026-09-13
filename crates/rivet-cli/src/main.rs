@@ -11,7 +11,10 @@ use rivet_auth::{
     AUTH_USERS_VERSION, ApiTokenRecord, AuthPolicy, AuthPolicyDocument, AuthUserRecord, AuthUsers,
     AuthUsersDocument, Role as AuthRole, generate_token, hash_password, token_digest,
 };
-use rivet_compat::{BehaviorFixture, compare_fixture};
+use rivet_compat::{
+    ArtifactSnapshot, BehaviorFixture, BehaviorSnapshot, StageSnapshot, StepSnapshot,
+    compare_fixture,
+};
 use rivet_core::{
     BuildEvent, BuildStatus, CronExpression, ExecutionPlan, LogStream, Pipeline, Project,
     ScheduleId, SourceSnapshot,
@@ -24,6 +27,7 @@ use rivet_scm::{
     GitCredential, GitHttpCredential, GitPrepareOptions, GitRepository, GitSshCredential, ScmError,
 };
 use rivet_storage::Storage;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -603,6 +607,60 @@ enum AnalyzeCommand {
 enum CompatCommand {
     /// Normalize and compare one exported behavior fixture.
     Compare { fixture: PathBuf },
+    /// Capture one live Rivet build as a bounded behavior snapshot.
+    CaptureRivet {
+        project: String,
+        #[arg(long)]
+        build: i64,
+        /// HTTP(S) origin or base URL of the Rivet server.
+        #[arg(long, default_value = "http://127.0.0.1:7878")]
+        server: String,
+        /// Read an optional Bearer token from a private file.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Include bounded Rivet log lines; omitted by default to avoid persisting output.
+        #[arg(long)]
+        include_logs: bool,
+        /// Private output path for the snapshot JSON.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Capture one live Jenkins build as a bounded behavior snapshot.
+    CaptureJenkins {
+        job: String,
+        #[arg(long)]
+        build: i64,
+        /// HTTP(S) origin or base URL of Jenkins.
+        #[arg(long)]
+        server: String,
+        /// Jenkins username used with the API token.
+        #[arg(long)]
+        username: Option<String>,
+        /// Read the Jenkins API token from a private file.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Include bounded console lines; omitted by default to avoid persisting output.
+        #[arg(long)]
+        include_logs: bool,
+        /// Private output path for the snapshot JSON.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Assemble two captured snapshots into a comparable fixture.
+    Assemble {
+        /// Stable scenario identifier for this comparison.
+        #[arg(long)]
+        scenario: String,
+        /// Snapshot captured from Jenkins.
+        #[arg(long)]
+        jenkins: PathBuf,
+        /// Snapshot captured from Rivet.
+        #[arg(long)]
+        rivet: PathBuf,
+        /// Private output path for the fixture JSON.
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -816,7 +874,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Auth { command } => manage_auth(&cli.data_dir, command)?,
         Command::Cache { command } => manage_cache(&cli.data_dir, command)?,
         Command::Analyze { command } => analyze_file(command)?,
-        Command::Compat { command } => compare_compatibility(command)?,
+        Command::Compat { command } => compare_compatibility(command).await?,
         Command::Agent(args) => run_agent(args).await?,
     }
     Ok(())
@@ -845,7 +903,7 @@ fn analyze_file(command: AnalyzeCommand) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-fn compare_compatibility(command: CompatCommand) -> Result<(), Box<dyn std::error::Error>> {
+async fn compare_compatibility(command: CompatCommand) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         CompatCommand::Compare { fixture } => {
             let fixture = BehaviorFixture::from_json(&fs::read(&fixture)?)?;
@@ -855,8 +913,616 @@ fn compare_compatibility(command: CompatCommand) -> Result<(), Box<dyn std::erro
                 return Err("compatibility fixture contains semantic differences".into());
             }
         }
+        CompatCommand::CaptureRivet {
+            project,
+            build,
+            server,
+            token_file,
+            include_logs,
+            output,
+        } => {
+            let snapshot = capture_rivet_snapshot(
+                &server,
+                &project,
+                build,
+                token_file.as_deref(),
+                include_logs,
+            )
+            .await?;
+            write_compat_json(&output, &snapshot)?;
+            println!("Captured Rivet snapshot to {}", output.display());
+        }
+        CompatCommand::CaptureJenkins {
+            job,
+            build,
+            server,
+            username,
+            token_file,
+            include_logs,
+            output,
+        } => {
+            let snapshot = capture_jenkins_snapshot(
+                &server,
+                &job,
+                build,
+                username.as_deref(),
+                token_file.as_deref(),
+                include_logs,
+            )
+            .await?;
+            write_compat_json(&output, &snapshot)?;
+            println!("Captured Jenkins snapshot to {}", output.display());
+        }
+        CompatCommand::Assemble {
+            scenario,
+            jenkins,
+            rivet,
+            output,
+        } => {
+            let jenkins = read_compat_snapshot(&jenkins)?;
+            let rivet = read_compat_snapshot(&rivet)?;
+            let fixture = BehaviorFixture {
+                schema_version: rivet_compat::FIXTURE_SCHEMA_VERSION,
+                scenario,
+                jenkins,
+                rivet,
+            };
+            fixture.validate()?;
+            write_compat_json(&output, &fixture)?;
+            println!("Assembled compatibility fixture at {}", output.display());
+        }
     }
     Ok(())
+}
+
+const MAX_COMPAT_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_COMPAT_CAPTURE_LOG_LINES: usize = 4096;
+const MAX_COMPAT_CAPTURE_LOG_LINE_BYTES: usize = 8192;
+
+async fn capture_rivet_snapshot(
+    server: &str,
+    project: &str,
+    build: i64,
+    token_file: Option<&Path>,
+    include_logs: bool,
+) -> Result<BehaviorSnapshot, Box<dyn std::error::Error>> {
+    if build <= 0 {
+        return Err("Rivet build number must be positive".into());
+    }
+    let token = token_file.map(read_auth_token).transpose()?;
+    let client = compatibility_http_client()?;
+    let details_url = rivet_capture_endpoint(server, project, build, &[])?;
+    let details: rivet_storage::BuildDetails = serde_json::from_value(
+        capture_json(
+            capture_get(&client, details_url, token.as_deref(), None),
+            "Rivet build details",
+        )
+        .await?,
+    )?;
+    let artifact_url = rivet_capture_endpoint(server, project, build, &["artifacts"])?;
+    let artifacts: Vec<rivet_storage::ArtifactRecord> = serde_json::from_value(
+        capture_json(
+            capture_get(&client, artifact_url, token.as_deref(), None),
+            "Rivet artifacts",
+        )
+        .await?,
+    )?;
+    let logs = if include_logs {
+        let log_url = rivet_capture_endpoint(server, project, build, &["logs"])?;
+        let records: Vec<rivet_storage::LogRecord> = serde_json::from_value(
+            capture_json(
+                capture_get(&client, log_url, token.as_deref(), None),
+                "Rivet logs",
+            )
+            .await?,
+        )?;
+        records.into_iter().map(|record| record.line).collect()
+    } else {
+        Vec::new()
+    };
+    let rivet_storage::BuildDetails { build, stages } = details;
+    let snapshot = BehaviorSnapshot {
+        status: status_label(&build.status).to_owned(),
+        stages: stages
+            .into_iter()
+            .map(|stage| StageSnapshot {
+                name: stage.stage.name,
+                status: status_label(&stage.stage.status).to_owned(),
+                steps: stage
+                    .steps
+                    .into_iter()
+                    .map(|step| StepSnapshot {
+                        name: step.name,
+                        status: status_label(&step.status).to_owned(),
+                        exit_code: step.exit_code,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        parameters: build.parameters,
+        artifacts: artifacts
+            .into_iter()
+            .map(|artifact| ArtifactSnapshot {
+                name: artifact.name,
+                checksum: Some(artifact.checksum),
+            })
+            .collect(),
+        logs: validate_capture_logs(logs)?,
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
+async fn capture_jenkins_snapshot(
+    server: &str,
+    job: &str,
+    build: i64,
+    username: Option<&str>,
+    token_file: Option<&Path>,
+    include_logs: bool,
+) -> Result<BehaviorSnapshot, Box<dyn std::error::Error>> {
+    if build <= 0 {
+        return Err("Jenkins build number must be positive".into());
+    }
+    let username = username.map(str::trim).filter(|value| !value.is_empty());
+    if username.is_some() != token_file.is_some() {
+        return Err("Jenkins authentication requires both --username and --token-file".into());
+    }
+    let token = token_file.map(read_auth_token).transpose()?;
+    let basic_auth = username.zip(token.as_deref());
+    let client = compatibility_http_client()?;
+    let mut build_url = jenkins_capture_endpoint(server, job, build, &["api", "json"])?;
+    build_url.set_query(Some(
+        "tree=result,building,actions[parameters[name,value]],artifacts[fileName,relativePath,checksum]",
+    ));
+    let build_payload = capture_json(
+        capture_get(&client, build_url, None, basic_auth),
+        "Jenkins build details",
+    )
+    .await?;
+    let building = build_payload
+        .get("building")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let status = jenkins_status(
+        build_payload
+            .get("result")
+            .and_then(serde_json::Value::as_str),
+        building,
+    )?;
+    let stage_payload = capture_optional_json(
+        capture_get(
+            &client,
+            jenkins_capture_endpoint(server, job, build, &["wfapi", "describe"])?,
+            None,
+            basic_auth,
+        ),
+        "Jenkins pipeline stages",
+    )
+    .await?;
+    let stages = parse_jenkins_stages(stage_payload.as_ref())?;
+    let logs = if include_logs {
+        let log_payload = capture_bytes(
+            capture_get(
+                &client,
+                jenkins_capture_endpoint(server, job, build, &["consoleText"])?,
+                None,
+                basic_auth,
+            ),
+            "Jenkins console output",
+        )
+        .await?;
+        let text = String::from_utf8(log_payload)?;
+        validate_capture_logs(text.lines().map(str::to_owned).collect())?
+    } else {
+        Vec::new()
+    };
+    let snapshot = BehaviorSnapshot {
+        status,
+        stages,
+        parameters: parse_jenkins_parameters(&build_payload),
+        artifacts: parse_jenkins_artifacts(&build_payload)?,
+        logs,
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
+fn compatibility_http_client() -> Result<reqwest::Client, Box<dyn std::error::Error>> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(20))
+        .user_agent("rivet-compat/0.1")
+        .build()?)
+}
+
+fn parse_capture_base_url(
+    server: &str,
+    label: &str,
+) -> Result<reqwest::Url, Box<dyn std::error::Error>> {
+    let url = reqwest::Url::parse(server.trim_end_matches('/'))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(format!("{label} must be a credential-free HTTP(S) base URL").into());
+    }
+    Ok(url)
+}
+
+fn append_capture_segments<I, S>(
+    url: &mut reqwest::Url,
+    segments: I,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut path = url
+        .path_segments_mut()
+        .map_err(|_| "capture URL cannot be used as a base URL")?;
+    path.pop_if_empty();
+    for segment in segments {
+        let segment = segment.as_ref();
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err("capture URL contains an invalid empty or traversal segment".into());
+        }
+        path.push(segment);
+    }
+    Ok(())
+}
+
+fn rivet_capture_endpoint(
+    server: &str,
+    project: &str,
+    build: i64,
+    tail: &[&str],
+) -> Result<reqwest::Url, Box<dyn std::error::Error>> {
+    let mut url = parse_capture_base_url(server, "Rivet server")?;
+    let number = build.to_string();
+    let mut segments = vec!["api", "v1", "projects", project, "builds", number.as_str()];
+    segments.extend_from_slice(tail);
+    append_capture_segments(&mut url, segments)?;
+    Ok(url)
+}
+
+fn jenkins_capture_endpoint(
+    server: &str,
+    job: &str,
+    build: i64,
+    tail: &[&str],
+) -> Result<reqwest::Url, Box<dyn std::error::Error>> {
+    let mut url = parse_capture_base_url(server, "Jenkins server")?;
+    let job = job.trim_matches('/');
+    if job.is_empty() {
+        return Err("Jenkins job cannot be empty".into());
+    }
+    let mut segments = Vec::new();
+    for part in job.split('/') {
+        if part.is_empty() || part == "." || part == ".." || part.chars().any(char::is_control) {
+            return Err("Jenkins job contains an invalid path segment".into());
+        }
+        segments.push("job");
+        segments.push(part);
+    }
+    let number = build.to_string();
+    segments.push(number.as_str());
+    segments.extend_from_slice(tail);
+    append_capture_segments(&mut url, segments)?;
+    Ok(url)
+}
+
+fn capture_get(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    bearer: Option<&str>,
+    basic: Option<(&str, &str)>,
+) -> reqwest::RequestBuilder {
+    let mut request = client
+        .get(url)
+        .header("accept", "application/json")
+        .header("x-request-id", uuid::Uuid::new_v4().to_string());
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+    if let Some((username, token)) = basic {
+        request = request.basic_auth(username, Some(token));
+    }
+    request
+}
+
+async fn capture_bytes(
+    request: reqwest::RequestBuilder,
+    label: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let response = request.send().await?;
+    let status = response.status();
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_COMPAT_CAPTURE_BYTES as u64)
+    {
+        return Err(
+            format!("{label} response exceeds the {MAX_COMPAT_CAPTURE_BYTES}-byte limit").into(),
+        );
+    }
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > MAX_COMPAT_CAPTURE_BYTES {
+            return Err(format!(
+                "{label} response exceeds the {MAX_COMPAT_CAPTURE_BYTES}-byte limit"
+            )
+            .into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        return Err(format!("{label} returned HTTP {status}").into());
+    }
+    Ok(body)
+}
+
+async fn capture_json(
+    request: reqwest::RequestBuilder,
+    label: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let body = capture_bytes(request, label).await?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
+async fn capture_optional_json(
+    request: reqwest::RequestBuilder,
+    label: &str,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    let response = request.send().await?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_COMPAT_CAPTURE_BYTES as u64)
+    {
+        return Err(
+            format!("{label} response exceeds the {MAX_COMPAT_CAPTURE_BYTES}-byte limit").into(),
+        );
+    }
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > MAX_COMPAT_CAPTURE_BYTES {
+            return Err(format!(
+                "{label} response exceeds the {MAX_COMPAT_CAPTURE_BYTES}-byte limit"
+            )
+            .into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        return Err(format!("{label} returned HTTP {status}").into());
+    }
+    Ok(Some(serde_json::from_slice(&body)?))
+}
+
+fn jenkins_status(
+    value: Option<&str>,
+    building: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let status = value.unwrap_or_default().trim().to_ascii_uppercase();
+    let mapped = match status.as_str() {
+        "" if building => "running",
+        "" => "pending",
+        "SUCCESS" => "passed",
+        "FAILURE" | "ERROR" => "failed",
+        "ABORTED" => "cancelled",
+        "UNSTABLE" => "unstable",
+        "NOT_BUILT" => "skipped",
+        "QUEUED" | "WAITING" | "BLOCKED" => "queued",
+        "IN_PROGRESS" | "RUNNING" => "running",
+        other => return Err(format!("unsupported Jenkins status: {other}").into()),
+    };
+    Ok(mapped.to_owned())
+}
+
+fn parse_jenkins_stages(
+    payload: Option<&serde_json::Value>,
+) -> Result<Vec<StageSnapshot>, Box<dyn std::error::Error>> {
+    let Some(stages) = payload
+        .and_then(|payload| payload.get("stages"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+    stages
+        .iter()
+        .enumerate()
+        .map(|(index, stage)| {
+            let name = stage
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("Jenkins stage {index} has no name"))?
+                .to_owned();
+            let status = jenkins_status(
+                stage.get("status").and_then(serde_json::Value::as_str),
+                false,
+            )?;
+            let steps = stage
+                .get("steps")
+                .and_then(serde_json::Value::as_array)
+                .map(|steps| {
+                    steps
+                        .iter()
+                        .enumerate()
+                        .map(|(step_index, step)| {
+                            let name = step
+                                .get("name")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| format!("Jenkins step {step_index} has no name"))?
+                                .to_owned();
+                            Ok(StepSnapshot {
+                                name,
+                                status: jenkins_status(
+                                    step.get("status").and_then(serde_json::Value::as_str),
+                                    false,
+                                )?,
+                                exit_code: step
+                                    .get("exit_code")
+                                    .and_then(serde_json::Value::as_i64)
+                                    .and_then(|value| i32::try_from(value).ok()),
+                            })
+                        })
+                        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            Ok(StageSnapshot {
+                name,
+                status,
+                steps,
+            })
+        })
+        .collect()
+}
+
+fn parse_jenkins_parameters(payload: &serde_json::Value) -> BTreeMap<String, String> {
+    let mut parameters = BTreeMap::new();
+    let Some(actions) = payload.get("actions").and_then(serde_json::Value::as_array) else {
+        return parameters;
+    };
+    for action in actions {
+        let Some(values) = action
+            .get("parameters")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for parameter in values {
+            let Some(name) = parameter.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(value) = parameter.get("value") else {
+                continue;
+            };
+            let value = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            parameters.insert(
+                name.to_owned(),
+                if sensitive_parameter_name(name) {
+                    "<redacted>".to_owned()
+                } else {
+                    value
+                },
+            );
+        }
+    }
+    parameters
+}
+
+fn sensitive_parameter_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    [
+        "PASSWORD",
+        "PASSWD",
+        "TOKEN",
+        "SECRET",
+        "PRIVATE_KEY",
+        "API_KEY",
+        "CREDENTIAL",
+    ]
+    .iter()
+    .any(|marker| name.contains(marker))
+}
+
+fn parse_jenkins_artifacts(
+    payload: &serde_json::Value,
+) -> Result<Vec<ArtifactSnapshot>, Box<dyn std::error::Error>> {
+    let Some(artifacts) = payload
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+    artifacts
+        .iter()
+        .enumerate()
+        .map(|(index, artifact)| {
+            let name = artifact
+                .get("fileName")
+                .or_else(|| artifact.get("relativePath"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("Jenkins artifact {index} has no file name"))?
+                .to_owned();
+            Ok(ArtifactSnapshot {
+                name,
+                checksum: artifact
+                    .get("checksum")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+fn validate_capture_logs(logs: Vec<String>) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if logs.len() > MAX_COMPAT_CAPTURE_LOG_LINES {
+        return Err(format!(
+            "compatibility capture contains more than {MAX_COMPAT_CAPTURE_LOG_LINES} log lines"
+        )
+        .into());
+    }
+    for line in &logs {
+        if line.len() > MAX_COMPAT_CAPTURE_LOG_LINE_BYTES
+            || line
+                .chars()
+                .any(|character| character.is_control() && character != '\r' && character != '\n')
+        {
+            return Err("compatibility capture contains an invalid log line".into());
+        }
+    }
+    Ok(logs)
+}
+
+fn read_compat_snapshot(path: &Path) -> Result<BehaviorSnapshot, Box<dyn std::error::Error>> {
+    let bytes = read_bounded_compat_file(path, "compatibility snapshot")?;
+    let snapshot: BehaviorSnapshot = serde_json::from_slice(&bytes)?;
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
+fn read_bounded_compat_file(
+    path: &Path,
+    label: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{label} must not be a symbolic link: {}", path.display()).into());
+    }
+    if !metadata.is_file() {
+        return Err(format!("{label} path must be a regular file: {}", path.display()).into());
+    }
+    if metadata.len() > MAX_COMPAT_CAPTURE_BYTES as u64 {
+        return Err(format!("{label} exceeds the {MAX_COMPAT_CAPTURE_BYTES}-byte limit").into());
+    }
+    let bytes = fs::read(path)?;
+    if bytes.len() > MAX_COMPAT_CAPTURE_BYTES {
+        return Err(format!("{label} exceeds the {MAX_COMPAT_CAPTURE_BYTES}-byte limit").into());
+    }
+    Ok(bytes)
+}
+
+fn write_compat_json<T: Serialize>(
+    path: &Path,
+    value: &T,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    write_private_atomic(path, &bytes, true, "compatibility capture")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3027,5 +3693,69 @@ mod tests {
         ] {
             assert!(cancel_endpoint(server, "project", 1).is_err(), "{server}");
         }
+    }
+
+    #[test]
+    fn compatibility_capture_urls_encode_project_and_nested_job_segments() {
+        let rivet = rivet_capture_endpoint(
+            "https://ci.example.test/rivet/",
+            "team alpha",
+            42,
+            &["artifacts"],
+        )
+        .expect("Rivet capture URL");
+        assert_eq!(
+            rivet.as_str(),
+            "https://ci.example.test/rivet/api/v1/projects/team%20alpha/builds/42/artifacts"
+        );
+
+        let jenkins = jenkins_capture_endpoint(
+            "https://ci.example.test/jenkins/",
+            "folder/service api",
+            7,
+            &["wfapi", "describe"],
+        )
+        .expect("Jenkins capture URL");
+        assert_eq!(
+            jenkins.as_str(),
+            "https://ci.example.test/jenkins/job/folder/job/service%20api/7/wfapi/describe"
+        );
+    }
+
+    #[test]
+    fn compatibility_capture_maps_statuses_and_redacts_sensitive_parameters() {
+        assert_eq!(jenkins_status(Some("SUCCESS"), false).unwrap(), "passed");
+        assert_eq!(
+            jenkins_status(Some("IN_PROGRESS"), false).unwrap(),
+            "running"
+        );
+        assert_eq!(jenkins_status(None, true).unwrap(), "running");
+        assert!(jenkins_status(Some("plugin-specific"), false).is_err());
+
+        let payload = serde_json::json!({
+            "actions": [{
+                "parameters": [
+                    {"name": "TARGET", "value": "release"},
+                    {"name": "DEPLOY_TOKEN", "value": "must-not-persist"}
+                ]
+            }]
+        });
+        let parameters = parse_jenkins_parameters(&payload);
+        assert_eq!(parameters.get("TARGET"), Some(&"release".to_owned()));
+        assert_eq!(
+            parameters.get("DEPLOY_TOKEN"),
+            Some(&"<redacted>".to_owned())
+        );
+    }
+
+    #[test]
+    fn compatibility_capture_rejects_unbounded_logs() {
+        assert!(validate_capture_logs(vec!["ok".into()]).is_ok());
+        assert!(
+            validate_capture_logs(vec!["x".repeat(MAX_COMPAT_CAPTURE_LOG_LINE_BYTES + 1)]).is_err()
+        );
+        assert!(
+            validate_capture_logs(vec!["line".into(); MAX_COMPAT_CAPTURE_LOG_LINES + 1]).is_err()
+        );
     }
 }

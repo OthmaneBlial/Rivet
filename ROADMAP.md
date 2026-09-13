@@ -5,8 +5,8 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **92 / 100 points** (**92.75 weighted evidence
-points**, displayed conservatively as 92%).
+The current verified total is **93 / 100 points** (**93.45 weighted evidence
+points**, displayed conservatively as 93%).
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
@@ -28,7 +28,7 @@ points**, displayed conservatively as 92%).
 | Authentication and authorization | 4 | partial | protected remote transport with private Bearer tokens, policy-file token digests, roles, project scopes, route authorization, agent-connect permission checks, local token creation/listing/revocation, optional RFC3339 token expiration enforcement, bounded admin-only authentication audit history, Argon2id local user policy files with CLI lifecycle controls, password login, and persisted opaque session creation/use/expiry/revocation pass; external identity providers remain |
 | Extension protocol | 4 | verified | versioned manifest, WASM/subprocess kind model, declared permission vocabulary, bounded length-prefixed JSON framing, direct-argument subprocess host, bounded local catalog discovery/API, desktop extension model, root-confined subprocess lifecycle manager with per-request permission enforcement, administrator-only server/desktop subprocess lifecycle controls, capability-free WASM runtime with explicit JSON ABI, denied imports, bounded module/memory/output sizes, fuel metering, bounded read-only build/log/artifact host methods, persisted stage-scoped annotations with permission-checked host writes, and permission-checked real build triggering pass |
 | Jenkins migration analyzer | 3 | partial | bounded Jenkinsfile analysis, headless API delivery, rendered desktop report, and valid drafts for deterministic quoted shell steps pass; full Groovy parsing, plugin semantics, and broad generated Rivetfile conversion remain |
-| Differential compatibility harness | 2 | partial | bounded JSON snapshots, explicit semantic normalization/comparison, mismatch exit status, and a checked-in regression fixture pass; live Jenkins/Rivet capture adapters and a permanent live regression corpus remain |
+| Differential compatibility harness | 2 | partial | bounded JSON snapshots, explicit semantic normalization/comparison, mismatch exit status, checked-in regression fixture, live Rivet/Jenkins HTTP capture adapters with private token-file auth and bounded responses, and a local capture smoke pass; a permanent corpus captured from deployed Jenkins remains |
 | Release and operations | 2 | partial | local release gate, optimized CLI artifact, desktop web/native checks, real temporary-data CLI smoke workflow, and versioned SHA-256 manifest pass; signed installers, observability, upgrades, recovery, security, and load gates remain |
 
 ## Progress policy
@@ -41,8 +41,8 @@ scaffold, passing unrelated test, or interface alone does not complete a gate.
 The next gates are the final Tauri-window
 flow inside the packaged app, API
 deployment hardening, broader provider lifecycle and deployment-specific keychain policy coverage, user
-accounts and external identity providers, live compatibility capture adapters
-and a permanent differential regression corpus, broader repository-event
+accounts and external identity providers, a permanent differential regression
+corpus captured from deployed Jenkins, broader repository-event
 mapping, upstream triggers, full Groovy/plugin migration
 semantics, and generated Rivetfile conversion with fixture-backed migration
 regressions.
