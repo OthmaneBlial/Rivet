@@ -68,7 +68,7 @@
       "feature": "Project-scoped local CI cache",
       "status": "partial",
       "evidence": ["crates/rivet-core/src/pipeline.rs", "crates/rivet-runner/src/cache.rs", "crates/rivet-runner/src/pipeline.rs", "crates/rivet-runner/src/scheduler.rs"],
-      "notes": "Exact relative cache paths are validated, entries are isolated by project and key, restored before execution, and saved atomically after success; fallback keys, eviction, and remote backends remain planned."
+      "notes": "Exact relative cache paths and bounded primary/fallback keys are validated, entries are isolated by project and key, restoration tries the first valid archive before execution, and saves are atomic after success; eviction and remote backends remain planned."
     },
     {
       "category": "Execution",

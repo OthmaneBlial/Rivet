@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**84% verified** · `████████████████▊░░░`<br>
-Weighted evidence score: **84.73 / 100** · displayed conservatively as the
+**85% verified** · `█████████████████░░░`<br>
+Weighted evidence score: **85.18 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -416,6 +416,7 @@ secret = true
 [[caches]]
 name = "rust-target"
 key = "rust-target-v1"
+fallback_keys = ["rust-target-default"]
 paths = ["target"]
 
 [[artifacts]]
@@ -427,9 +428,10 @@ Parameters are resolved per build and exposed to direct processes as
 environment variables. Non-secret values are persisted for history; secret
 parameters cannot define defaults, are represented as `[redacted]` in stored
 build data and API responses, and are replaced with `***` in emitted logs.
-Cache paths use an exact project-scoped key, restore before the first stage, and
-save only after a successful build to an atomic archive under Rivet's local
-data directory; a missing or corrupt cache never fails the build. Artifact
+Cache paths use exact project-scoped primary and fallback keys, restore before
+the first stage, and save only after a successful build to an atomic archive
+under Rivet's local data directory; a missing or corrupt cache never fails the
+build. Artifact
 files stay inside the pipeline workspace, are copied to local Rivet storage
 with a SHA-256 checksum, and are available through the build artifacts API or
 `rivet artifacts`. Remote agents package only declared artifact matches and
