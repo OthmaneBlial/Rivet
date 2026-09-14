@@ -1,16 +1,21 @@
-# Rivet
+# Rivet — A Modern Jenkins Alternative
 
-### A Rust-native CI/CD control room for pipelines you can actually see.
+### Rust-native CI/CD automation for teams that want a clearer build signal.
 
-Rivet is a local-first CI/CD automation platform for defining, running, and
-operating build pipelines from one focused workspace. It combines an explicit
-`Rivetfile.toml`, a Rust execution engine, durable SQLite history, a headless
-HTTP/WebSocket API, a CLI, and a Tauri desktop control room.
+Rivet is an open-source, self-hosted CI/CD platform for defining, running, and
+operating build pipelines from one focused control room. It combines an
+explicit `Rivetfile.toml`, a Rust execution engine, durable SQLite history, a
+headless HTTP/WebSocket API, a CLI, and a Tauri desktop application.
 
-It is being built as a modern, inspectable Jenkins alternative for teams that
-want clear pipeline behavior without hiding the execution signal behind a
-black box. Rivet is an early alpha: it does not claim feature-for-feature
-Jenkins parity or production readiness on every platform.
+If you are evaluating Jenkins alternatives, Rivet offers a fresh architecture
+to try: local-first operation, visible queue and stage state, typed events,
+remote-agent execution, and a modern developer-tool interface. It is built
+independently from Jenkins and is intentionally not a feature-for-feature clone
+of Jenkins or its Java plugin ecosystem.
+
+Rivet is currently an early alpha. The working slices below are real and tested,
+but cross-platform packaging, production operations, broad Jenkins migration,
+and full Jenkins parity are not claimed.
 
 <p align="center">
   <img src="apps/desktop/src-tauri/icons/icon.svg" alt="Rivet logo" width="112" />
@@ -45,11 +50,16 @@ The 50-second preview shows the real macOS control room, a passed local
 pipeline, the Jenkinsfile migration assistant, queue visibility, remote-agent
 status, and the light/dark workspace. [Watch or download the full MP4](https://github.com/OthmaneBlial/Rivet/releases/download/v0.1.0-alpha/rivet-desktop-demo.mp4).
 
-## Why Rivet exists
+## Why look for a Jenkins alternative?
 
-CI/CD tools are powerful, but the operator often has to reconstruct what is
-happening from scattered logs, opaque configuration, queue state, and provider
-callbacks. Rivet keeps the execution model explicit:
+Jenkins remains a capable and widely used automation server. Rivet exists for
+teams that want to evaluate a newer CI/CD architecture alongside it: a smaller
+local-first control room, explicit pipeline contracts, and build state that is
+easy to inspect from the CLI, API, or desktop UI.
+
+In many CI/CD systems, the operator reconstructs what is happening from
+scattered logs, opaque configuration, queue state, and provider callbacks.
+Rivet keeps the execution model explicit:
 
 - the pipeline is a versioned TOML file;
 - each build has a durable identity, source snapshot, stage state, logs, and
@@ -57,19 +67,21 @@ callbacks. Rivet keeps the execution model explicit:
 - queue admission, cancellation, retry, and resource requirements are visible;
 - the same Rust core powers the CLI, headless server, and desktop client.
 
-The result is a small, auditable foundation for local development, self-hosted
-automation, and future distributed runners.
+The result is an auditable foundation for local development and self-hosted
+automation, with a path toward distributed runners. Think of it as a modern
+Jenkins alternative for teams who value inspectability and a Rust-native core,
+not as a promise that every Jenkins plugin already works in Rivet.
 
 ## What Rivet gives you
 
-### Define a pipeline you can review
+### Define CI/CD pipelines you can review
 
 `Rivetfile.toml` uses explicit executable and argument arrays. Pipelines support
 validated stage dependencies, stable topological ordering, parallel independent
 stages, parameters, deterministic conditional stages with explicit `skipped`
 outcomes, timeouts, and declared artifacts.
 
-### Run and observe the whole build
+### Run and observe every build
 
 The native process runner streams stdout and stderr with bounded line
 retention, supports cancellation and cleanup, and records typed build events.
@@ -80,7 +92,7 @@ Build details, stage movement, live output, retry actions, checksummed artifact
 downloads, retention pruning, and project-scoped local CI cache operations are
 available through the CLI, API, and desktop control room.
 
-### Connect real repositories and triggers
+### Connect repositories and triggers
 
 Rivet can inspect Git source at build admission and exercise clone, checkout,
 fetch, clean, submodule, and explicit revision preparation. It supports local
