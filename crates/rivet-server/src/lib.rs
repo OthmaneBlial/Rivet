@@ -397,9 +397,16 @@ impl IntoResponse for ApiError {
             Self::Migration(_)
             | Self::Auth(_)
             | Self::Storage(_)
-            | Self::Pipeline(_)
             | Self::Model(_)
             | Self::Scheduler(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Pipeline(error) => match error {
+                rivet_core::PipelineError::UnknownParameter(_)
+                | rivet_core::PipelineError::MissingParameter(_)
+                | rivet_core::PipelineError::InvalidParameterValue { .. } => {
+                    StatusCode::BAD_REQUEST
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            },
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }
@@ -5893,7 +5900,7 @@ mod tests {
             .create_project(&project, &pipeline)
             .expect("create project");
 
-        let response = router(AppState::new(storage))
+        let response = router(AppState::new(storage.clone()))
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/projects/parameters/parameters")
@@ -5924,6 +5931,19 @@ mod tests {
         assert_eq!(payload[3]["kind"], "password");
         assert_eq!(payload[3]["secret"], true);
         assert!(payload[3]["default"].is_null());
+
+        let response = router(AppState::new(storage))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/parameters/builds")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"parameters":{"PUBLISH":"not-a-boolean"}}"#))
+                    .expect("invalid parameter request"),
+            )
+            .await
+            .expect("invalid parameter response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
