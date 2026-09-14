@@ -291,9 +291,9 @@ pub fn analyze_jenkinsfile(source: &str) -> JenkinsfileAnalysis {
                 &mut recommendations,
                 line_number,
                 "parallel",
-                SupportLevel::Unsupported,
-                "Parallel branch semantics are not silently converted; the current runner executes stages sequentially.",
-                None,
+                SupportLevel::Partial,
+                "Rivet can run independent stages concurrently, but Groovy branch names and their dependencies require explicit migration review.",
+                Some("independent [[stages]] entries with explicit depends_on"),
                 evidence("parallel", None),
             );
         } else if starts_with_construct(trimmed, "script") {
@@ -1231,7 +1231,7 @@ mod tests {
 
         assert_eq!(analysis.status, SupportLevel::Unsupported);
         assert!(analysis.summary.unsupported >= 3);
-        for kind in ["when", "script", "parallel", "with_credentials"] {
+        for kind in ["when", "script", "with_credentials"] {
             assert!(
                 analysis
                     .constructs
@@ -1240,6 +1240,9 @@ mod tests {
                         && finding.status == SupportLevel::Unsupported)
             );
         }
+        assert!(analysis.constructs.iter().any(|finding| {
+            finding.kind == "parallel" && finding.status == SupportLevel::Partial
+        }));
     }
 
     #[test]
@@ -1273,6 +1276,34 @@ pipeline {
             1
         );
         assert_eq!(analysis.summary.unsupported, 0);
+    }
+
+    #[test]
+    fn parallel_blocks_are_reported_as_reviewable_rivet_dag_work() {
+        let analysis = analyze_jenkinsfile(
+            r#"pipeline {
+  stages {
+    stage('Checks') {
+      parallel {
+        stage('Lint') { steps { sh 'cargo fmt --check' } }
+        stage('Test') { steps { sh 'cargo test' } }
+      }
+    }
+  }
+}"#,
+        );
+
+        let finding = analysis
+            .constructs
+            .iter()
+            .find(|finding| finding.kind == "parallel")
+            .expect("parallel finding");
+        assert_eq!(finding.status, SupportLevel::Partial);
+        assert_eq!(
+            finding.rivet_mapping.as_deref(),
+            Some("independent [[stages]] entries with explicit depends_on")
+        );
+        assert!(analysis.summary.partial >= 1);
     }
 
     #[test]
