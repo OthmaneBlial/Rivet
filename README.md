@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**94% verified** · `███████████████████░`<br>
-Weighted evidence score: **94.97 / 100** · displayed conservatively as the
+**95% verified** · `███████████████████░`<br>
+Weighted evidence score: **95.02 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -36,7 +36,7 @@ secret-parameter redaction/masking, a passphrase-encrypted SCM credential vault
 with typed HTTP/SSH credentials, non-secret credential references, project allow-lists,
 deployment-specific OS-keychain service/account isolation, and local user accounts
 with Argon2id password verification, opaque sessions, and a packaged desktop launch with an
-ephemeral loopback engine origin, project-scoped local CI cache restore and
+ephemeral loopback engine origin plus bridge retry/offline recovery, project-scoped local CI cache restore and
 save, explicit Docker/Podman container command assembly with bounded workspace mounts,
 and a bounded Jenkinsfile migration analyzer with line-level support findings
 plus safe drafts for deterministic shell steps and statically typed primitive

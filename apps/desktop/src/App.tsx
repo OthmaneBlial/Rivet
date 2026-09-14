@@ -425,6 +425,12 @@ function App() {
     return () => window.clearTimeout(retry);
   }, [engineOnline, loadProjects]);
 
+  useEffect(() => {
+    const retryConnection = () => void loadProjects();
+    window.addEventListener("online", retryConnection);
+    return () => window.removeEventListener("online", retryConnection);
+  }, [loadProjects]);
+
   async function runSelectedPipeline() {
     if (!projectName) return;
     if (!validateParameterValues()) return;

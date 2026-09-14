@@ -88,7 +88,17 @@ export async function initializeEngineOrigin(): Promise<string> {
         activeEngineOrigin = parsed.origin;
         return activeEngineOrigin;
       })
-      .catch(() => activeEngineOrigin);
+      .catch((cause) => {
+        // The embedded server deliberately binds an ephemeral loopback port.
+        // Falling back to the CLI's 7878 port would turn a temporary bridge
+        // race into a permanent stream of misleading fetch failures.
+        engineOriginPromise = null;
+        throw new Error(
+          cause instanceof Error
+            ? `The embedded engine bridge is unavailable: ${cause.message}`
+            : "The embedded engine bridge is unavailable.",
+        );
+      });
   }
   return engineOriginPromise;
 }
@@ -98,7 +108,17 @@ export function getEngineOrigin(): string {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const engineOrigin = await initializeEngineOrigin();
+  let engineOrigin: string;
+  try {
+    engineOrigin = await initializeEngineOrigin();
+  } catch {
+    throw new EngineRequestError(
+      "Engine bridge unavailable — retrying the local connection.",
+      "",
+      null,
+      true,
+    );
+  }
   const method = (init?.method ?? "GET").toUpperCase();
   const retryable = RETRYABLE_METHODS.has(method);
   let response: Response | undefined;
