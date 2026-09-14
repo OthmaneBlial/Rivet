@@ -19,6 +19,9 @@ cargo test --workspace
 ./scripts/local-progress-check.sh
 ```
 
+The same baseline is available as `make check`. Use `make release` for the
+full macOS packaging and integration gate.
+
 On macOS, run `./scripts/local-release-check.sh` when changing packaging,
 desktop integration, release behavior, storage boundaries, or deployment
 hardening. The repository intentionally validates locally and does not consume

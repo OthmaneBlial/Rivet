@@ -346,6 +346,9 @@ cargo test --workspace
 ./scripts/local-documentation-check.sh
 ```
 
+The common baseline is also available as `make check`. Use `make desktop-build`
+for the desktop-only build or `make release` for the full macOS packaging gate.
+
 Run the full macOS release gate:
 
 ```sh

@@ -13,6 +13,7 @@ test -s SUPPORT.md
 test -s CODE_OF_CONDUCT.md
 test -s CHANGELOG.md
 test -s CITATION.cff
+test -s Makefile
 test -s .github/pull_request_template.md
 test -s .github/CODEOWNERS
 test -s .github/ISSUE_TEMPLATE/bug_report.md
