@@ -1647,7 +1647,7 @@ function ArtifactPanel({
               key={artifact.id}
             >
               <span className="artifact-mark">□</span>
-              <span className="artifact-copy"><strong>{artifact.relative_path}</strong><small>{artifact.name} · {formatBytes(artifact.size_bytes)} · {artifact.mime_type}</small></span>
+              <span className="artifact-copy"><strong>{artifact.relative_path}</strong><small>{artifact.name} · {formatBytes(artifact.size_bytes)} · {artifact.mime_type} · {artifact.stage_id ? `stage ${artifact.stage_id.slice(0, 8)}` : "pipeline output"} · {artifact.expires_at ? `retains until ${new Date(artifact.expires_at).toLocaleDateString()}` : "no expiry"}</small></span>
               <span className="artifact-checksum">{artifact.checksum.slice(-12)}</span>
               <span className="artifact-arrow">↗</span>
             </a>
