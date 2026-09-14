@@ -718,6 +718,12 @@ struct LogQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct CredentialListQuery {
+    #[serde(default)]
+    owner: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct ExtensionRuntimeStatusResponse {
     id: String,
@@ -1553,10 +1559,36 @@ fn configured_credentials(state: &AppState) -> Result<&Arc<Mutex<CredentialVault
 async fn list_credentials(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    Query(query): Query<CredentialListQuery>,
 ) -> Result<Json<Vec<CredentialSummary>>, ApiError> {
     require_global(&principal, Permission::Administer)?;
+    let owner = query
+        .owner
+        .map(|owner| {
+            let owner = owner.trim().to_owned();
+            if owner.is_empty() || owner.len() > 256 || owner.chars().any(char::is_control) {
+                Err(ApiError::BadRequest(
+                    "credential owner filter must be non-empty and bounded".into(),
+                ))
+            } else {
+                Ok(owner)
+            }
+        })
+        .transpose()?;
     let vault = configured_credentials(&state)?;
-    Ok(Json(vault.lock().await.list()))
+    Ok(Json(
+        vault
+            .lock()
+            .await
+            .list()
+            .into_iter()
+            .filter(|credential| {
+                owner
+                    .as_deref()
+                    .is_none_or(|owner| owner == credential.owner)
+            })
+            .collect(),
+    ))
 }
 
 async fn set_credential(
@@ -8840,6 +8872,32 @@ agent = { os = "macos", arch = "aarch64", labels = ["recovery"] }
                 .windows(b"first-secret".len())
                 .any(|window| { window == b"first-secret" })
         );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/credentials?owner=unassigned")
+                    .body(Body::empty())
+                    .expect("owner-filter request"),
+            )
+            .await
+            .expect("owner-filter response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let filtered = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("owner-filter body");
+        assert_eq!(&filtered[..], b"[]");
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/credentials?owner=%0A")
+                    .body(Body::empty())
+                    .expect("invalid owner-filter request"),
+            )
+            .await
+            .expect("invalid owner-filter response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let response = router(state.clone())
             .oneshot(put("rotated-secret"))

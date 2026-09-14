@@ -270,8 +270,9 @@ export function requestExtension(
   );
 }
 
-export function credentials(): Promise<CredentialSummary[]> {
-  return request<CredentialSummary[]>("/api/v1/credentials");
+export function credentials(owner?: string): Promise<CredentialSummary[]> {
+  const query = owner ? `?owner=${encodeURIComponent(owner)}` : "";
+  return request<CredentialSummary[]>(`/api/v1/credentials${query}`);
 }
 
 export function setCredential(
