@@ -7,11 +7,12 @@ operating build pipelines from one focused control room. It combines an
 explicit `Rivetfile.toml`, a Rust execution engine, durable SQLite history, a
 headless HTTP/WebSocket API, a CLI, and a Tauri desktop application.
 
-If you are evaluating Jenkins alternatives, Rivet offers a fresh architecture
-to try: local-first operation, visible queue and stage state, typed events,
-remote-agent execution, and a modern developer-tool interface. It is built
-independently from Jenkins and is intentionally not a feature-for-feature clone
-of Jenkins or its Java plugin ecosystem.
+If you are evaluating Jenkins alternatives, Rivet is a candidate self-hosted
+Jenkins replacement for teams that want a fresh architecture to try: local-
+first operation, visible queue and stage state, typed events, remote-agent
+execution, and a modern developer-tool interface. It is built independently
+from Jenkins and is intentionally not a feature-for-feature clone of Jenkins or
+its Java plugin ecosystem.
 
 Rivet is currently an early alpha. The working slices below are real and tested,
 but cross-platform packaging, production operations, broad Jenkins migration,
