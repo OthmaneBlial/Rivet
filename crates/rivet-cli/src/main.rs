@@ -505,6 +505,9 @@ enum CredentialCommand {
         kind: CredentialKindArg,
         #[arg(long)]
         username: String,
+        /// Identity that owns this credential; defaults to `local`.
+        #[arg(long)]
+        owner: Option<String>,
         /// Restrict use to one or more project names; repeat the flag.
         #[arg(long = "project")]
         projects: Vec<String>,
@@ -3666,6 +3669,7 @@ fn manage_credentials(
             id,
             kind,
             username,
+            owner,
             projects,
             secret_file,
             passphrase_file,
@@ -3677,10 +3681,35 @@ fn manage_credentials(
             let mut vault = CredentialVault::open_or_create(&vault_path, passphrase)?;
             match kind {
                 CredentialKindArg::HttpBasic => {
-                    vault.set_http_basic_for_projects(id.clone(), username, secret, projects)?;
+                    if let Some(owner) = owner {
+                        vault.set_http_basic_for_projects_owned(
+                            id.clone(),
+                            owner,
+                            username,
+                            secret,
+                            projects,
+                        )?;
+                    } else {
+                        vault.set_http_basic_for_projects(
+                            id.clone(),
+                            username,
+                            secret,
+                            projects,
+                        )?;
+                    }
                 }
                 CredentialKindArg::SshKey => {
-                    vault.set_ssh_key_for_projects(id.clone(), username, secret, projects)?;
+                    if let Some(owner) = owner {
+                        vault.set_ssh_key_for_projects_owned(
+                            id.clone(),
+                            owner,
+                            username,
+                            secret,
+                            projects,
+                        )?;
+                    } else {
+                        vault.set_ssh_key_for_projects(id.clone(), username, secret, projects)?;
+                    }
                 }
             }
             println!("Stored credential {id} in {}", vault.path().display());
@@ -3716,14 +3745,15 @@ fn manage_credentials(
                     credential.projects.join(",")
                 };
                 println!(
-                    "{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\towner={}",
                     credential.id,
                     match credential.kind {
                         CredentialKind::HttpBasic => "http-basic",
                         CredentialKind::SshKey => "ssh-key",
                     },
                     credential.username,
-                    scope
+                    scope,
+                    credential.owner
                 );
             }
         }

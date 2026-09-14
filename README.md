@@ -131,8 +131,10 @@ The Tauri desktop client embeds a loopback Rust engine and starts in light mode,
 with a persistent dark-mode toggle. The headless server provides health and
 readiness probes, scoped API identities, opaque sessions, audit records,
 authenticated metrics, graceful shutdown, and a bounded extension surface.
-The local credential vault encrypts provider credentials and keeps projects
-scoped to opaque references rather than ordinary pipeline records.
+The local credential vault encrypts provider credentials, records an owner
+identity for rotation/audit, and keeps projects scoped to opaque references
+rather than ordinary pipeline records. The CLI supports `--owner` without
+placing secrets in process arguments.
 
 ## Screenshots
 
