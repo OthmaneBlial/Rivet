@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **94% verified** · `███████████████████░`<br>
-Weighted evidence score: **94.36 / 100** · displayed conservatively as the
+Weighted evidence score: **94.37 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -177,6 +177,7 @@ cargo run -p rivet -- builds rivet
 cargo run -p rivet -- inspect rivet --build 1
 cargo run -p rivet -- logs rivet --build 1
 cargo run -p rivet -- cancel rivet --build 1 --server http://127.0.0.1:7878
+cargo run -p rivet -- poll rivet --server http://127.0.0.1:7878 --token-file /secure/path/rivet.token
 ```
 
 The build command uses the Rust queue, real child processes, live event
@@ -189,6 +190,9 @@ during a running step to exercise the local cancellation path. The `cancel`
 command sends one authenticated request to a running server; pass
 `--token-file` for a private Bearer token. Mutations are not retried after a
 network interruption, avoiding duplicate operator actions.
+The `poll` command sends one authenticated repository-change request to a
+server, optionally with `--fetch --remote <name> --credential-id <id>`; the
+credential is only an ID and its secret stays in the server-side vault.
 
 The process runner streams stdout and stderr independently while retaining at
 most 64 KiB of any single line. An unterminated line that exceeds the bound is

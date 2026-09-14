@@ -117,7 +117,7 @@
       "category": "Triggers",
       "feature": "Authenticated repository-change polling",
       "status": "partial",
-      "evidence": ["crates/rivet-server/src/lib.rs", "crates/rivet-storage/migrations/016_repository_poll_events.sql", "apps/desktop/src/App.tsx"],
+      "evidence": ["crates/rivet-server/src/lib.rs", "crates/rivet-storage/migrations/016_repository_poll_events.sql", "crates/rivet-cli/src/main.rs", "apps/desktop/src/App.tsx"],
       "notes": "A project-scoped authenticated endpoint inspects the local Git checkout, optionally fetches an explicit remote with a vault credential ID, compares the observed revision with the latest build, queues the exact revision, and durably deduplicates concurrent or repeated transitions; provider-side event delivery and upstream lifecycle mapping remain planned."
     },
     {

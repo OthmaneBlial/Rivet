@@ -27,7 +27,7 @@ use rivet_scm::{
     GitCredential, GitHttpCredential, GitPrepareOptions, GitRepository, GitSshCredential, ScmError,
 };
 use rivet_storage::Storage;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -268,6 +268,8 @@ enum Command {
         #[arg(long)]
         token_file: Option<PathBuf>,
     },
+    /// Poll a server-managed repository and queue only a new Git revision.
+    Poll(PollArgs),
     /// Show artifacts collected for a build.
     Artifacts {
         project: String,
@@ -705,6 +707,25 @@ struct RunArgs {
 }
 
 #[derive(Debug, Args)]
+struct PollArgs {
+    project: String,
+    /// HTTP(S) origin of the Rivet server.
+    #[arg(long, default_value = "http://127.0.0.1:7878")]
+    server: String,
+    /// Read the Bearer token from a private file without persisting it.
+    #[arg(long)]
+    token_file: Option<PathBuf>,
+    #[arg(long, default_value = "origin")]
+    remote: String,
+    /// Fetch the selected remote before comparing the repository revision.
+    #[arg(long)]
+    fetch: bool,
+    /// Non-secret credential ID resolved by the server's encrypted vault.
+    #[arg(long, requires = "fetch")]
+    credential_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
 struct AgentArgs {
     /// WebSocket endpoint exposed by the Rivet server.
     #[arg(long, default_value = "ws://127.0.0.1:7878/api/v1/agents/connect")]
@@ -804,6 +825,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             server,
             token_file,
         } => cancel_remote_build(&project, build, &server, token_file.as_deref()).await?,
+        Command::Poll(args) => poll_remote_repository(args).await?,
         Command::Artifacts { project, build } => list_artifacts(&cli.data_dir, &project, build)?,
         Command::Artifact { command } => manage_artifacts(&cli.data_dir, command)?,
         Command::Retry {
@@ -3532,6 +3554,103 @@ fn cancel_endpoint(
     Ok(endpoint)
 }
 
+fn repository_poll_endpoint(
+    server: &str,
+    project: &str,
+) -> Result<reqwest::Url, Box<dyn std::error::Error>> {
+    let mut endpoint = parse_capture_base_url(server, "Rivet server")?;
+    append_capture_segments(
+        &mut endpoint,
+        ["api", "v1", "projects", project, "repository-changes"],
+    )?;
+    Ok(endpoint)
+}
+
+#[derive(Debug, Serialize)]
+struct RepositoryPollRequestBody {
+    remote: String,
+    fetch: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositoryPollResult {
+    status: String,
+    revision: String,
+    build: Option<rivet_storage::BuildRecord>,
+}
+
+async fn poll_remote_repository(args: PollArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = repository_poll_endpoint(&args.server, &args.project)?;
+    let token = args
+        .token_file
+        .as_deref()
+        .map(read_auth_token)
+        .transpose()?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .user_agent("rivet-cli/0.1")
+        .build()?;
+    let request_body = RepositoryPollRequestBody {
+        remote: args.remote,
+        fetch: args.fetch,
+        credential_id: args.credential_id,
+    };
+    let mut request = client
+        .post(endpoint)
+        .header("accept", "application/json")
+        .header("x-request-id", uuid::Uuid::new_v4().to_string())
+        .json(&request_body);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    // A poll mutates admission state when a revision changes. Do not retry an
+    // uncertain response and risk turning one operator action into a duplicate.
+    let response = request.send().await?;
+    let status = response.status();
+    let body = response.bytes().await?;
+    if body.len() > 64 * 1024 {
+        return Err("server returned an oversized repository poll response".into());
+    }
+    if !matches!(
+        status,
+        reqwest::StatusCode::OK | reqwest::StatusCode::ACCEPTED
+    ) {
+        let message = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|error| error.as_str())
+                    .map(str::to_owned)
+            })
+            .filter(|message| !message.trim().is_empty())
+            .or_else(|| {
+                let message = String::from_utf8_lossy(&body).trim().to_owned();
+                (!message.is_empty()).then_some(message)
+            })
+            .unwrap_or_else(|| status.to_string());
+        return Err(format!(
+            "server refused repository poll for {}: {message}",
+            args.project
+        )
+        .into());
+    }
+    let result: RepositoryPollResult = serde_json::from_slice(&body)?;
+    let build = result
+        .build
+        .as_ref()
+        .map(|build| format!(" #{}", build.number))
+        .unwrap_or_default();
+    println!(
+        "Repository poll {}: {}{} ({})",
+        args.project, result.status, build, result.revision
+    );
+    Ok(())
+}
+
 async fn cancel_remote_build(
     project: &str,
     number: i64,
@@ -3703,6 +3822,31 @@ mod tests {
         ] {
             assert!(cancel_endpoint(server, "project", 1).is_err(), "{server}");
         }
+    }
+
+    #[test]
+    fn repository_poll_endpoint_encodes_project_without_exposing_credentials() {
+        let endpoint = repository_poll_endpoint("https://ci.example.test/rivet/", "team alpha")
+            .expect("repository poll endpoint");
+        assert_eq!(
+            endpoint.as_str(),
+            "https://ci.example.test/rivet/api/v1/projects/team%20alpha/repository-changes"
+        );
+        assert!(!endpoint.as_str().contains("credential"));
+    }
+
+    #[test]
+    fn repository_poll_request_omits_absent_credential_ids() {
+        let body = serde_json::to_value(RepositoryPollRequestBody {
+            remote: "origin".into(),
+            fetch: false,
+            credential_id: None,
+        })
+        .expect("poll body");
+        assert_eq!(
+            body,
+            serde_json::json!({"remote": "origin", "fetch": false})
+        );
     }
 
     #[test]
