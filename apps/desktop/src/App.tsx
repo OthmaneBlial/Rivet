@@ -913,7 +913,7 @@ function App() {
     setCredentialBusy(true);
     setCredentialError(null);
     try {
-      await deleteCredential(credential.id);
+      await deleteCredential(credential.id, credential.owner);
       if (credentialId === credential.id) resetCredentialForm();
       await loadCredentialList();
     } catch (cause) {

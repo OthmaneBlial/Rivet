@@ -290,9 +290,10 @@ export function setCredential(
   );
 }
 
-export function deleteCredential(id: string): Promise<void> {
+export function deleteCredential(id: string, owner?: string): Promise<void> {
+  const query = owner ? `?owner=${encodeURIComponent(owner)}` : "";
   return request<void>(
-    `/api/v1/credentials/${encodeURIComponent(id)}`,
+    `/api/v1/credentials/${encodeURIComponent(id)}${query}`,
     { method: "DELETE" },
   );
 }
