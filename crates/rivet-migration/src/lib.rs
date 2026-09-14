@@ -470,6 +470,10 @@ pub fn generate_rivetfile_draft(source: &str) -> Result<RivetfileDraft, Migratio
     let mut warnings = metadata.warnings;
     let mut artifacts = metadata.artifacts;
     let mut in_block_comment = false;
+    let mut brace_depth = 0usize;
+    let mut next_parallel_group = 0usize;
+    let mut active_parallel_group = None;
+    let mut parallel_close_depth = None;
 
     for (index, raw_line) in source.lines().enumerate() {
         let line = index + 1;
@@ -477,6 +481,35 @@ pub fn generate_rivetfile_draft(source: &str) -> Result<RivetfileDraft, Migratio
         let trimmed = code_line.trim();
         if trimmed.is_empty() {
             continue;
+        }
+
+        let line_brace_depth = brace_depth;
+        let inside_parallel =
+            parallel_close_depth.is_some_and(|close_depth| line_brace_depth > close_depth);
+        let opens = trimmed
+            .chars()
+            .filter(|character| *character == '{')
+            .count();
+        let closes = trimmed
+            .chars()
+            .filter(|character| *character == '}')
+            .count();
+        if parallel_close_depth.is_some_and(|close_depth| line_brace_depth <= close_depth) {
+            active_parallel_group = None;
+            parallel_close_depth = None;
+        }
+        update_brace_depth(&mut brace_depth, opens, closes);
+
+        if starts_with_construct(trimmed, "parallel") {
+            if trimmed.contains('{') {
+                active_parallel_group = Some(next_parallel_group);
+                next_parallel_group += 1;
+                parallel_close_depth = Some(line_brace_depth);
+            } else {
+                warnings.push(format!(
+                    "line {line}: parallel syntax is not a simple named branch block"
+                ));
+            }
         }
 
         if starts_with_construct(trimmed, "stage") {
@@ -496,6 +529,7 @@ pub fn generate_rivetfile_draft(source: &str) -> Result<RivetfileDraft, Migratio
                 stage_drafts.push(StageDraft {
                     name,
                     steps: Vec::new(),
+                    parallel_group: inside_parallel.then_some(active_parallel_group).flatten(),
                 });
                 current_stage = Some(stage_drafts.len() - 1);
             }
@@ -518,6 +552,10 @@ pub fn generate_rivetfile_draft(source: &str) -> Result<RivetfileDraft, Migratio
             None
         };
         let Some((jenkins_kind, program, shell_flag)) = command_kind else {
+            if parallel_close_depth.is_some_and(|close_depth| brace_depth <= close_depth) {
+                active_parallel_group = None;
+                parallel_close_depth = None;
+            }
             continue;
         };
 
@@ -550,10 +588,18 @@ pub fn generate_rivetfile_draft(source: &str) -> Result<RivetfileDraft, Migratio
             container: None,
             agent: None,
         });
+
+        if parallel_close_depth.is_some_and(|close_depth| brace_depth <= close_depth) {
+            active_parallel_group = None;
+            parallel_close_depth = None;
+        }
     }
 
     let mut skipped_stages = Vec::new();
     let mut stages = Vec::new();
+    let mut active_group = None;
+    let mut group_dependencies = Vec::new();
+    let mut completed_group = Vec::new();
     for stage in stage_drafts {
         if stage.steps.is_empty() {
             skipped_stages.push(stage.name.clone());
@@ -563,13 +609,27 @@ pub fn generate_rivetfile_draft(source: &str) -> Result<RivetfileDraft, Migratio
             ));
             continue;
         }
-        // Jenkins declarative stages are sequential unless `parallel` is
-        // explicit. Keep that contract visible in the generated Rivet DAG;
-        // independent stages are otherwise eligible for parallel execution.
-        let depends_on = stages
-            .last()
-            .map(|stage: &Stage| vec![stage.name.clone()])
-            .unwrap_or_default();
+        let depends_on = if let Some(group) = stage.parallel_group {
+            if active_group != Some(group) {
+                active_group = Some(group);
+                completed_group.clear();
+                group_dependencies = stages
+                    .last()
+                    .map(|stage: &Stage| vec![stage.name.clone()])
+                    .unwrap_or_default();
+            }
+            completed_group.push(stage.name.clone());
+            group_dependencies.clone()
+        } else if active_group.take().is_some() {
+            let dependencies = completed_group.clone();
+            completed_group.clear();
+            dependencies
+        } else {
+            stages
+                .last()
+                .map(|stage: &Stage| vec![stage.name.clone()])
+                .unwrap_or_default()
+        };
         stages.push(Stage {
             name: stage.name,
             depends_on,
@@ -625,6 +685,11 @@ pub fn generate_rivetfile_draft_file(path: &Path) -> Result<RivetfileDraft, Migr
 struct StageDraft {
     name: String,
     steps: Vec<Step>,
+    parallel_group: Option<usize>,
+}
+
+fn update_brace_depth(depth: &mut usize, opens: usize, closes: usize) {
+    *depth = depth.saturating_add(opens).saturating_sub(closes);
 }
 
 #[derive(Debug, Default)]
@@ -1304,6 +1369,63 @@ pipeline {
             Some("independent [[stages]] entries with explicit depends_on")
         );
         assert!(analysis.summary.partial >= 1);
+    }
+
+    #[test]
+    fn generates_independent_rivet_stages_for_simple_parallel_branches() {
+        let draft = generate_rivetfile_draft(
+            r#"pipeline {
+  stages {
+    stage('Build') {
+      steps {
+        sh 'cargo build'
+      }
+    }
+    stage('Checks') {
+      parallel {
+        stage('Lint') {
+          steps {
+            sh 'cargo fmt --check'
+          }
+        }
+        stage('Test') {
+          steps {
+            sh 'cargo test'
+          }
+        }
+      }
+    }
+    stage('Package') {
+      steps {
+        sh 'cargo package'
+      }
+    }
+  }
+}"#,
+        )
+        .expect("parallel draft");
+
+        let rivetfile = draft.rivetfile_toml.expect("parallel Rivetfile");
+        let pipeline = rivet_core::Pipeline::from_toml_str(&rivetfile).expect("valid Rivetfile");
+        assert_eq!(
+            pipeline
+                .stages
+                .iter()
+                .map(|stage| stage.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Build", "Lint", "Test", "Package"]
+        );
+        assert_eq!(pipeline.stages[1].depends_on, ["Build"]);
+        assert_eq!(pipeline.stages[2].depends_on, ["Build"]);
+        assert_eq!(pipeline.stages[3].depends_on, ["Lint", "Test"]);
+        assert_eq!(draft.converted_steps, 4);
+        assert_eq!(draft.skipped_stages, ["Checks"]);
+        assert!(
+            draft
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Checks") && warning.contains("no deterministic"))
+        );
     }
 
     #[test]
