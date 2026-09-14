@@ -235,6 +235,14 @@ curl -X POST http://127.0.0.1:7878/api/v1/projects/release/upstream-triggers \
   -d '{"upstream_project":"test"}'
 ```
 
+For a local data directory, the equivalent operator commands are:
+
+```sh
+cargo run -p rivet -- upstream create release --upstream test
+cargo run -p rivet -- upstream list release
+cargo run -p rivet -- upstream delete release <trigger-id>
+```
+
 `GET` on the same path lists relations and `DELETE
 /api/v1/projects/<downstream>/upstream-triggers/<trigger-id>` removes one.
 Only a persisted `passed` upstream build queues the downstream project. The

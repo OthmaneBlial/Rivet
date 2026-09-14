@@ -356,6 +356,11 @@ enum Command {
         #[command(subcommand)]
         command: ScheduleCommand,
     },
+    /// Manage internal upstream pipeline triggers.
+    Upstream {
+        #[command(subcommand)]
+        command: UpstreamCommand,
+    },
     /// Manage passphrase-encrypted SCM credentials.
     Credential {
         #[command(subcommand)]
@@ -441,6 +446,20 @@ enum ScheduleCommand {
     Disable { project: String, id: ScheduleId },
     /// Delete a schedule by UUID.
     Delete { project: String, id: ScheduleId },
+}
+
+#[derive(Debug, Subcommand)]
+enum UpstreamCommand {
+    /// Queue the downstream project after a passed upstream build.
+    Create {
+        downstream: String,
+        #[arg(long)]
+        upstream: String,
+    },
+    /// List upstream triggers targeting a downstream project.
+    List { downstream: String },
+    /// Remove an upstream trigger by UUID.
+    Delete { downstream: String, id: uuid::Uuid },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1006,6 +1025,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Scm { command } => inspect_scm(command).await?,
         Command::Schedule { command } => manage_schedule(&cli.data_dir, command)?,
+        Command::Upstream { command } => manage_upstream(&cli.data_dir, command)?,
         Command::Credential { command } => manage_credentials(&cli.data_dir, command)?,
         Command::Auth { command } => manage_auth(&cli.data_dir, command)?,
         Command::Cache { command } => manage_cache(&cli.data_dir, command)?,
@@ -2920,6 +2940,76 @@ fn manage_schedule(
     Ok(())
 }
 
+fn manage_upstream(
+    data_dir: &Path,
+    command: UpstreamCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = open_storage(data_dir)?;
+    match command {
+        UpstreamCommand::Create {
+            downstream,
+            upstream,
+        } => {
+            let downstream_record = storage
+                .get_project_by_name(&downstream)?
+                .ok_or_else(|| format!("project not found: {downstream}"))?;
+            let upstream_record = storage
+                .get_project_by_name(&upstream)?
+                .ok_or_else(|| format!("project not found: {upstream}"))?;
+            if downstream_record.id == upstream_record.id {
+                return Err("an upstream trigger cannot reference the same project".into());
+            }
+            if storage.pipeline_trigger_reaches(downstream_record.id, upstream_record.id)? {
+                return Err("upstream trigger would create a pipeline cycle".into());
+            }
+            let trigger = storage
+                .create_pipeline_trigger(upstream_record.id, downstream_record.id)?
+                .ok_or_else(|| "upstream trigger already exists".to_owned())?;
+            println!(
+                "Created upstream trigger {}: {} -> {}",
+                trigger.id, upstream, downstream
+            );
+        }
+        UpstreamCommand::List { downstream } => {
+            let downstream_record = storage
+                .get_project_by_name(&downstream)?
+                .ok_or_else(|| format!("project not found: {downstream}"))?;
+            let projects = storage
+                .list_projects()?
+                .into_iter()
+                .map(|project| (project.id, project.name))
+                .collect::<HashMap<_, _>>();
+            for trigger in storage.list_pipeline_triggers_to(downstream_record.id)? {
+                let upstream_name = projects
+                    .get(&trigger.upstream_project_id)
+                    .map(String::as_str)
+                    .unwrap_or("<missing>");
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    trigger.id,
+                    if trigger.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    upstream_name,
+                    trigger.created_at.to_rfc3339()
+                );
+            }
+        }
+        UpstreamCommand::Delete { downstream, id } => {
+            let downstream_record = storage
+                .get_project_by_name(&downstream)?
+                .ok_or_else(|| format!("project not found: {downstream}"))?;
+            if !storage.delete_pipeline_trigger(downstream_record.id, id)? {
+                return Err(format!("upstream trigger not found: {downstream} {id}").into());
+            }
+            println!("Deleted upstream trigger {id}");
+        }
+    }
+    Ok(())
+}
+
 fn parse_schedule_trigger(value: &str) -> Result<ScheduleTrigger, String> {
     match value.trim() {
         "build" => Ok(ScheduleTrigger::Build),
@@ -4401,5 +4491,76 @@ mod tests {
         assert!(
             validate_capture_logs(vec!["line".into(); MAX_COMPAT_CAPTURE_LOG_LINES + 1]).is_err()
         );
+    }
+
+    #[test]
+    fn upstream_cli_manages_persisted_triggers() {
+        let data_dir =
+            std::env::temp_dir().join(format!("rivet-cli-trigger-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&data_dir).expect("data directory");
+        let storage = Storage::open(data_dir.join("rivet.db")).expect("storage");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "trigger"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+        let upstream = Project::new("upstream", ".", "Rivetfile.toml").expect("upstream");
+        let downstream = Project::new("downstream", ".", "Rivetfile.toml").expect("downstream");
+        storage
+            .create_project(&upstream, &pipeline)
+            .expect("upstream project");
+        storage
+            .create_project(&downstream, &pipeline)
+            .expect("downstream project");
+        drop(storage);
+
+        manage_upstream(
+            &data_dir,
+            UpstreamCommand::Create {
+                downstream: "downstream".into(),
+                upstream: "upstream".into(),
+            },
+        )
+        .expect("create upstream trigger");
+        let storage = Storage::open(data_dir.join("rivet.db")).expect("reopen storage");
+        let trigger = storage
+            .list_pipeline_triggers_to(downstream.id)
+            .expect("triggers")
+            .pop()
+            .expect("trigger");
+        assert_eq!(trigger.upstream_project_id, upstream.id);
+        assert!(
+            manage_upstream(
+                &data_dir,
+                UpstreamCommand::Create {
+                    downstream: "downstream".into(),
+                    upstream: "upstream".into(),
+                },
+            )
+            .is_err()
+        );
+        manage_upstream(
+            &data_dir,
+            UpstreamCommand::Delete {
+                downstream: "downstream".into(),
+                id: trigger.id,
+            },
+        )
+        .expect("delete upstream trigger");
+        assert!(
+            storage
+                .list_pipeline_triggers_to(downstream.id)
+                .expect("triggers")
+                .is_empty()
+        );
+        drop(storage);
+        fs::remove_dir_all(data_dir).expect("remove test data directory");
     }
 }
