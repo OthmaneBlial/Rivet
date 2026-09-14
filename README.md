@@ -101,6 +101,21 @@ repository polling, persistent UTC cron schedules, signed generic webhooks,
 internal passed-build gates, and provider completion mappings for GitHub
 Actions, GitLab CI, and Bitbucket Pipelines.
 
+### Start migrating from Jenkins deliberately
+
+Use the migration analyzer to turn a readable Jenkinsfile into a reviewed
+`Rivetfile.toml` draft. Simple declarative stages, quoted shell steps, typed
+parameters, static environment values, safe archive patterns, and explicit
+parallel-stage dependencies can be converted; unsupported Groovy and
+plugin-specific behavior is reported instead of executed or guessed.
+
+```sh
+cargo run -p rivet -- migrate Jenkinsfile --output Rivetfile.toml
+```
+
+Review the generated file and every warning before running it. Rivet does not
+claim arbitrary Jenkins plugin compatibility.
+
 ### Add capacity without losing the signal
 
 Remote agents register through a versioned authenticated protocol, advertise
@@ -165,6 +180,16 @@ The sample `Rivetfile.toml` runs the repository formatter and workspace tests.
 For a short, dependency-light walkthrough use
 [`examples/demo/Rivetfile.toml`](examples/demo/Rivetfile.toml), which is also
 the pipeline used for the checked-in desktop demo capture.
+
+### Migrate a Jenkinsfile
+
+```sh
+cargo run -p rivet -- migrate ./Jenkinsfile --output ./Rivetfile.toml
+```
+
+The command refuses to overwrite an existing file unless `--force` is passed.
+The output is a draft: inspect its status and warnings before using it in a
+real CI/CD workflow.
 
 ### Run the desktop control room
 

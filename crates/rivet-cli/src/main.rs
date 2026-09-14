@@ -404,6 +404,17 @@ enum Command {
         #[command(subcommand)]
         command: AnalyzeCommand,
     },
+    /// Generate a reviewed Rivetfile draft from a Jenkinsfile.
+    Migrate {
+        /// Jenkinsfile to analyze and convert.
+        path: PathBuf,
+        /// Write the generated draft to this path; without it, print TOML to stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Allow replacing an existing output file.
+        #[arg(long)]
+        force: bool,
+    },
     /// Compare recorded Jenkins/Rivet semantics locally.
     Compat {
         #[command(subcommand)]
@@ -1060,6 +1071,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             replace,
         } => restore_storage(&backup, &target, replace)?,
         Command::Analyze { command } => analyze_file(command)?,
+        Command::Migrate {
+            path,
+            output,
+            force,
+        } => migrate_file(&path, output.as_deref(), force)?,
         Command::Compat { command } => compare_compatibility(command).await?,
         Command::Agent(args) => run_agent(args).await?,
     }
@@ -1094,6 +1110,45 @@ fn analyze_file(command: AnalyzeCommand) -> Result<(), Box<dyn std::error::Error
             };
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
+    }
+    Ok(())
+}
+
+fn migrate_file(
+    path: &Path,
+    output: Option<&Path>,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let draft = generate_rivetfile_draft_file(path)?;
+    let Some(rivetfile) = draft.rivetfile_toml.as_deref() else {
+        return Err("Jenkinsfile did not produce a deterministic Rivetfile draft".into());
+    };
+
+    if let Some(output) = output {
+        let mut bytes = rivetfile.as_bytes().to_vec();
+        if !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
+        }
+        write_private_atomic(output, &bytes, force, "Rivetfile draft")?;
+        eprintln!(
+            "Generated Rivetfile draft at {} (status: {:?}, converted steps: {})",
+            output.display(),
+            draft.status,
+            draft.converted_steps
+        );
+    } else {
+        print!("{rivetfile}");
+        if !rivetfile.ends_with('\n') {
+            println!();
+        }
+        eprintln!(
+            "Migration status: {:?} · converted steps: {}",
+            draft.status, draft.converted_steps
+        );
+    }
+
+    for warning in draft.warnings {
+        eprintln!("warning: {warning}");
     }
     Ok(())
 }
