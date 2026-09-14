@@ -127,6 +127,14 @@ pub enum StorageError {
     MissingWebhookDelivery(String),
     #[error("repository poll event {0} does not exist")]
     MissingRepositoryPollEvent(String),
+    #[error("pipeline trigger cannot reference the same project")]
+    PipelineTriggerSelfReference,
+    #[error("pipeline trigger {0} does not exist")]
+    MissingPipelineTrigger(Uuid),
+    #[error("pipeline trigger delivery does not exist")]
+    MissingPipelineTriggerDelivery,
+    #[error("invalid pipeline trigger enabled flag in database: {0}")]
+    InvalidPipelineTriggerEnabled(i64),
     #[error("audit {field} is empty, too long, or contains control characters")]
     InvalidAuditField { field: &'static str },
     #[error("authentication session token digest is invalid")]
@@ -315,6 +323,15 @@ pub struct RepositoryPollEventRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PipelineTriggerRecord {
+    pub id: Uuid,
+    pub upstream_project_id: ProjectId,
+    pub downstream_project_id: ProjectId,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditEventRecord {
     pub sequence: i64,
     pub timestamp: DateTime<Utc>,
@@ -477,6 +494,11 @@ impl Storage {
             &connection,
             18,
             Some(include_str!("../migrations/018_schedule_poll_config.sql")),
+        )?;
+        apply_migration(
+            &connection,
+            19,
+            Some(include_str!("../migrations/019_pipeline_triggers.sql")),
         )?;
         backfill_event_hashes(&connection)?;
         Ok(Self {
@@ -993,6 +1015,222 @@ impl Storage {
             params![event_id],
         )?;
         Ok(())
+    }
+
+    pub fn create_pipeline_trigger(
+        &self,
+        upstream_project_id: ProjectId,
+        downstream_project_id: ProjectId,
+    ) -> Result<Option<PipelineTriggerRecord>, StorageError> {
+        if upstream_project_id == downstream_project_id {
+            return Err(StorageError::PipelineTriggerSelfReference);
+        }
+        let trigger = PipelineTriggerRecord {
+            id: Uuid::new_v4(),
+            upstream_project_id,
+            downstream_project_id,
+            enabled: true,
+            created_at: Utc::now(),
+        };
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "INSERT OR IGNORE INTO pipeline_triggers(
+                id, upstream_project_id, downstream_project_id, enabled, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                trigger.id.to_string(),
+                trigger.upstream_project_id.to_string(),
+                trigger.downstream_project_id.to_string(),
+                1_i64,
+                trigger.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok((changed == 1).then_some(trigger))
+    }
+
+    pub fn list_pipeline_triggers(&self) -> Result<Vec<PipelineTriggerRecord>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT id, upstream_project_id, downstream_project_id, enabled, created_at
+             FROM pipeline_triggers ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = statement.query_map([], raw_pipeline_trigger)?;
+        rows.map(|row| {
+            row.map_err(StorageError::from)
+                .and_then(parse_pipeline_trigger)
+        })
+        .collect()
+    }
+
+    pub fn list_pipeline_triggers_from(
+        &self,
+        upstream_project_id: ProjectId,
+    ) -> Result<Vec<PipelineTriggerRecord>, StorageError> {
+        Ok(self
+            .list_pipeline_triggers()?
+            .into_iter()
+            .filter(|trigger| trigger.enabled && trigger.upstream_project_id == upstream_project_id)
+            .collect())
+    }
+
+    pub fn list_pipeline_triggers_to(
+        &self,
+        downstream_project_id: ProjectId,
+    ) -> Result<Vec<PipelineTriggerRecord>, StorageError> {
+        Ok(self
+            .list_pipeline_triggers()?
+            .into_iter()
+            .filter(|trigger| trigger.downstream_project_id == downstream_project_id)
+            .collect())
+    }
+
+    /// Return whether an enabled trigger path already reaches `target`.
+    /// Callers can use this to reject a new edge that would create a cycle.
+    pub fn pipeline_trigger_reaches(
+        &self,
+        start: ProjectId,
+        target: ProjectId,
+    ) -> Result<bool, StorageError> {
+        if start == target {
+            return Ok(true);
+        }
+        let triggers = self.list_pipeline_triggers()?;
+        let mut visited = BTreeSet::new();
+        let mut pending = vec![start];
+        while let Some(project_id) = pending.pop() {
+            if !visited.insert(project_id) {
+                continue;
+            }
+            for trigger in triggers
+                .iter()
+                .filter(|trigger| trigger.enabled && trigger.upstream_project_id == project_id)
+            {
+                if trigger.downstream_project_id == target {
+                    return Ok(true);
+                }
+                pending.push(trigger.downstream_project_id);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn delete_pipeline_trigger(
+        &self,
+        downstream_project_id: ProjectId,
+        trigger_id: Uuid,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(connection.execute(
+            "DELETE FROM pipeline_triggers WHERE id = ?1 AND downstream_project_id = ?2",
+            params![trigger_id.to_string(), downstream_project_id.to_string()],
+        )? == 1)
+    }
+
+    /// Claim one upstream build for one trigger. The primary key makes this
+    /// idempotent across duplicate build-finished events and server restarts.
+    pub fn claim_pipeline_trigger_delivery(
+        &self,
+        trigger_id: Uuid,
+        upstream_build_id: BuildId,
+        triggered_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "INSERT OR IGNORE INTO pipeline_trigger_deliveries(
+                trigger_id, upstream_build_id, downstream_build_id, triggered_at
+             )
+             SELECT ?1, ?2, NULL, ?3
+             WHERE EXISTS (
+                 SELECT 1 FROM pipeline_triggers
+                 WHERE id = ?1 AND enabled = 1
+                   AND upstream_project_id = (
+                       SELECT project_id FROM builds WHERE id = ?2
+                   )
+             )",
+            params![
+                trigger_id.to_string(),
+                upstream_build_id.to_string(),
+                triggered_at.to_rfc3339()
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn complete_pipeline_trigger_delivery(
+        &self,
+        trigger_id: Uuid,
+        upstream_build_id: BuildId,
+        downstream_build_id: BuildId,
+    ) -> Result<(), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "UPDATE pipeline_trigger_deliveries
+             SET downstream_build_id = ?1
+             WHERE trigger_id = ?2 AND upstream_build_id = ?3
+               AND downstream_build_id IS NULL",
+            params![
+                downstream_build_id.to_string(),
+                trigger_id.to_string(),
+                upstream_build_id.to_string()
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::MissingPipelineTriggerDelivery);
+        }
+        Ok(())
+    }
+
+    pub fn release_pipeline_trigger_delivery(
+        &self,
+        trigger_id: Uuid,
+        upstream_build_id: BuildId,
+    ) -> Result<(), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        connection.execute(
+            "DELETE FROM pipeline_trigger_deliveries
+             WHERE trigger_id = ?1 AND upstream_build_id = ?2
+               AND downstream_build_id IS NULL",
+            params![trigger_id.to_string(), upstream_build_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Find passed builds that became eligible after a trigger was created but
+    /// have not yet been dispatched. This makes a restart safe without
+    /// replaying builds that predate the trigger relation.
+    pub fn pending_pipeline_trigger_deliveries(
+        &self,
+    ) -> Result<Vec<(PipelineTriggerRecord, BuildId)>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT t.id, t.upstream_project_id, t.downstream_project_id, t.enabled,
+                    t.created_at, b.id
+             FROM pipeline_triggers t
+             JOIN builds b ON b.project_id = t.upstream_project_id
+             LEFT JOIN pipeline_trigger_deliveries d
+               ON d.trigger_id = t.id AND d.upstream_build_id = b.id
+             WHERE t.enabled = 1 AND b.status = 'passed'
+               AND b.finished_at IS NOT NULL
+               AND b.finished_at >= t.created_at
+               AND d.trigger_id IS NULL
+             ORDER BY b.finished_at ASC, b.id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let raw: RawPipelineTrigger = (
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            );
+            let build_id: String = row.get(5)?;
+            Ok((raw, build_id))
+        })?;
+        rows.map(|row| {
+            let (raw, build_id) = row?;
+            Ok((parse_pipeline_trigger(raw)?, parse_uuid(&build_id)?))
+        })
+        .collect()
     }
 
     /// Append a bounded audit record. Authentication material and request
@@ -2180,6 +2418,7 @@ type RawSchedule = (
 );
 type RawWebhookDelivery = (String, String, String, Option<String>, Option<i64>);
 type RawRepositoryPollEvent = (String, String, String, String, Option<String>, Option<i64>);
+type RawPipelineTrigger = (String, String, String, i64, String);
 type RawAuditEvent = (i64, String, Option<String>, String, String, String);
 type RawAuthSession = (
     String,
@@ -2660,6 +2899,31 @@ fn parse_repository_poll_event(
         checked_at: parse_timestamp(&raw.3)?,
         build_id: raw.4.as_deref().map(parse_uuid).transpose()?,
         build_number: raw.5,
+    })
+}
+
+fn raw_pipeline_trigger(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawPipelineTrigger> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
+fn parse_pipeline_trigger(raw: RawPipelineTrigger) -> Result<PipelineTriggerRecord, StorageError> {
+    let enabled = match raw.3 {
+        0 => false,
+        1 => true,
+        value => return Err(StorageError::InvalidPipelineTriggerEnabled(value)),
+    };
+    Ok(PipelineTriggerRecord {
+        id: parse_uuid(&raw.0)?,
+        upstream_project_id: parse_uuid(&raw.1)?,
+        downstream_project_id: parse_uuid(&raw.2)?,
+        enabled,
+        created_at: parse_timestamp(&raw.4)?,
     })
 }
 
@@ -3428,6 +3692,130 @@ program = "true"
             Err(StorageError::InvalidSchedulePollRemote(message))
                 if message.contains("fetch=true")
         ));
+    }
+
+    #[test]
+    fn pipeline_triggers_are_durable_idempotent_and_cycle_checked() {
+        let directory = tempdir().expect("tempdir");
+        let database = directory.path().join("rivet.db");
+        let (_, pipeline, _) = fixture();
+        let upstream = Project::new("upstream", ".", "Rivetfile.toml").expect("upstream");
+        let downstream = Project::new("downstream", ".", "Rivetfile.toml").expect("downstream");
+        let storage = Storage::open(&database).expect("open");
+        storage
+            .create_project(&upstream, &pipeline)
+            .expect("upstream project");
+        storage
+            .create_project(&downstream, &pipeline)
+            .expect("downstream project");
+
+        let trigger = storage
+            .create_pipeline_trigger(upstream.id, downstream.id)
+            .expect("trigger")
+            .expect("new trigger");
+        assert!(
+            storage
+                .create_pipeline_trigger(upstream.id, downstream.id)
+                .expect("duplicate trigger")
+                .is_none()
+        );
+        assert_eq!(
+            storage
+                .list_pipeline_triggers_to(downstream.id)
+                .expect("downstream triggers"),
+            vec![trigger.clone()]
+        );
+        assert!(
+            storage
+                .pipeline_trigger_reaches(upstream.id, downstream.id)
+                .expect("reachable")
+        );
+        assert!(
+            !storage
+                .pipeline_trigger_reaches(downstream.id, upstream.id)
+                .expect("not reachable")
+        );
+        assert!(matches!(
+            storage.create_pipeline_trigger(upstream.id, upstream.id),
+            Err(StorageError::PipelineTriggerSelfReference)
+        ));
+
+        let upstream_plan = ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), upstream.id);
+        let upstream_build = storage
+            .create_build(&upstream, &upstream_plan, &pipeline, None)
+            .expect("upstream build");
+        let finished_at = Utc::now();
+        storage
+            .apply_event(&BuildEvent::BuildQueued {
+                build_id: upstream_build.id,
+                project_id: upstream.id,
+                timestamp: finished_at,
+            })
+            .expect("queue upstream");
+        storage
+            .apply_event(&BuildEvent::BuildStarted {
+                build_id: upstream_build.id,
+                timestamp: finished_at,
+            })
+            .expect("start upstream");
+        storage
+            .apply_event(&BuildEvent::BuildFinished {
+                build_id: upstream_build.id,
+                status: BuildStatus::Passed,
+                timestamp: finished_at,
+            })
+            .expect("finish upstream");
+
+        let pending = storage
+            .pending_pipeline_trigger_deliveries()
+            .expect("pending trigger deliveries");
+        assert_eq!(pending, vec![(trigger.clone(), upstream_build.id)]);
+        assert!(
+            storage
+                .claim_pipeline_trigger_delivery(trigger.id, upstream_build.id, finished_at)
+                .expect("claim trigger delivery")
+        );
+        assert!(
+            !storage
+                .claim_pipeline_trigger_delivery(trigger.id, upstream_build.id, finished_at)
+                .expect("duplicate trigger delivery")
+        );
+
+        let downstream_plan =
+            ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), downstream.id);
+        let downstream_build = storage
+            .create_build(&downstream, &downstream_plan, &pipeline, None)
+            .expect("downstream build");
+        storage
+            .complete_pipeline_trigger_delivery(trigger.id, upstream_build.id, downstream_build.id)
+            .expect("complete trigger delivery");
+        assert!(
+            storage
+                .pending_pipeline_trigger_deliveries()
+                .expect("no pending trigger deliveries")
+                .is_empty()
+        );
+
+        drop(storage);
+        let reopened = Storage::open(&database).expect("reopen");
+        assert_eq!(
+            reopened
+                .list_pipeline_triggers_from(upstream.id)
+                .expect("reopened trigger")
+                .len(),
+            1
+        );
+        assert!(
+            reopened
+                .delete_pipeline_trigger(downstream.id, trigger.id)
+                .expect("delete trigger")
+        );
+        assert!(
+            reopened
+                .list_pipeline_triggers()
+                .expect("deleted trigger list")
+                .is_empty()
+        );
     }
 
     #[test]
