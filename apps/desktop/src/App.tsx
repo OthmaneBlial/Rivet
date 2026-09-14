@@ -231,7 +231,7 @@ function App() {
   }, []);
 
   const loadBuildList = useCallback(async () => {
-    if (!projectName) return;
+    if (!engineOnline || !projectName) return;
     try {
       const result = await builds(projectName);
       setBuildList(result);
@@ -240,10 +240,10 @@ function App() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not load builds");
     }
-  }, [projectName]);
+  }, [engineOnline, projectName]);
 
   const loadScheduleList = useCallback(async () => {
-    if (!projectName) {
+    if (!engineOnline || !projectName) {
       setScheduleList([]);
       return;
     }
@@ -253,7 +253,7 @@ function App() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not load schedules");
     }
-  }, [projectName]);
+  }, [engineOnline, projectName]);
 
   const loadUpstreamTriggerList = useCallback(async () => {
     if (!engineOnline || !projectName) {
@@ -269,7 +269,7 @@ function App() {
   }, [engineOnline, projectName]);
 
   const loadBuildView = useCallback(async () => {
-    if (!projectName || selectedBuild === null) {
+    if (!engineOnline || !projectName || selectedBuild === null) {
       setDetails(null);
       setLogLines([]);
       setArtifactList([]);
@@ -288,7 +288,7 @@ function App() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not load build");
     }
-  }, [projectName, selectedBuild]);
+  }, [engineOnline, projectName, selectedBuild]);
 
   const loadQueueStatus = useCallback(async () => {
     try {
@@ -390,7 +390,7 @@ function App() {
 
   useEffect(() => {
     void loadBuildView();
-    if (!projectName || selectedBuild === null) return;
+    if (!engineOnline || !projectName || selectedBuild === null) return;
     const socket = new WebSocket(eventUrl(projectName, selectedBuild));
     socket.onmessage = () => {
       void Promise.all([loadBuildList(), loadBuildView()]);
@@ -400,7 +400,7 @@ function App() {
       setEngineOnline(false);
     };
     return () => socket.close();
-  }, [loadBuildList, loadBuildView, projectName, selectedBuild]);
+  }, [engineOnline, loadBuildList, loadBuildView, projectName, selectedBuild]);
 
   useEffect(() => {
     if (!engineOnline) return;
