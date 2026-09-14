@@ -51,18 +51,11 @@ if [ "$engine_ready" -ne 1 ]; then
 fi
 
 # A loopback listener alone can be provided by a headless process. Confirm
-# that the packaged Tauri host also created the operator-facing window.
-if ! window_name=$(osascript 2>"$launch_root/window-error.log" <<'APPLESCRIPT'
-tell application "System Events"
-    tell process "rivet-desktop"
-        if (count of windows) = 0 then error "no Tauri window"
-        return name of window 1
-    end tell
-end tell
-APPLESCRIPT
-); then
-    printf '%s\n' "Tauri macOS bundle smoke refused: macOS could not inspect the application window." >&2
-    printf '%s\n' "Grant Accessibility access to the shell/terminal running this check in System Settings > Privacy & Security > Accessibility, then retry." >&2
+# that the packaged Tauri host also created the operator-facing window. The
+# CoreGraphics probe reads the window list for the exact launched PID and does
+# not require Accessibility permission from System Events.
+if ! window_name=$(swift "$repo_root/scripts/macos-window-smoke.swift" "$app_pid" 2>"$launch_root/window-error.log"); then
+    printf '%s\n' "Tauri macOS bundle smoke refused: the packaged process has no visible operator window." >&2
     sed -n '1,20p' "$launch_root/window-error.log" >&2 || true
     exit 1
 fi
