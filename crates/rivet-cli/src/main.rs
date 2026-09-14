@@ -683,6 +683,36 @@ struct CreateProject {
     name: String,
     #[arg(long, default_value = ".")]
     repository: PathBuf,
+    /// Remote repository to clone before registering the project.
+    #[arg(long)]
+    repository_url: Option<String>,
+    /// New or empty destination for a remote repository clone.
+    #[arg(long, requires = "repository_url")]
+    clone_destination: Option<PathBuf>,
+    /// Optional branch or tag passed to `git clone --branch`.
+    #[arg(long, requires = "repository_url")]
+    branch: Option<String>,
+    /// Optional shallow history depth for the remote clone.
+    #[arg(long, requires = "repository_url")]
+    depth: Option<u32>,
+    /// Optional revision checked out after the remote clone.
+    #[arg(long, requires = "repository_url")]
+    revision: Option<String>,
+    /// Initialize and recursively update submodules after the remote clone.
+    #[arg(long, requires = "repository_url")]
+    submodules: bool,
+    /// Resolve this non-secret ID from an encrypted vault before cloning.
+    #[arg(long, requires = "repository_url")]
+    credential_id: Option<String>,
+    /// Encrypted SCM credential vault used with --credential-id.
+    #[arg(long, requires = "credential_id")]
+    credentials_file: Option<PathBuf>,
+    /// Private passphrase file used with --credential-id.
+    #[arg(long, requires = "credential_id")]
+    credentials_passphrase_file: Option<PathBuf>,
+    /// Use this OpenSSH known-hosts file for strict SSH host-key verification.
+    #[arg(long, requires = "repository_url")]
+    ssh_known_hosts_file: Option<PathBuf>,
     #[arg(long)]
     pipeline: Option<PathBuf>,
 }
@@ -862,7 +892,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Project { command } => {
             let storage = open_storage(&cli.data_dir)?;
             match command {
-                ProjectCommand::Create(args) => create_project(&storage, args)?,
+                ProjectCommand::Create(args) => create_project(&storage, args).await?,
                 ProjectCommand::List => list_projects(&storage)?,
             }
         }
@@ -3215,11 +3245,63 @@ fn init_repository(data_dir: &Path, repository: &Path) -> Result<(), Box<dyn std
     Ok(())
 }
 
-fn create_project(
+async fn create_project(
     storage: &Storage,
     args: CreateProject,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repository = fs::canonicalize(&args.repository)?;
+    let remote_requested = args.repository_url.is_some();
+    let repository_url = args
+        .repository_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty());
+    if remote_requested && repository_url.is_none() {
+        return Err("--repository-url cannot be empty".into());
+    }
+    let repository = if let Some(repository_url) = repository_url {
+        if args.repository != Path::new(".") {
+            return Err("--repository cannot be combined with --repository-url".into());
+        }
+        let destination = args
+            .clone_destination
+            .clone()
+            .ok_or("--clone-destination is required with --repository-url")?;
+        let credential = load_git_credential(
+            args.credential_id.as_deref(),
+            args.credentials_file.as_deref(),
+            args.credentials_passphrase_file.as_deref(),
+            Some(&args.name),
+        )?;
+        let snapshot = GitRepository::clone_repository_with_auth(
+            &GitCloneOptions {
+                remote: repository_url.to_owned(),
+                destination,
+                branch: args.branch.clone(),
+                depth: args.depth,
+                revision: args.revision.clone(),
+                submodules: args.submodules,
+                credential_id: args.credential_id.clone(),
+                known_hosts_file: args.ssh_known_hosts_file.clone(),
+            },
+            credential.as_ref(),
+        )
+        .await?;
+        snapshot.root
+    } else {
+        if args.clone_destination.is_some()
+            || args.branch.is_some()
+            || args.depth.is_some()
+            || args.revision.is_some()
+            || args.submodules
+            || args.credential_id.is_some()
+            || args.credentials_file.is_some()
+            || args.credentials_passphrase_file.is_some()
+            || args.ssh_known_hosts_file.is_some()
+        {
+            return Err("remote clone options require --repository-url".into());
+        }
+        fs::canonicalize(&args.repository)?
+    };
     let pipeline_path = args
         .pipeline
         .unwrap_or_else(|| repository.join("Rivetfile.toml"));
