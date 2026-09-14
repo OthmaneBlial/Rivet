@@ -138,6 +138,20 @@ identity for rotation/audit, and keeps projects scoped to opaque references
 rather than ordinary pipeline records. The CLI supports `--owner` without
 placing secrets in process arguments.
 
+For example, list only credentials owned by one identity from the CLI:
+
+```sh
+rivet credential list \
+  --owner user:42 \
+  --passphrase-file /private/path/passphrase
+```
+
+The headless API exposes the same inventory boundary with
+`GET /api/v1/credentials?owner=user%3A42`. This endpoint is admin-authenticated
+and returns summaries only; credential secrets are never returned. The desktop
+credential inventory also has an owner filter so operators can review one
+identity's scope without mixing it with the rest of the vault.
+
 ## Screenshots
 
 | Pipeline control room | Migration assistant |
