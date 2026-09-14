@@ -31,6 +31,8 @@ toggle, persistent UTC cron schedules with repository-poll remote/fetch
 configuration, server dispatch, desktop schedule controls, signed generic
 webhook delivery with idempotent redelivery, GitHub repository-dispatch
 revision triggers, and signed Bitbucket push/pull-request revision triggers,
+durable internal upstream-pipeline triggers with passed-build gating,
+cycle rejection, idempotent delivery claims, and restart reconciliation,
 policy-backed API identities with role/project authorization,
 secret-parameter redaction/masking, a passphrase-encrypted SCM credential vault
 with typed HTTP/SSH credentials, non-secret credential references, project allow-lists,
@@ -118,7 +120,7 @@ persisted data. This produces a locally verifiable artifact, not a signed
 installer, store submission, or hosted CI result.
 
 The headless server handles SIGINT/SIGTERM with a graceful HTTP shutdown and
-stops its schedule dispatcher after the listener closes. Authenticated
+stops its schedule and upstream-trigger dispatchers after the listener closes. Authenticated
 administrators can request the same lifecycle operation with
 `POST /api/v1/admin/shutdown`; the server returns `202` only after the global
 `administer` permission check. Rivet's extension surface is intentionally a
@@ -222,6 +224,24 @@ in-memory buffer without limit.
 Administrators can stop new admissions without interrupting running builds with
 `POST /api/v1/queue/pause`, inspect the `paused` field from `GET
 /api/v1/queue`, and reopen admissions with `POST /api/v1/queue/resume`.
+
+Internal upstream triggers connect one Rivet project to another without a
+container runtime. Create a relation with an authenticated build-capable
+request on the downstream project:
+
+```sh
+curl -X POST http://127.0.0.1:7878/api/v1/projects/release/upstream-triggers \
+  -H 'content-type: application/json' \
+  -d '{"upstream_project":"test"}'
+```
+
+`GET` on the same path lists relations and `DELETE
+/api/v1/projects/<downstream>/upstream-triggers/<trigger-id>` removes one.
+Only a persisted `passed` upstream build queues the downstream project. The
+delivery claim is durable and idempotent, cycles are rejected, and pending
+passed builds are reconciled when the server starts. The downstream build uses
+the common local or remote-agent queue path; it does not install or start
+Docker or Podman.
 
 ## Run headless
 

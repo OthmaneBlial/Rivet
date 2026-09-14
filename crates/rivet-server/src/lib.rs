@@ -40,8 +40,8 @@ use rivet_scm::{
 };
 use rivet_storage::{
     AnnotationRecord, ArtifactRecord, AuditEventRecord, BuildDetails, BuildRecord,
-    RemoteAttemptRecord, SchedulePollConfig, ScheduleRecord, ScheduleTrigger, Storage,
-    StorageError,
+    PipelineTriggerRecord, RemoteAttemptRecord, SchedulePollConfig, ScheduleRecord,
+    ScheduleTrigger, Storage, StorageError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -291,6 +291,10 @@ enum ApiError {
         project: String,
         schedule_id: ScheduleId,
     },
+    #[error("pipeline trigger {trigger_id} not found for project {project}")]
+    PipelineTriggerNotFound { project: String, trigger_id: Uuid },
+    #[error("pipeline trigger already exists")]
+    PipelineTriggerConflict,
     #[error("repository path is not a directory: {0}")]
     InvalidRepository(PathBuf),
     #[error("pipeline path is not a file: {0}")]
@@ -356,7 +360,8 @@ impl IntoResponse for ApiError {
         let status = match &self {
             Self::ProjectNotFound(_)
             | Self::BuildNotFound { .. }
-            | Self::ScheduleNotFound { .. } => StatusCode::NOT_FOUND,
+            | Self::ScheduleNotFound { .. }
+            | Self::PipelineTriggerNotFound { .. } => StatusCode::NOT_FOUND,
             Self::InvalidRepository(_) | Self::InvalidPipeline(_) | Self::BadRequest(_) => {
                 StatusCode::BAD_REQUEST
             }
@@ -370,6 +375,7 @@ impl IntoResponse for ApiError {
             | Self::WebhookEventIdTooLong
             | Self::InvalidWebhookEventId => StatusCode::BAD_REQUEST,
             Self::WebhookEventConflict => StatusCode::CONFLICT,
+            Self::PipelineTriggerConflict => StatusCode::CONFLICT,
             Self::ArtifactNotFound(_) => StatusCode::NOT_FOUND,
             Self::ArtifactRead(_) | Self::ArtifactIntegrity => StatusCode::INTERNAL_SERVER_ERROR,
             Self::CredentialsUnavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -538,6 +544,12 @@ pub struct CreateScheduleRequest {
 #[derive(Debug, Deserialize)]
 pub struct UpdateScheduleRequest {
     pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreatePipelineTriggerRequest {
+    /// Name of the project whose passed builds should queue this project.
+    pub upstream_project: String,
 }
 
 #[derive(Deserialize)]
@@ -755,6 +767,14 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
         .route(
             "/api/v1/projects/{name}/schedules/{schedule_id}",
             patch(update_schedule).delete(delete_schedule),
+        )
+        .route(
+            "/api/v1/projects/{name}/upstream-triggers",
+            get(list_upstream_triggers).post(create_upstream_trigger),
+        )
+        .route(
+            "/api/v1/projects/{name}/upstream-triggers/{trigger_id}",
+            axum::routing::delete(delete_upstream_trigger),
         )
         .route(
             "/api/v1/projects/{name}/builds/{number}/logs",
@@ -1080,6 +1100,7 @@ pub async fn serve_with_listener(
     };
     tracing::info!(bind = %bind, "Rivet server listening");
     spawn_schedule_dispatcher(state.clone(), shutdown.clone());
+    spawn_upstream_trigger_dispatcher(state.clone(), shutdown.clone());
     spawn_remote_recovery_dispatcher(state.clone(), resumable_remote_attempts, shutdown.clone());
     let result = axum::serve(listener, router_with_origins(state, &allowed_origins)?)
         .with_graceful_shutdown(wait_for_shutdown_signal(shutdown.clone()))
@@ -2787,6 +2808,72 @@ async fn delete_schedule(
     }
 }
 
+async fn list_upstream_triggers(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<PipelineTriggerRecord>>, ApiError> {
+    require_project(&principal, Permission::Read, &name)?;
+    let project = project_by_name(&state.storage, &name)?;
+    Ok(Json(state.storage.list_pipeline_triggers_to(project.id)?))
+}
+
+async fn create_upstream_trigger(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<CreatePipelineTriggerRequest>,
+) -> Result<(StatusCode, Json<PipelineTriggerRecord>), ApiError> {
+    require_project(&principal, Permission::Build, &name)?;
+    let downstream = project_by_name(&state.storage, &name)?;
+    let upstream_name = request.upstream_project.trim();
+    if upstream_name.is_empty() {
+        return Err(ApiError::BadRequest(
+            "upstream_project cannot be empty".into(),
+        ));
+    }
+    require_project(&principal, Permission::Read, upstream_name)?;
+    let upstream = project_by_name(&state.storage, upstream_name)?;
+    if upstream.id == downstream.id {
+        return Err(ApiError::BadRequest(
+            "an upstream trigger cannot reference the same project".into(),
+        ));
+    }
+    if state
+        .storage
+        .pipeline_trigger_reaches(downstream.id, upstream.id)?
+    {
+        return Err(ApiError::BadRequest(
+            "upstream trigger would create a pipeline cycle".into(),
+        ));
+    }
+    let trigger = state
+        .storage
+        .create_pipeline_trigger(upstream.id, downstream.id)?
+        .ok_or(ApiError::PipelineTriggerConflict)?;
+    Ok((StatusCode::CREATED, Json(trigger)))
+}
+
+async fn delete_upstream_trigger(
+    State(state): State<AppState>,
+    AxumPath((name, trigger_id)): AxumPath<(String, Uuid)>,
+    Extension(principal): Extension<Principal>,
+) -> Result<StatusCode, ApiError> {
+    require_project(&principal, Permission::Build, &name)?;
+    let project = project_by_name(&state.storage, &name)?;
+    if state
+        .storage
+        .delete_pipeline_trigger(project.id, trigger_id)?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::PipelineTriggerNotFound {
+            project: name,
+            trigger_id,
+        })
+    }
+}
+
 async fn webhook_build(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -3656,6 +3743,39 @@ fn spawn_schedule_dispatcher(state: AppState, shutdown: CancellationToken) {
     });
 }
 
+fn spawn_upstream_trigger_dispatcher(state: AppState, shutdown: CancellationToken) {
+    let mut receiver = state.events.subscribe();
+    tokio::spawn(async move {
+        if let Err(error) = dispatch_pending_upstream_triggers(&state).await {
+            tracing::error!(?error, "could not reconcile pending upstream triggers");
+        }
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                event = receiver.recv() => match event {
+                    Ok(BuildEvent::BuildFinished {
+                        build_id,
+                        status: BuildStatus::Passed,
+                        ..
+                    }) => {
+                        if let Err(error) = dispatch_upstream_triggers_for_build(&state, build_id).await {
+                            tracing::error!(?error, %build_id, "upstream trigger dispatch failed");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "upstream trigger dispatcher lagged; reconciling from storage");
+                        if let Err(error) = dispatch_pending_upstream_triggers(&state).await {
+                            tracing::error!(?error, "could not reconcile upstream triggers after lag");
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    });
+}
+
 fn spawn_remote_recovery_dispatcher(
     state: AppState,
     attempts: Vec<RemoteAttemptRecord>,
@@ -3916,6 +4036,87 @@ async fn dispatch_due_schedules(state: &AppState, now: DateTime<Utc>) -> Result<
         }
     }
     Ok(dispatched)
+}
+
+async fn dispatch_upstream_triggers_for_build(
+    state: &AppState,
+    upstream_build_id: BuildId,
+) -> Result<usize, ApiError> {
+    let Some(details) = state.storage.get_build_details(upstream_build_id)? else {
+        return Ok(0);
+    };
+    if details.build.status != BuildStatus::Passed {
+        return Ok(0);
+    }
+    let triggers = state
+        .storage
+        .list_pipeline_triggers_from(details.build.project_id)?;
+    let mut dispatched = 0;
+    for trigger in triggers {
+        match dispatch_pipeline_trigger(state, trigger, upstream_build_id).await {
+            Ok(true) => dispatched += 1,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(?error, %upstream_build_id, "one upstream trigger could not be dispatched");
+            }
+        }
+    }
+    Ok(dispatched)
+}
+
+async fn dispatch_pending_upstream_triggers(state: &AppState) -> Result<usize, ApiError> {
+    let pending = state.storage.pending_pipeline_trigger_deliveries()?;
+    let mut dispatched = 0;
+    for (trigger, upstream_build_id) in pending {
+        match dispatch_pipeline_trigger(state, trigger, upstream_build_id).await {
+            Ok(true) => dispatched += 1,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(?error, %upstream_build_id, "pending upstream trigger could not be dispatched");
+            }
+        }
+    }
+    Ok(dispatched)
+}
+
+async fn dispatch_pipeline_trigger(
+    state: &AppState,
+    trigger: PipelineTriggerRecord,
+    upstream_build_id: BuildId,
+) -> Result<bool, ApiError> {
+    if !state
+        .storage
+        .claim_pipeline_trigger_delivery(trigger.id, upstream_build_id, Utc::now())?
+    {
+        return Ok(false);
+    }
+    let Some(downstream) = state
+        .storage
+        .get_project_by_id(trigger.downstream_project_id)?
+    else {
+        state
+            .storage
+            .release_pipeline_trigger_delivery(trigger.id, upstream_build_id)?;
+        return Err(ApiError::ProjectNotFound(
+            trigger.downstream_project_id.to_string(),
+        ));
+    };
+    match enqueue_project_build(state, downstream, QueueBuildRequest::default()).await {
+        Ok(response) => {
+            state.storage.complete_pipeline_trigger_delivery(
+                trigger.id,
+                upstream_build_id,
+                response.build.id,
+            )?;
+            Ok(true)
+        }
+        Err(error) => {
+            state
+                .storage
+                .release_pipeline_trigger_delivery(trigger.id, upstream_build_id)?;
+            Err(error)
+        }
+    }
 }
 
 fn validate_schedule_name(name: String) -> Result<String, ApiError> {
@@ -10020,6 +10221,169 @@ program = "true"
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn upstream_trigger_queues_downstream_once_after_passed_build() {
+        let directory = tempdir().expect("tempdir");
+        let repository = directory.path().join("repository");
+        fs::create_dir_all(&repository).expect("repository");
+        let pipeline_path = repository.join("Rivetfile.toml");
+        fs::write(
+            &pipeline_path,
+            r#"
+version = 1
+name = "triggered"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline file");
+        let pipeline = Pipeline::load(&pipeline_path).expect("pipeline");
+        let upstream = Project::new(
+            "upstream",
+            repository.to_string_lossy().into_owned(),
+            pipeline_path.to_string_lossy().into_owned(),
+        )
+        .expect("upstream project");
+        let downstream = Project::new(
+            "downstream",
+            repository.to_string_lossy().into_owned(),
+            pipeline_path.to_string_lossy().into_owned(),
+        )
+        .expect("downstream project");
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&upstream, &pipeline)
+            .expect("upstream project");
+        storage
+            .create_project(&downstream, &pipeline)
+            .expect("downstream project");
+        let state = AppState::new(storage.clone());
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/downstream/upstream-triggers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"upstream_project":"upstream"}"#))
+                    .expect("create trigger request"),
+            )
+            .await
+            .expect("create trigger response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let trigger: PipelineTriggerRecord = serde_json::from_slice(
+            &to_bytes(response.into_body(), 8192)
+                .await
+                .expect("trigger body"),
+        )
+        .expect("trigger JSON");
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/downstream/upstream-triggers")
+                    .body(Body::empty())
+                    .expect("list trigger request"),
+            )
+            .await
+            .expect("list trigger response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let triggers: Vec<PipelineTriggerRecord> = serde_json::from_slice(
+            &to_bytes(response.into_body(), 8192)
+                .await
+                .expect("trigger list body"),
+        )
+        .expect("trigger list JSON");
+        assert_eq!(triggers, vec![trigger.clone()]);
+
+        let duplicate = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/downstream/upstream-triggers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"upstream_project":"upstream"}"#))
+                    .expect("duplicate trigger request"),
+            )
+            .await
+            .expect("duplicate trigger response");
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+        let cycle = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/upstream/upstream-triggers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"upstream_project":"downstream"}"#))
+                    .expect("cycle trigger request"),
+            )
+            .await
+            .expect("cycle trigger response");
+        assert_eq!(cycle.status(), StatusCode::BAD_REQUEST);
+
+        let upstream_build = enqueue_project_build(&state, upstream, QueueBuildRequest::default())
+            .await
+            .expect("upstream build");
+        for _ in 0..100 {
+            if storage
+                .get_build_details(upstream_build.build.id)
+                .expect("upstream details")
+                .is_some_and(|details| details.build.status == BuildStatus::Passed)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            storage
+                .get_build_details(upstream_build.build.id)
+                .expect("upstream details")
+                .expect("upstream build exists")
+                .build
+                .status,
+            BuildStatus::Passed
+        );
+
+        assert_eq!(
+            dispatch_pending_upstream_triggers(&state)
+                .await
+                .expect("reconcile upstream trigger"),
+            1
+        );
+        assert_eq!(
+            dispatch_upstream_triggers_for_build(&state, upstream_build.build.id)
+                .await
+                .expect("deduplicated upstream trigger"),
+            0
+        );
+        for _ in 0..100 {
+            if storage
+                .list_builds(downstream.id)
+                .expect("downstream builds")
+                .first()
+                .is_some_and(|build| build.status == BuildStatus::Passed)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let downstream_builds = storage
+            .list_builds(downstream.id)
+            .expect("downstream builds");
+        assert_eq!(downstream_builds.len(), 1);
+        assert_eq!(downstream_builds[0].status, BuildStatus::Passed);
+        assert!(
+            storage
+                .pending_pipeline_trigger_deliveries()
+                .expect("pending triggers")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

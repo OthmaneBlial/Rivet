@@ -1167,7 +1167,14 @@ impl Storage {
             "UPDATE pipeline_trigger_deliveries
              SET downstream_build_id = ?1
              WHERE trigger_id = ?2 AND upstream_build_id = ?3
-               AND downstream_build_id IS NULL",
+               AND downstream_build_id IS NULL
+               AND EXISTS (
+                   SELECT 1
+                   FROM pipeline_triggers t
+                   JOIN builds b ON b.id = ?1
+                   WHERE t.id = ?2
+                     AND t.downstream_project_id = b.project_id
+               )",
             params![
                 downstream_build_id.to_string(),
                 trigger_id.to_string(),
