@@ -852,6 +852,37 @@ mod tests {
     }
 
     #[test]
+    fn credential_owner_round_trips_without_exposing_secret_material() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("credentials.vault");
+        let mut vault = CredentialVault::open_or_create(&path, PASSPHRASE).expect("create");
+        vault
+            .set_http_basic_for_projects_owned(
+                "github",
+                "user:42",
+                "oauth2",
+                "owner-secret",
+                ["rivet"],
+            )
+            .expect("set owned credential");
+        assert_eq!(vault.list()[0].owner, "user:42");
+        assert!(
+            !serde_json::to_string(&vault.list())
+                .expect("summary")
+                .contains("owner-secret")
+        );
+        drop(vault);
+
+        let reopened = CredentialVault::open(&path, PASSPHRASE).expect("reopen");
+        let summary = &reopened.list()[0];
+        assert_eq!(summary.owner, "user:42");
+        assert_eq!(
+            reopened.get("github").expect("credential").secret(),
+            "owner-secret"
+        );
+    }
+
+    #[test]
     fn project_scopes_are_trimmed_and_bounded() {
         let directory = tempdir().expect("tempdir");
         let path = directory.path().join("credentials.vault");
