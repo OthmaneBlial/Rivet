@@ -392,6 +392,7 @@ impl IntoResponse for ApiError {
             Self::Credentials(error) => match error {
                 CredentialError::CredentialNotFound(_) => StatusCode::NOT_FOUND,
                 CredentialError::InvalidId(_)
+                | CredentialError::InvalidOwner
                 | CredentialError::InvalidUsername
                 | CredentialError::InvalidProject(_)
                 | CredentialError::TooManyProjects
@@ -1573,12 +1574,25 @@ async fn set_credential(
         secret,
         projects,
     } = request;
+    let owner = principal.id().to_owned();
     match kind {
         CredentialKind::HttpBasic => {
-            vault.set_http_basic_for_projects(id.clone(), username, secret, projects)?;
+            vault.set_http_basic_for_projects_owned(
+                id.clone(),
+                owner,
+                username,
+                secret,
+                projects,
+            )?;
         }
         CredentialKind::SshKey => {
-            vault.set_ssh_key_for_projects(id.clone(), username, secret, projects)?;
+            vault.set_ssh_key_for_projects_owned(
+                id.clone(),
+                principal.id(),
+                username,
+                secret,
+                projects,
+            )?;
         }
     }
     let summary = vault

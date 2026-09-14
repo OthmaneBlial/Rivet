@@ -44,6 +44,8 @@ pub enum CredentialError {
     WeakPassphrase,
     #[error("credential ID is invalid: {0}")]
     InvalidId(String),
+    #[error("credential owner is empty or too long")]
+    InvalidOwner,
     #[error("credential username is empty or too long")]
     InvalidUsername,
     #[error("credential project scope is invalid: {0}")]
@@ -133,6 +135,7 @@ pub enum CredentialKind {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Credential {
     id: String,
+    owner: String,
     kind: CredentialKind,
     username: String,
     secret: String,
@@ -142,6 +145,10 @@ pub struct Credential {
 impl Credential {
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub fn owner(&self) -> &str {
+        &self.owner
     }
 
     pub fn kind(&self) -> CredentialKind {
@@ -186,6 +193,7 @@ impl Drop for Credential {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CredentialSummary {
     pub id: String,
+    pub owner: String,
     pub kind: CredentialKind,
     pub username: String,
     /// Empty means global access; otherwise this is the explicit project
@@ -218,6 +226,8 @@ struct VaultPayload {
 
 #[derive(Deserialize, Serialize)]
 struct VaultCredential {
+    #[serde(default)]
+    owner: String,
     #[serde(default)]
     kind: CredentialKind,
     username: String,
@@ -288,6 +298,11 @@ impl CredentialVault {
                     id.clone(),
                     Credential {
                         id,
+                        owner: if credential.owner.trim().is_empty() {
+                            "legacy".into()
+                        } else {
+                            credential.owner.clone()
+                        },
                         kind: credential.kind,
                         username: credential.username.clone(),
                         secret: credential.secret.clone(),
@@ -338,6 +353,7 @@ impl CredentialVault {
             .values()
             .map(|credential| CredentialSummary {
                 id: credential.id.clone(),
+                owner: credential.owner.clone(),
                 kind: credential.kind,
                 username: credential.username.clone(),
                 projects: credential.projects.iter().cloned().collect(),
@@ -396,7 +412,36 @@ impl CredentialVault {
             .collect::<BTreeSet<_>>();
         validate_id(&id)?;
         validate_username(&username)?;
-        self.set_for_projects(id, CredentialKind::HttpBasic, username, secret, projects)
+        self.set_for_projects_with_owner(
+            id,
+            "local",
+            CredentialKind::HttpBasic,
+            username,
+            secret,
+            projects,
+        )
+    }
+
+    pub fn set_http_basic_for_projects_owned<I, S>(
+        &mut self,
+        id: impl Into<String>,
+        owner: impl Into<String>,
+        username: impl Into<String>,
+        secret: impl Into<String>,
+        projects: I,
+    ) -> Result<(), CredentialError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.set_for_projects_with_owner(
+            id,
+            owner,
+            CredentialKind::HttpBasic,
+            username,
+            secret,
+            projects,
+        )
     }
 
     /// Store or replace an SSH private-key credential with an optional project
@@ -412,12 +457,42 @@ impl CredentialVault {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.set_for_projects(id, CredentialKind::SshKey, username, private_key, projects)
+        self.set_for_projects_with_owner(
+            id,
+            "local",
+            CredentialKind::SshKey,
+            username,
+            private_key,
+            projects,
+        )
     }
 
-    fn set_for_projects<I, S>(
+    pub fn set_ssh_key_for_projects_owned<I, S>(
         &mut self,
         id: impl Into<String>,
+        owner: impl Into<String>,
+        username: impl Into<String>,
+        private_key: impl Into<String>,
+        projects: I,
+    ) -> Result<(), CredentialError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.set_for_projects_with_owner(
+            id,
+            owner,
+            CredentialKind::SshKey,
+            username,
+            private_key,
+            projects,
+        )
+    }
+
+    fn set_for_projects_with_owner<I, S>(
+        &mut self,
+        id: impl Into<String>,
+        owner: impl Into<String>,
         kind: CredentialKind,
         username: impl Into<String>,
         secret: impl Into<String>,
@@ -428,6 +503,7 @@ impl CredentialVault {
         S: Into<String>,
     {
         let id = id.into();
+        let owner = owner.into();
         let username = username.into();
         let secret = secret.into();
         let projects = projects
@@ -435,6 +511,7 @@ impl CredentialVault {
             .map(|project| project.into().trim().to_owned())
             .collect::<BTreeSet<_>>();
         validate_id(&id)?;
+        validate_owner(&owner)?;
         validate_username(&username)?;
         validate_secret(&kind, &secret)?;
         validate_projects(&projects)?;
@@ -442,6 +519,7 @@ impl CredentialVault {
             id.clone(),
             Credential {
                 id: id.clone(),
+                owner,
                 kind,
                 username,
                 secret,
@@ -481,6 +559,7 @@ impl CredentialVault {
                     (
                         id.clone(),
                         VaultCredential {
+                            owner: credential.owner.clone(),
                             kind: credential.kind,
                             username: credential.username.clone(),
                             secret: credential.secret.clone(),
@@ -520,6 +599,14 @@ fn validate_id(id: &str) -> Result<(), CredentialError> {
 fn validate_username(username: &str) -> Result<(), CredentialError> {
     if username.is_empty() || username.len() > MAX_USERNAME_BYTES || username.contains('\0') {
         Err(CredentialError::InvalidUsername)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_owner(owner: &str) -> Result<(), CredentialError> {
+    if owner.trim().is_empty() || owner.len() > MAX_USERNAME_BYTES || owner.contains('\0') {
+        Err(CredentialError::InvalidOwner)
     } else {
         Ok(())
     }
@@ -728,6 +815,7 @@ mod tests {
             vault.list(),
             [CredentialSummary {
                 id: "github".into(),
+                owner: "local".into(),
                 kind: CredentialKind::HttpBasic,
                 username: "oauth2".into(),
                 projects: vec![],

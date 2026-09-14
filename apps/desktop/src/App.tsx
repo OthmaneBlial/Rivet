@@ -1783,7 +1783,7 @@ function CredentialsPanel({
                   {credentials.map((credential) => (
                     <div className="credential-row" key={credential.id}>
                       <span className="credential-row-mark">◈</span>
-                      <div className="credential-copy"><strong>{credential.id}</strong><small>{credential.kind === "ssh_key" ? "SSH private key" : "HTTP basic / token"} · {credential.username} · {credential.projects.length ? `scoped to ${credential.projects.join(", ")}` : "all projects"} · secret sealed</small></div>
+                      <div className="credential-copy"><strong>{credential.id}</strong><small>{credential.kind === "ssh_key" ? "SSH private key" : "HTTP basic / token"} · {credential.username} · owner {credential.owner} · {credential.projects.length ? `scoped to ${credential.projects.join(", ")}` : "all projects"} · secret sealed</small></div>
                       <button className="button button-quiet credential-action" type="button" disabled={busy} onClick={() => onEdit(credential)}>Rotate</button>
                       <button className="credential-delete" type="button" disabled={busy} aria-label={`Remove credential ${credential.id}`} onClick={() => void onRemove(credential)}>×</button>
                     </div>
