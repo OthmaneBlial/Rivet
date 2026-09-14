@@ -162,7 +162,9 @@ button { color: inherit; }
 .button-danger:hover:not(:disabled) { border-color: var(--red); background: rgba(242,119,115,.13); }
 .error-banner { display: flex; align-items: center; gap: 10px; margin: 18px clamp(24px, 4vw, 64px) 0; padding: 10px 12px; border: 1px solid rgba(185,65,67,.4); color: var(--error-text); background: rgba(185,65,67,.08); font-size: 12px; }
 .error-symbol { display: grid; width: 18px; height: 18px; place-items: center; border: 1px solid var(--red); color: var(--red); font: 11px "Azeret Mono", monospace; }
-.error-banner button { margin-left: auto; border: 0; color: inherit; background: none; cursor: pointer; font-size: 18px; }
+.error-retry { margin-left: auto; min-height: 28px; padding: 0 10px; border-color: rgba(185,65,67,.4); color: var(--error-text); font: 9px "Azeret Mono", monospace; text-transform: uppercase; }
+.error-retry:hover:not(:disabled) { border-color: var(--red); color: var(--red); background: rgba(185,65,67,.08); }
+.error-dismiss { margin-left: 0; border: 0; color: inherit; background: none; cursor: pointer; font-size: 18px; }
 .content-wrap { max-width: 1510px; margin: 0 auto; padding: 54px clamp(24px, 4vw, 64px) 70px; }
 .page-heading { display: flex; align-items: end; justify-content: space-between; gap: 30px; margin-bottom: 36px; }
 .eyebrow { display: flex; align-items: center; gap: 9px; color: var(--amber); }

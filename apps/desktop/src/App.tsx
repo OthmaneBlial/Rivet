@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   buildDetails,
   builds,
@@ -196,6 +196,8 @@ function App() {
   const [migrationBusy, setMigrationBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [connectionBusy, setConnectionBusy] = useState(false);
+  const connectionAttemptRef = useRef(false);
 
   const selectedProject = useMemo(
     () => projectsList.find((project) => project.name === projectName) ?? null,
@@ -203,6 +205,9 @@ function App() {
   );
 
   const loadProjects = useCallback(async () => {
+    if (connectionAttemptRef.current) return;
+    connectionAttemptRef.current = true;
+    setConnectionBusy(true);
     try {
       await readiness();
       const result = await projects();
@@ -213,6 +218,9 @@ function App() {
     } catch (cause) {
       setEngineOnline(false);
       setError(cause instanceof Error ? cause.message : ENGINE_OFFLINE_MESSAGE);
+    } finally {
+      connectionAttemptRef.current = false;
+      setConnectionBusy(false);
     }
   }, []);
 
@@ -421,8 +429,8 @@ function App() {
 
   useEffect(() => {
     if (engineOnline) return;
-    const retry = window.setTimeout(() => void loadProjects(), 5000);
-    return () => window.clearTimeout(retry);
+    const retry = window.setInterval(() => void loadProjects(), 5000);
+    return () => window.clearInterval(retry);
   }, [engineOnline, loadProjects]);
 
   useEffect(() => {
@@ -885,7 +893,8 @@ function App() {
           <div className="error-banner" role="alert">
             <span className="error-symbol">!</span>
             <span>{error}</span>
-            <button onClick={() => setError(null)} aria-label="Dismiss error">×</button>
+            {!engineOnline && <button className="button button-quiet error-retry" type="button" onClick={() => void loadProjects()}>{connectionBusy ? "Connecting…" : "Reconnect"}</button>}
+            <button className="error-dismiss" type="button" onClick={() => setError(null)} aria-label="Dismiss error">×</button>
           </div>
         )}
 
