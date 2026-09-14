@@ -8,6 +8,7 @@ import type {
   MigrationResponse,
   PipelineParameter,
   Project,
+  PipelineTriggerRecord,
   QueueItem,
   QueueResponse,
   QueueStats,
@@ -367,6 +368,32 @@ export function updateSchedule(
 export function deleteSchedule(project: string, id: string): Promise<void> {
   return request<void>(
     `/api/v1/projects/${encodeURIComponent(project)}/schedules/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function upstreamTriggers(project: string): Promise<PipelineTriggerRecord[]> {
+  return request<PipelineTriggerRecord[]>(
+    `/api/v1/projects/${encodeURIComponent(project)}/upstream-triggers`,
+  );
+}
+
+export function createUpstreamTrigger(
+  project: string,
+  upstreamProject: string,
+): Promise<PipelineTriggerRecord> {
+  return request<PipelineTriggerRecord>(
+    `/api/v1/projects/${encodeURIComponent(project)}/upstream-triggers`,
+    {
+      method: "POST",
+      body: JSON.stringify({ upstream_project: upstreamProject }),
+    },
+  );
+}
+
+export function deleteUpstreamTrigger(project: string, id: string): Promise<void> {
+  return request<void>(
+    `/api/v1/projects/${encodeURIComponent(project)}/upstream-triggers/${encodeURIComponent(id)}`,
     { method: "DELETE" },
   );
 }

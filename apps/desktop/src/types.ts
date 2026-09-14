@@ -114,6 +114,14 @@ export interface SchedulePollConfig {
   credential_id: string | null;
 }
 
+export interface PipelineTriggerRecord {
+  id: string;
+  upstream_project_id: string;
+  downstream_project_id: string;
+  enabled: boolean;
+  created_at: string;
+}
+
 export interface QueueResponse {
   build: BuildRecord;
   status: BuildStatus;

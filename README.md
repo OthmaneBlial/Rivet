@@ -28,7 +28,7 @@ build retry, pre-execution queue cancellation, build artifact
 downloads with checksum-verified streaming and integrity headers, a priority-ordered queue snapshot and rendered queue control room,
 and a light-default desktop theme with an accessible dark-mode
 toggle, persistent UTC cron schedules with repository-poll remote/fetch
-configuration, server dispatch, desktop schedule controls, signed generic
+configuration, server dispatch, desktop schedule and upstream-gate controls, signed generic
 webhook delivery with idempotent redelivery, GitHub repository-dispatch
 revision triggers, and signed Bitbucket push/pull-request revision triggers,
 durable internal upstream-pipeline triggers with passed-build gating,

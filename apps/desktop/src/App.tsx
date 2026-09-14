@@ -6,8 +6,10 @@ import {
   credentials as fetchCredentials,
   createProject,
   createSchedule,
+  createUpstreamTrigger,
   deleteCredential,
   deleteSchedule,
+  deleteUpstreamTrigger,
   artifactUrl,
   analyzeJenkinsfile,
   agents as fetchAgents,
@@ -33,6 +35,7 @@ import {
   stopExtension,
   setCredential,
   schedules,
+  upstreamTriggers,
   updateSchedule,
 } from "./api";
 import type {
@@ -45,6 +48,7 @@ import type {
   LogRecord,
   MigrationResponse,
   PipelineParameter,
+  PipelineTriggerRecord,
   Project,
   QueueItem,
   QueueStats,
@@ -176,6 +180,7 @@ function App() {
   const [logLines, setLogLines] = useState<LogRecord[]>([]);
   const [artifactList, setArtifactList] = useState<ArtifactRecord[]>([]);
   const [scheduleList, setScheduleList] = useState<ScheduleRecord[]>([]);
+  const [upstreamTriggerList, setUpstreamTriggerList] = useState<PipelineTriggerRecord[]>([]);
   const [parameterDefinitions, setParameterDefinitions] = useState<PipelineParameter[]>([]);
   const [parameterValues, setParameterValues] = useState<Record<string, string>>({});
   const [activeNav, setActiveNav] = useState("Pipelines");
@@ -191,6 +196,7 @@ function App() {
   const [pollMessage, setPollMessage] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [showScheduleCreate, setShowScheduleCreate] = useState(false);
+  const [showUpstreamCreate, setShowUpstreamCreate] = useState(false);
   const [migrationSource, setMigrationSource] = useState(DEFAULT_JENKINSFILE);
   const [migrationResult, setMigrationResult] = useState<MigrationResponse | null>(null);
   const [migrationBusy, setMigrationBusy] = useState(false);
@@ -248,6 +254,19 @@ function App() {
       setError(cause instanceof Error ? cause.message : "Could not load schedules");
     }
   }, [projectName]);
+
+  const loadUpstreamTriggerList = useCallback(async () => {
+    if (!engineOnline || !projectName) {
+      setUpstreamTriggerList([]);
+      return;
+    }
+    try {
+      setUpstreamTriggerList(await upstreamTriggers(projectName));
+      setError(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not load upstream triggers");
+    }
+  }, [engineOnline, projectName]);
 
   const loadBuildView = useCallback(async () => {
     if (!projectName || selectedBuild === null) {
@@ -337,6 +356,10 @@ function App() {
   useEffect(() => {
     void loadScheduleList();
   }, [loadScheduleList]);
+
+  useEffect(() => {
+    void loadUpstreamTriggerList();
+  }, [loadUpstreamTriggerList]);
 
   useEffect(() => {
     if (!engineOnline || !projectName) {
@@ -717,6 +740,39 @@ function App() {
     }
   }
 
+  async function submitUpstreamTrigger(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!projectName) return;
+    const form = new FormData(event.currentTarget);
+    const upstreamProject = String(form.get("upstream_project") ?? "").trim();
+    if (!upstreamProject) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await createUpstreamTrigger(projectName, upstreamProject);
+      await loadUpstreamTriggerList();
+      setShowUpstreamCreate(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not create upstream trigger");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeUpstreamTrigger(trigger: PipelineTriggerRecord) {
+    if (!projectName) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await deleteUpstreamTrigger(projectName, trigger.id);
+      await loadUpstreamTriggerList();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not delete upstream trigger");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function runMigrationAnalysis() {
     if (!migrationSource.trim()) {
       setError("Paste a Jenkinsfile before running the migration analysis.");
@@ -968,6 +1024,7 @@ function App() {
                     setParameterDefinitions([]);
                     setParameterValues({});
                     setPollMessage(null);
+                    setShowUpstreamCreate(false);
                   }}
                 >
                   {projectsList.map((project) => <option key={project.id} value={project.name}>{project.name}</option>)}
@@ -1020,6 +1077,17 @@ function App() {
               onSubmit={submitSchedule}
               onToggle={toggleSchedule}
               onDelete={removeSchedule}
+            />
+
+            <UpstreamTriggerPanel
+              project={projectName}
+              projects={projectsList}
+              triggers={upstreamTriggerList}
+              busy={busy || !engineOnline}
+              showCreate={showUpstreamCreate}
+              onToggleCreate={() => setShowUpstreamCreate((current) => !current)}
+              onSubmit={submitUpstreamTrigger}
+              onDelete={removeUpstreamTrigger}
             />
 
             <section className="section-head">
@@ -1344,6 +1412,67 @@ function SchedulePanel({
               <button className="schedule-delete" type="button" disabled={busy} aria-label={`Delete schedule ${schedule.name}`} onClick={() => onDelete(schedule)}>×</button>
             </div>
           ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function UpstreamTriggerPanel({
+  project,
+  projects,
+  triggers,
+  busy,
+  showCreate,
+  onToggleCreate,
+  onSubmit,
+  onDelete,
+}: {
+  project: string;
+  projects: Project[];
+  triggers: PipelineTriggerRecord[];
+  busy: boolean;
+  showCreate: boolean;
+  onToggleCreate: () => void;
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
+  onDelete: (trigger: PipelineTriggerRecord) => void;
+}) {
+  const names = new Map(projects.map((item) => [item.id, item.name]));
+  const choices = projects.filter((item) => item.name !== project);
+  return (
+    <section className="panel upstream-panel" aria-label="Upstream pipeline triggers">
+      <div className="panel-heading">
+        <div><span className="overline">Chain logic</span><h2>Upstream gates</h2></div>
+        <div className="upstream-heading-actions">
+          <span className="panel-count">{triggers.length.toString().padStart(2, "0")}</span>
+          <button className="button button-quiet" type="button" disabled={busy || choices.length === 0} onClick={onToggleCreate}>{showCreate ? "Close" : "＋ Add upstream"}</button>
+        </div>
+      </div>
+      <div className="upstream-intro">
+        <span className="upstream-intro-line" aria-hidden="true"><i /><i /><i /></span>
+        <p>Queue this pipeline only after a connected upstream build passes. Rivet remembers each handoff and refuses cycles.</p>
+      </div>
+      {showCreate && (
+        <form className="upstream-form" onSubmit={onSubmit}>
+          <label>When this passes<select name="upstream_project" required defaultValue=""><option value="" disabled>Select an upstream project</option>{choices.map((item) => <option key={item.id} value={item.name}>{item.name}</option>)}</select><small>Only a persisted <code>passed</code> build opens this gate.</small></label>
+          <button className="button button-primary" type="submit" disabled={busy}>{busy ? "Arming…" : "Arm handoff"}</button>
+        </form>
+      )}
+      {triggers.length === 0 ? (
+        <EmptyState text={showCreate ? "Choose a project to create the first handoff." : "No upstream gate is armed for this pipeline."} />
+      ) : (
+        <div className="upstream-list">
+          {triggers.map((trigger) => {
+            const upstream = names.get(trigger.upstream_project_id) ?? "Unknown project";
+            return (
+              <div className="upstream-row" key={trigger.id}>
+                <span className={`upstream-node ${trigger.enabled ? "enabled" : "disabled"}`} aria-hidden="true"><i /></span>
+                <div className="upstream-copy"><strong>{upstream}</strong><small>passed <span>→</span> {project} · {trigger.id.slice(0, 8)}</small></div>
+                <span className="upstream-status">{trigger.enabled ? "armed" : "paused"}</span>
+                <button className="schedule-delete" type="button" disabled={busy} aria-label={`Delete upstream trigger from ${upstream}`} onClick={() => onDelete(trigger)}>×</button>
+              </div>
+            );
+          })}
         </div>
       )}
     </section>
