@@ -50,5 +50,25 @@ if [ "$engine_ready" -ne 1 ]; then
     exit 1
 fi
 
+# A loopback listener alone can be provided by a headless process. Confirm
+# that the packaged Tauri host also created the operator-facing window.
+window_name=$(osascript <<'APPLESCRIPT'
+tell application "System Events"
+    tell process "rivet-desktop"
+        if (count of windows) = 0 then error "no Tauri window"
+        return name of window 1
+    end tell
+end tell
+APPLESCRIPT
+)
+case "$window_name" in
+    *Rivet*) ;;
+    *)
+        printf 'Tauri macOS bundle smoke refused: unexpected window title: %s\n' "$window_name" >&2
+        exit 1
+        ;;
+esac
+
 printf '%s\n' "local Tauri macOS bundle and launch smoke passed"
 printf 'bundle: %s\n' "$app_path"
+printf 'window: %s\n' "$window_name"

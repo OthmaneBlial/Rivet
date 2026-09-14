@@ -38,7 +38,7 @@ and full Jenkins parity are not claimed.
 </p>
 
 **95% verified** · `███████████████████░`<br>
-Weighted evidence score: **95.04 / 100** · displayed conservatively as the
+Weighted evidence score: **95.09 / 100** · displayed conservatively as the
 whole-number floor. This measures the weighted product scope in
 [ROADMAP.md](ROADMAP.md), not Jenkins parity.
 
@@ -243,7 +243,7 @@ boundaries in mind:
 
 ## Current status
 
-The repository currently reports **95.04 / 100 weighted evidence points** and
+The repository currently reports **95.09 / 100 weighted evidence points** and
 displays **95% verified**. This is an engineering progress measure, not a
 promise of complete platform coverage.
 
@@ -251,7 +251,7 @@ promise of complete platform coverage.
 | --- | --- |
 | Rust pipeline model, local runner, SQLite history, CLI workflow | **Working and locally tested** |
 | Headless API, WebSocket events, queue controls, schedules, triggers, artifacts, cache | **Working slices with local evidence** |
-| Tauri control room, light default, dark mode, offline recovery, packaged loopback engine | **Working slice; final window/release QA remains** |
+| Tauri control room, light default, dark mode, offline recovery, packaged loopback engine | **Working and locally tested, including packaged window QA** |
 | Remote-agent protocol and shared-runner execution | **Working local vertical slice** |
 | GitHub/GitLab/Bitbucket signed completion mappings | **Working locally; provider deployment evidence remains** |
 | Docker/Podman runtime behavior, external identity providers, signed installers, Windows/Linux packages | **Planned or unverified** |
