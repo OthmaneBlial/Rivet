@@ -86,6 +86,7 @@ pub struct AppState {
     scheduler: Arc<Scheduler>,
     active_builds: Arc<Mutex<HashMap<BuildId, CancellationToken>>>,
     events: broadcast::Sender<BuildEvent>,
+    shutdown: CancellationToken,
     auth_digest: Option<[u8; 32]>,
     auth_policy: Option<Arc<AuthPolicy>>,
     auth_users: Option<Arc<AuthUsers>>,
@@ -636,6 +637,11 @@ struct QueueStatusResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct ShutdownResponse {
+    status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct QueueItemResponse {
     build_id: BuildId,
     project_id: rivet_core::ProjectId,
@@ -687,6 +693,7 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
         .route("/api/v1/health", get(health))
         .route("/api/v1/ready", get(readiness))
         .route("/api/v1/metrics", get(metrics))
+        .route("/api/v1/admin/shutdown", post(request_shutdown))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/me", get(auth_me))
         .route("/api/v1/auth/sessions", post(create_session))
@@ -1028,6 +1035,8 @@ pub async fn serve_with_listener(
         config.webhook_secret.as_deref(),
         credentials,
     );
+    let shutdown = CancellationToken::new();
+    state.shutdown = shutdown.clone();
     state.auth_policy = auth_policy;
     state.auth_users = auth_users;
     state.extensions = Arc::new(extensions);
@@ -1051,11 +1060,10 @@ pub async fn serve_with_listener(
         config.allowed_origins
     };
     tracing::info!(bind = %bind, "Rivet server listening");
-    let shutdown = CancellationToken::new();
     spawn_schedule_dispatcher(state.clone(), shutdown.clone());
     spawn_remote_recovery_dispatcher(state.clone(), resumable_remote_attempts, shutdown.clone());
     let result = axum::serve(listener, router_with_origins(state, &allowed_origins)?)
-        .with_graceful_shutdown(wait_for_shutdown_signal())
+        .with_graceful_shutdown(wait_for_shutdown_signal(shutdown.clone()))
         .await;
     shutdown.cancel();
     result?;
@@ -1234,6 +1242,7 @@ impl AppState {
             scheduler: Arc::new(Scheduler::new_with_cache(2, Some(1), Some(cache_root))),
             active_builds: Arc::new(Mutex::new(HashMap::new())),
             events,
+            shutdown: CancellationToken::new(),
             auth_digest: None,
             auth_policy: None,
             auth_users: None,
@@ -1752,6 +1761,24 @@ rivet_queue_paused {}\n",
         HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
     );
     Ok(response)
+}
+
+async fn request_shutdown(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<(StatusCode, Json<ShutdownResponse>), ApiError> {
+    require_global(&principal, Permission::Administer)?;
+    state.shutdown.cancel();
+    tracing::info!(
+        actor = %principal.id(),
+        "Rivet server shutdown requested through the admin API"
+    );
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ShutdownResponse {
+            status: "shutdown_requested",
+        }),
+    ))
 }
 
 async fn analyze_jenkinsfile(
@@ -3501,22 +3528,28 @@ fn spawn_remote_recovery_dispatcher(
     });
 }
 
-async fn wait_for_shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
+async fn wait_for_shutdown_signal(shutdown: CancellationToken) {
+    let source = {
+        #[cfg(unix)]
+        {
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            tokio::select! {
+                _ = shutdown.cancelled() => "admin_api",
+                _ = tokio::signal::ctrl_c() => "signal",
+                _ = terminate.recv() => "signal",
+            }
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-    tracing::info!("Rivet server shutdown requested");
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                _ = shutdown.cancelled() => "admin_api",
+                _ = tokio::signal::ctrl_c() => "signal",
+            }
+        }
+    };
+    tracing::info!(source, "Rivet server shutdown requested");
 }
 
 async fn dispatch_due_schedules(state: &AppState, now: DateTime<Utc>) -> Result<usize, ApiError> {
@@ -5624,6 +5657,49 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_shutdown_route_requires_admin_and_requests_graceful_shutdown() {
+        let state = AppState::with_token(
+            Storage::open_in_memory().expect("storage"),
+            "shutdown-secret",
+        );
+        let shutdown = state.shutdown.clone();
+
+        let unauthorized = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/shutdown")
+                    .body(Body::empty())
+                    .expect("unauthorized request"),
+            )
+            .await
+            .expect("unauthorized response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert!(!shutdown.is_cancelled());
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/shutdown")
+                    .header(header::AUTHORIZATION, "Bearer shutdown-secret")
+                    .body(Body::empty())
+                    .expect("shutdown request"),
+            )
+            .await
+            .expect("shutdown response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(shutdown.is_cancelled());
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("shutdown body"),
+        )
+        .expect("shutdown JSON");
+        assert_eq!(body["status"], "shutdown_requested");
     }
 
     #[tokio::test]
