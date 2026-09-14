@@ -16,7 +16,8 @@ and unverified work remains at zero until it passes its gate.
 Last verified update: **2026-09-14** · native pipeline execution, priority-aware
 FIFO queue with pause/resume controls,
 SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
-clone/inspection, server-side project bootstrap cloning into explicit destinations,
+clone/inspection, local/remote project onboarding, server-side project bootstrap
+cloning into explicit destinations,
 persisted build-source identity, recursive Git submodule preparation,
 live queue telemetry, durable
 event replay, quiet engine offline recovery, explicit Git preparation at build
