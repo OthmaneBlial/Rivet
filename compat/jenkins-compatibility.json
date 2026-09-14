@@ -104,7 +104,7 @@
       "feature": "Signed generic webhook delivery",
       "status": "partial",
       "evidence": ["crates/rivet-server/src/lib.rs", "crates/rivet-storage/migrations/007_webhook_deliveries.sql", "crates/rivet-cli/src/main.rs"],
-      "notes": "The generic endpoint verifies HMAC-SHA256 over the raw request body, atomically deduplicates event IDs, and queues one real build; provider adapters are tracked separately and broader repository-event mapping remains planned."
+      "notes": "The generic endpoint verifies HMAC-SHA256 over the raw request body, atomically deduplicates event IDs, requires an actually persisted passed upstream build when one is referenced, and queues one real build; provider adapters are tracked separately and broader repository-event mapping remains planned."
     },
     {
       "category": "Triggers",

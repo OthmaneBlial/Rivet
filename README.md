@@ -425,10 +425,10 @@ build. A non-loopback server still requires the separate Bearer token.
 
 The signed generic webhook also accepts an optional upstream reference:
 `{"upstream":{"project":"build","build":4,"status":"passed"}}`.
-Only a positive, explicitly passed upstream build admits the downstream build;
-failed or cancelled upstream deliveries return `ignored`, and unknown statuses
-are rejected. This is a bounded trigger contract, not a claim of Jenkins
-upstream-job compatibility.
+Only a positive upstream build that is actually persisted as `passed` admits the
+downstream build; failed or cancelled upstream deliveries return `ignored`, and
+unknown or unrecorded upstream builds are rejected. This is a bounded trigger
+contract, not a claim of Jenkins upstream-job compatibility.
 
 Provider webhook adapters are available when their provider secret is supplied.
 The project name is part of the route, so the receiver never guesses a Rivet

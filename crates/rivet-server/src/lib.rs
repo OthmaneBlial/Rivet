@@ -2768,6 +2768,20 @@ async fn enqueue_webhook_build(
                 }),
             ));
         }
+        let upstream_project = project_by_name(&state.storage, upstream.project.trim())?;
+        let upstream_build = build_by_number(
+            &state.storage,
+            upstream_project.id,
+            upstream.project.trim(),
+            upstream.build,
+        )?;
+        if upstream_build.status != BuildStatus::Passed {
+            return Err(ApiError::BadRequest(format!(
+                "upstream build {} #{} is not recorded as passed",
+                upstream.project.trim(),
+                upstream.build
+            )));
+        }
     }
     let project_name = request.project.trim();
     require_project(principal, Permission::Build, project_name)?;
@@ -7762,8 +7776,42 @@ program = "true"
         storage
             .create_project(&project, &pipeline)
             .expect("project");
+        let upstream_project = Project::new(
+            "upstream-demo",
+            repository.to_string_lossy().into_owned(),
+            pipeline_path.to_string_lossy().into_owned(),
+        )
+        .expect("upstream project");
+        storage
+            .create_project(&upstream_project, &pipeline)
+            .expect("upstream project");
+        let upstream_plan =
+            ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), upstream_project.id);
+        let upstream_build = storage
+            .create_build(&upstream_project, &upstream_plan, &pipeline, None)
+            .expect("upstream build");
+        storage
+            .apply_event(&BuildEvent::BuildQueued {
+                build_id: upstream_build.id,
+                project_id: upstream_project.id,
+                timestamp: Utc::now(),
+            })
+            .expect("upstream queue");
+        storage
+            .apply_event(&BuildEvent::BuildStarted {
+                build_id: upstream_build.id,
+                timestamp: Utc::now(),
+            })
+            .expect("upstream start");
+        storage
+            .apply_event(&BuildEvent::BuildFinished {
+                build_id: upstream_build.id,
+                status: BuildStatus::Passed,
+                timestamp: Utc::now(),
+            })
+            .expect("upstream finish");
         let state = AppState::with_webhook_secret(storage.clone(), "webhook-test-secret");
-        let failed_upstream = br#"{"event_id":"upstream-failed-1","project":"webhook-demo","upstream":{"project":"upstream-demo","build":4,"status":"failed"}}"#.to_vec();
+        let failed_upstream = br#"{"event_id":"upstream-failed-1","project":"webhook-demo","upstream":{"project":"upstream-demo","build":1,"status":"failed"}}"#.to_vec();
         let failed_signature = sign_webhook("webhook-test-secret", &failed_upstream);
         let response = router(state.clone())
             .oneshot(
@@ -7789,7 +7837,23 @@ program = "true"
         assert!(ignored["build"].is_null());
         assert!(storage.list_builds(project.id).expect("builds").is_empty());
 
-        let body = br#"{"event_id":"delivery-1","project":"webhook-demo","upstream":{"project":"upstream-demo","build":4,"status":"passed"}}"#.to_vec();
+        let unrecorded_body = br#"{"event_id":"upstream-missing-1","project":"webhook-demo","upstream":{"project":"upstream-demo","build":99,"status":"passed"}}"#.to_vec();
+        let unrecorded_signature = sign_webhook("webhook-test-secret", &unrecorded_body);
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/webhooks/generic")
+                    .header("content-type", "application/json")
+                    .header("x-rivet-signature", &unrecorded_signature)
+                    .body(Body::from(unrecorded_body))
+                    .expect("unrecorded upstream request"),
+            )
+            .await
+            .expect("unrecorded upstream response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = br#"{"event_id":"delivery-1","project":"webhook-demo","upstream":{"project":"upstream-demo","build":1,"status":"passed"}}"#.to_vec();
 
         let response = router(state.clone())
             .oneshot(
