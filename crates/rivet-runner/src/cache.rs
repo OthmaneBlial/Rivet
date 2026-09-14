@@ -103,10 +103,31 @@ impl CacheStore {
                 fs::remove_file(&temporary_path)?;
                 return Ok(false);
             }
+            let digest = sha256_file(&temporary_path)?;
             if archive_path.is_file() {
                 return Ok(false);
             }
             fs::rename(&temporary_path, &archive_path)?;
+            let digest_path = digest_path(&archive_path);
+            let digest_temporary_path =
+                self.root
+                    .join(format!(".{}.{}.sha256.tmp", spec.name, Uuid::new_v4()));
+            let digest_result = (|| {
+                let mut digest_file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&digest_temporary_path)?;
+                set_private_file_permissions(&digest_temporary_path)?;
+                use std::io::Write;
+                writeln!(digest_file, "{digest}")?;
+                digest_file.sync_all()?;
+                fs::rename(&digest_temporary_path, &digest_path)?;
+                Ok::<_, CacheError>(())
+            })();
+            if digest_result.is_err() {
+                let _ = fs::remove_file(&digest_temporary_path);
+            }
+            digest_result?;
             Ok(true)
         })();
         if result.is_err() {
@@ -174,6 +195,12 @@ impl CacheStore {
                 continue;
             }
             fs::remove_file(&path)?;
+            let checksum_path = digest_path(&path);
+            if let Ok(checksum_metadata) = fs::symlink_metadata(&checksum_path)
+                && checksum_metadata.file_type().is_file()
+            {
+                fs::remove_file(checksum_path)?;
+            }
             remaining_bytes = remaining_bytes.saturating_sub(size);
             result.removed_entries += 1;
             result.removed_bytes += size;
@@ -213,6 +240,18 @@ impl CacheStore {
             )
             .into());
         }
+        if let Some(expected) = read_digest(&digest_path(archive_path))? {
+            let actual = sha256_file(archive_path)?;
+            if actual != expected {
+                let _ = fs::remove_file(archive_path);
+                let _ = fs::remove_file(digest_path(archive_path));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cache archive checksum mismatch",
+                )
+                .into());
+            }
+        }
         let file = File::open(archive_path)?;
         let mut archive = tar::Archive::new(file);
         let restore_result = (|| {
@@ -238,6 +277,7 @@ impl CacheStore {
         })();
         if let Err(error) = restore_result {
             let _ = fs::remove_file(archive_path);
+            let _ = fs::remove_file(digest_path(archive_path));
             return Err(error.into());
         }
         Ok(true)
@@ -271,6 +311,42 @@ fn set_private_file_permissions(path: &Path) -> Result<(), CacheError> {
     Ok(())
 }
 
+fn digest_path(archive_path: &Path) -> PathBuf {
+    archive_path.with_extension("sha256")
+}
+
+fn sha256_file(path: &Path) -> Result<String, CacheError> {
+    use std::io::Read;
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn read_digest(path: &Path) -> Result<Option<String>, CacheError> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let digest = contents.trim();
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache checksum sidecar is invalid",
+        )
+        .into());
+    }
+    Ok(Some(digest.to_ascii_lowercase()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +377,7 @@ mod tests {
         let spec = cache_spec();
 
         assert!(store.save(project_id, &spec, &workspace).expect("save"));
+        assert!(digest_path(&store.archive_path(project_id, &spec)).is_file());
         fs::remove_dir_all(workspace.join("target")).expect("remove target");
         fs::remove_file(workspace.join("lockfile")).expect("remove lockfile");
         assert!(
@@ -418,5 +495,25 @@ program = "true"
 
         assert!(store.restore(project_id, &spec, &workspace).is_err());
         assert!(!store.archive_path(project_id, &spec).exists());
+    }
+
+    #[test]
+    fn checksum_sidecar_rejects_a_modified_valid_archive() {
+        let directory = tempdir().expect("tempdir");
+        let workspace = directory.path().join("workspace");
+        let cache_root = directory.path().join("cache");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("lockfile"), "cache").expect("lockfile");
+        let project_id = uuid::Uuid::new_v4();
+        let store = CacheStore::new(&cache_root);
+        let spec = cache_spec();
+        assert!(store.save(project_id, &spec, &workspace).expect("save"));
+        let archive = store.archive_path(project_id, &spec);
+        let original = fs::read(&archive).expect("archive");
+        fs::write(&archive, [original.as_slice(), b"tamper"].concat()).expect("tamper");
+
+        assert!(store.restore(project_id, &spec, &workspace).is_err());
+        assert!(!archive.exists());
+        assert!(!digest_path(&archive).exists());
     }
 }
