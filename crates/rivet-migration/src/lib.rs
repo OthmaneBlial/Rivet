@@ -4,9 +4,9 @@
 //! arbitrary Jenkins plugins. It recognizes common declarative constructs and
 //! reports the exact line and migration boundary for each one.
 
-use rivet_core::{ArtifactSpec, ParameterSpec, Pipeline, Stage, Step};
+use rivet_core::{ArtifactSpec, ParameterKind, ParameterSpec, Pipeline, Stage, Step};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -205,6 +205,19 @@ pub fn analyze_jenkinsfile(source: &str) -> JenkinsfileAnalysis {
                 "Jenkins console output is detected; preserve it as an intentional Rivet process step or log boundary.",
                 Some("step output or an explicit logging command"),
                 evidence("echo", None),
+            );
+        } else if let Some(kind) = typed_parameter_construct(trimmed) {
+            add_finding(
+                &mut findings,
+                &mut recommendations,
+                line_number,
+                "typed_parameter",
+                SupportLevel::Supported,
+                &format!(
+                    "The deterministic {kind} parameter form can map to a typed Rivet runtime input."
+                ),
+                Some("[[parameters]] with kind-specific validation"),
+                evidence("typed_parameter", Some(kind)),
             );
         } else if starts_with_construct(trimmed, "parameters") {
             add_finding(
@@ -667,13 +680,19 @@ fn parse_declarative_metadata(source: &str) -> DeclarativeMetadata {
     let mut parameter_names = std::collections::HashSet::new();
     for (line, statement) in declaration_block_lines(source, "parameters") {
         let statement = statement.trim().trim_end_matches(';').trim();
-        let (kind, secret) = if starts_with_construct(statement, "string") {
-            ("string", false)
+        let (kind, parameter_kind, secret) = if starts_with_construct(statement, "string") {
+            ("string", ParameterKind::String, false)
         } else if starts_with_construct(statement, "password") {
-            ("password", true)
+            ("password", ParameterKind::Password, true)
+        } else if starts_with_construct(statement, "text") {
+            ("text", ParameterKind::Text, false)
+        } else if starts_with_construct(statement, "booleanParam") {
+            ("booleanParam", ParameterKind::Boolean, false)
+        } else if starts_with_construct(statement, "choice") {
+            ("choice", ParameterKind::Choice, false)
         } else {
             metadata.warnings.push(format!(
-                "line {line}: parameter declaration is not a deterministic string/password mapping"
+                "line {line}: parameter declaration is not a deterministic supported typed mapping"
             ));
             continue;
         };
@@ -697,7 +716,55 @@ fn parse_declarative_metadata(source: &str) -> DeclarativeMetadata {
             continue;
         }
 
-        let mut default = named_quoted_argument(statement, "defaultValue");
+        let mut choices = Vec::new();
+        let mut default = match parameter_kind {
+            ParameterKind::Boolean => {
+                if let Some(value) = named_boolean_argument(statement, "defaultValue") {
+                    Some(value.to_string())
+                } else if statement.contains("defaultValue:") {
+                    metadata.warnings.push(format!(
+                        "line {line}: boolean default for parameter {name:?} is dynamic and was omitted"
+                    ));
+                    None
+                } else {
+                    Some("false".to_owned())
+                }
+            }
+            _ => named_quoted_argument(statement, "defaultValue"),
+        };
+        if parameter_kind == ParameterKind::Choice {
+            let Some(parsed_choices) = named_quoted_list_argument(statement, "choices") else {
+                metadata.warnings.push(format!(
+                    "line {line}: choice parameter {name:?} has no deterministic quoted choices"
+                ));
+                continue;
+            };
+            let mut seen_choices = HashSet::new();
+            if parsed_choices.is_empty()
+                || parsed_choices.iter().any(|choice| choice.is_empty())
+                || parsed_choices
+                    .iter()
+                    .any(|choice| !seen_choices.insert(choice.as_str()))
+            {
+                metadata.warnings.push(format!(
+                    "line {line}: choice parameter {name:?} has empty or duplicate choices"
+                ));
+                continue;
+            }
+            choices = parsed_choices;
+            if default.is_none() {
+                default = choices.first().cloned();
+            }
+            if default
+                .as_ref()
+                .is_some_and(|value| !choices.iter().any(|choice| choice == value))
+            {
+                metadata.warnings.push(format!(
+                    "line {line}: default for choice parameter {name:?} is not one of its choices and was omitted"
+                ));
+                default = None;
+            }
+        }
         if default.as_deref().is_some_and(|value| value.contains('$')) {
             metadata.warnings.push(format!(
                 "line {line}: default for parameter {name:?} is dynamic and was omitted"
@@ -712,8 +779,10 @@ fn parse_declarative_metadata(source: &str) -> DeclarativeMetadata {
         }
         metadata.parameters.push(ParameterSpec {
             name,
+            kind: parameter_kind,
             default,
             secret,
+            choices,
         });
     }
 
@@ -816,6 +885,46 @@ fn named_quoted_argument(line: &str, name: &str) -> Option<String> {
         return None;
     }
     quoted_prefix(line[start + needle.len()..].trim_start()).map(|(value, _)| value)
+}
+
+fn typed_parameter_construct(line: &str) -> Option<&'static str> {
+    ["string", "password", "text", "booleanParam", "choice"]
+        .into_iter()
+        .find(|construct| starts_with_construct(line, construct))
+}
+
+fn named_quoted_list_argument(line: &str, name: &str) -> Option<Vec<String>> {
+    let needle = format!("{name}:");
+    let start = line.find(&needle)?;
+    if start > 0
+        && line[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    let mut rest = line[start + needle.len()..]
+        .trim_start()
+        .strip_prefix('[')?
+        .trim_start();
+    let mut values = Vec::new();
+    loop {
+        if rest.starts_with(']') {
+            return Some(values);
+        }
+        let (value, trailing) = quoted_prefix(rest)?;
+        values.push(value);
+        rest = trailing.trim_start();
+        if let Some(after_comma) = rest.strip_prefix(',') {
+            rest = after_comma.trim_start();
+            continue;
+        }
+        if rest.starts_with(']') {
+            return Some(values);
+        }
+        return None;
+    }
 }
 
 fn named_boolean_argument(line: &str, name: &str) -> Option<bool> {
@@ -1066,6 +1175,7 @@ fn strip_comments(line: &str, in_block_comment: &mut bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{SupportLevel, analyze_jenkinsfile, generate_rivetfile_draft};
+    use rivet_core::ParameterKind;
 
     #[test]
     fn declarative_pipeline_reports_mappable_and_partial_constructs() {
@@ -1266,6 +1376,45 @@ pipeline {
     }
 
     #[test]
+    fn typed_jenkins_parameters_become_valid_rivet_inputs() {
+        let draft = generate_rivetfile_draft(
+            r#"pipeline {
+  parameters {
+    booleanParam(name: 'PUBLISH', defaultValue: true)
+    choice(name: 'TARGET', choices: ['staging', 'production'])
+    text(name: 'NOTES', defaultValue: 'ship carefully')
+    password(name: 'TOKEN')
+  }
+  stages {
+    stage('Build') {
+      steps {
+        sh 'cargo build'
+      }
+    }
+  }
+}"#,
+        )
+        .expect("typed parameter draft");
+
+        assert!(draft.warnings.is_empty());
+        let rivetfile = draft.rivetfile_toml.expect("typed Rivetfile");
+        let pipeline = rivet_core::Pipeline::from_toml_str(&rivetfile).expect("valid Rivetfile");
+        assert_eq!(pipeline.parameters[0].kind, ParameterKind::Boolean);
+        assert_eq!(pipeline.parameters[0].default.as_deref(), Some("true"));
+        assert_eq!(pipeline.parameters[1].kind, ParameterKind::Choice);
+        assert_eq!(pipeline.parameters[1].choices, ["staging", "production"]);
+        assert_eq!(pipeline.parameters[1].default.as_deref(), Some("staging"));
+        assert_eq!(pipeline.parameters[2].kind, ParameterKind::Text);
+        assert_eq!(
+            pipeline.parameters[2].default.as_deref(),
+            Some("ship carefully")
+        );
+        assert_eq!(pipeline.parameters[3].kind, ParameterKind::Password);
+        assert!(pipeline.parameters[3].secret);
+        assert!(pipeline.parameters[3].default.is_none());
+    }
+
+    #[test]
     fn dynamic_metadata_and_unsafe_archives_remain_outside_the_generated_draft() {
         let draft = generate_rivetfile_draft(
             r#"pipeline {
@@ -1298,12 +1447,6 @@ pipeline {
             draft
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("string/password"))
-        );
-        assert!(
-            draft
-                .warnings
-                .iter()
                 .any(|warning| warning.contains("secret password default"))
         );
         assert!(
@@ -1316,10 +1459,14 @@ pipeline {
         let rivetfile = draft.rivetfile_toml.expect("bounded Rivetfile");
         let pipeline = rivet_core::Pipeline::from_toml_str(&rivetfile).expect("valid Rivetfile");
         assert!(pipeline.environment.is_empty());
-        assert_eq!(pipeline.parameters.len(), 1);
-        assert_eq!(pipeline.parameters[0].name, "TOKEN");
-        assert!(pipeline.parameters[0].secret);
-        assert!(pipeline.parameters[0].default.is_none());
+        assert_eq!(pipeline.parameters.len(), 2);
+        assert_eq!(pipeline.parameters[0].name, "PUBLISH");
+        assert_eq!(pipeline.parameters[0].kind, ParameterKind::Boolean);
+        assert_eq!(pipeline.parameters[0].default.as_deref(), Some("true"));
+        assert_eq!(pipeline.parameters[1].name, "TOKEN");
+        assert_eq!(pipeline.parameters[1].kind, ParameterKind::Password);
+        assert!(pipeline.parameters[1].secret);
+        assert!(pipeline.parameters[1].default.is_none());
         assert!(pipeline.artifacts.is_empty());
     }
 

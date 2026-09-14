@@ -151,9 +151,11 @@ export interface QueueItem {
 
 export interface PipelineParameter {
   name: string;
+  kind: "string" | "text" | "boolean" | "choice" | "password";
   secret: boolean;
   default: string | null;
   required: boolean;
+  choices: string[];
 }
 
 export interface CredentialSummary {

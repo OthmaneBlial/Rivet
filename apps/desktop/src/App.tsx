@@ -1158,17 +1158,53 @@ function ParameterPanel({
               <span>{definition.name}</span>
               {definition.required ? <em>required</em> : <em>optional</em>}
             </span>
-            <input
-              type={definition.secret ? "password" : "text"}
-              value={values[definition.name] ?? ""}
-              onChange={(event) => onChange(definition.name, event.target.value)}
-              placeholder={definition.secret ? "enter secret at run time" : definition.default ?? "value"}
-              autoComplete={definition.secret ? "new-password" : "off"}
-              spellCheck={false}
-              aria-required={definition.required}
-            />
+            {definition.kind === "choice" ? (
+              <select
+                value={values[definition.name] ?? ""}
+                onChange={(event) => onChange(definition.name, event.target.value)}
+                aria-required={definition.required}
+              >
+                <option value="">Use default{definition.default ? ` · ${definition.default}` : ""}</option>
+                {definition.choices.map((choice) => <option value={choice} key={choice}>{choice}</option>)}
+              </select>
+            ) : definition.kind === "boolean" ? (
+              <span className="boolean-parameter">
+                <input
+                  type="checkbox"
+                  checked={(values[definition.name] ?? definition.default ?? "false") === "true"}
+                  onChange={(event) => onChange(definition.name, event.target.checked ? "true" : "false")}
+                  aria-required={definition.required}
+                />
+                <span>{values[definition.name] === undefined ? `Default: ${definition.default ?? "false"}` : (values[definition.name] === "true" ? "Enabled" : "Disabled")}</span>
+              </span>
+            ) : definition.kind === "text" ? (
+              <textarea
+                value={values[definition.name] ?? ""}
+                onChange={(event) => onChange(definition.name, event.target.value)}
+                placeholder={definition.default ?? "value"}
+                autoComplete="off"
+                spellCheck={false}
+                aria-required={definition.required}
+              />
+            ) : (
+              <input
+                type={definition.secret || definition.kind === "password" ? "password" : "text"}
+                value={values[definition.name] ?? ""}
+                onChange={(event) => onChange(definition.name, event.target.value)}
+                placeholder={definition.secret || definition.kind === "password" ? "enter secret at run time" : definition.default ?? "value"}
+                autoComplete={definition.secret || definition.kind === "password" ? "new-password" : "off"}
+                spellCheck={false}
+                aria-required={definition.required}
+              />
+            )}
             <small>
-              {definition.secret
+              {definition.kind === "choice"
+                ? `Choice · ${definition.choices.length} allowed value${definition.choices.length === 1 ? "" : "s"}.`
+                : definition.kind === "boolean"
+                  ? "Boolean · the value is sent as true or false."
+                  : definition.kind === "text"
+                    ? "Text · multiline values are accepted."
+                    : definition.secret || definition.kind === "password"
                 ? "Secret · required at run time; never returned or persisted in clear text."
                 : definition.default
                   ? `Default: ${definition.default}`

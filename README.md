@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **94% verified** · `███████████████████░`<br>
-Weighted evidence score: **94.78 / 100** · displayed conservatively as the
+Weighted evidence score: **94.82 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -38,7 +38,8 @@ with Argon2id password verification, opaque sessions, and a packaged desktop lau
 ephemeral loopback engine origin, project-scoped local CI cache restore and
 save, explicit Docker/Podman container command assembly with bounded workspace mounts,
 and a bounded Jenkinsfile migration analyzer with line-level support findings
-plus safe drafts for deterministic shell steps, exposed through the headless
+plus safe drafts for deterministic shell steps and statically typed primitive
+parameters, exposed through the headless
 API and rendered in the desktop control room. The server also exposes
 administrator-only subprocess extension lifecycle status and start/stop
 controls, reflected in the desktop view. A capability-free WASM runtime now
@@ -576,10 +577,12 @@ cleanup, and a vault credential ID selected from the loaded summaries.
 
 It also loads the project's declared pipeline parameters through
 `GET /api/v1/projects/<name>/parameters`. Non-secret defaults and required
-fields are shown in the run form; secret parameters use password inputs, are
-sent only with the explicit queue/retry request, and are cleared from the form
-after a successful admission. The server remains the source of truth for
-unknown or missing values and never returns secret parameter contents.
+fields are shown in the run form; choice, boolean, text, and password kinds use
+their corresponding controls. Choice and boolean values are validated by the
+engine, secret parameters use password inputs, are sent only with the explicit
+queue/retry request, and are cleared from the form after a successful
+admission. The server remains the source of truth for unknown, missing, or
+ill-typed values and never returns secret parameter contents.
 
 The same `--credential-id`, `--credentials-file`, and
 `--credentials-passphrase-file` flags can be passed to `rivet run` when a
@@ -695,7 +698,19 @@ name = "TARGET"
 default = "debug"
 
 [[parameters]]
+name = "RELEASE_CHANNEL"
+kind = "choice"
+choices = ["staging", "production"]
+default = "staging"
+
+[[parameters]]
+name = "PUBLISH"
+kind = "boolean"
+default = "false"
+
+[[parameters]]
 name = "DEPLOY_TOKEN"
+kind = "password"
 secret = true
 
 [[caches]]
@@ -714,7 +729,9 @@ step; step-level `env` entries override them, and resolved build parameters
 override pipeline defaults. Reserved `CI`/`RIVET_*` names are controlled by
 the runner. Keep secrets in secret parameters or the encrypted credential
 vault, never in the versioned pipeline file. Parameters are resolved per
-build and exposed to direct processes as environment variables. Non-secret values are persisted for history; secret
+build and exposed to direct processes as environment variables. `string` and
+`text` values remain free-form, `boolean` accepts only `true` or `false`, and
+`choice` accepts only one of its declared values. Non-secret values are persisted for history; secret
 parameters cannot define defaults, are represented as `[redacted]` in stored
 build data and API responses, and are replaced with `***` in emitted logs.
 Failed or timed-out steps may request up to five additional attempts with a
@@ -778,9 +795,10 @@ cargo run -p rivet -- analyze jenkinsfile --draft ./Jenkinsfile
 The analyzer emits versioned JSON with supported, partial, and unsupported
 constructs, source line numbers, and Rivet mapping guidance. The optional
 draft emits a valid Rivetfile for simple, explicitly quoted `sh`/`bat` steps,
-static environment assignments, `string`/`password` parameters, and safe
-`archiveArtifacts` patterns. Ambiguous commands, dynamic values, unsupported
-parameter types, credentials, plugins, and lifecycle behavior stay in warnings.
+static environment assignments, `string`, `text`, `booleanParam`, `choice`, and
+`password` parameters, and safe `archiveArtifacts` patterns. Ambiguous
+commands, dynamic values, unsupported parameter types, credentials, plugins,
+and lifecycle behavior stay in warnings.
 It never executes Groovy or plugin code; complex migration semantics still
 need manual review. Generated declarative stages retain Jenkins' sequential
 order through explicit Rivet dependencies, and the fixture suite keeps

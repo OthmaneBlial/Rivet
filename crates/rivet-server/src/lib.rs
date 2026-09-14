@@ -23,8 +23,8 @@ use rivet_auth::{
     AuthError, AuthPolicy, AuthUsers, Permission, Principal, Role, generate_token, token_digest,
 };
 use rivet_core::{
-    BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, Pipeline, Project, ScheduleId,
-    SourceSnapshot,
+    BuildEvent, BuildId, BuildStatus, CronExpression, ExecutionPlan, ParameterKind, Pipeline,
+    Project, ScheduleId, SourceSnapshot,
 };
 use rivet_credentials::{
     CredentialError, CredentialKeychain, CredentialKind, CredentialSummary, CredentialVault,
@@ -635,9 +635,11 @@ struct QueueItemResponse {
 #[derive(Debug, Serialize)]
 struct PipelineParameterResponse {
     name: String,
+    kind: ParameterKind,
     secret: bool,
     default: Option<String>,
     required: bool,
+    choices: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1852,8 +1854,10 @@ async fn list_pipeline_parameters(
             .map(|parameter| PipelineParameterResponse {
                 required: parameter.default.is_none(),
                 name: parameter.name,
+                kind: parameter.kind,
                 secret: parameter.secret,
                 default: parameter.default,
+                choices: parameter.choices,
             })
             .collect(),
     ))
@@ -5874,7 +5878,7 @@ mod tests {
         let pipeline_path = directory.path().join("Rivetfile.toml");
         fs::write(
             &pipeline_path,
-            "version = 1\nname = \"parameters\"\n\n[[parameters]]\nname = \"TARGET\"\ndefault = \"release\"\n\n[[parameters]]\nname = \"TOKEN\"\nsecret = true\n\n[[stages]]\nname = \"Test\"\n[[stages.steps]]\nname = \"noop\"\nprogram = \"true\"\n",
+            "version = 1\nname = \"parameters\"\n\n[[parameters]]\nname = \"TARGET\"\ndefault = \"release\"\n\n[[parameters]]\nname = \"CHANNEL\"\nkind = \"choice\"\nchoices = [\"staging\", \"production\"]\ndefault = \"staging\"\n\n[[parameters]]\nname = \"PUBLISH\"\nkind = \"boolean\"\ndefault = \"false\"\n\n[[parameters]]\nname = \"TOKEN\"\nkind = \"password\"\nsecret = true\n\n[[stages]]\nname = \"Test\"\n[[stages.steps]]\nname = \"noop\"\nprogram = \"true\"\n",
         )
         .expect("pipeline");
         let pipeline = Pipeline::load(&pipeline_path).expect("pipeline");
@@ -5904,11 +5908,22 @@ mod tests {
             .expect("parameters body");
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("parameters JSON");
         assert_eq!(payload[0]["name"], "TARGET");
+        assert_eq!(payload[0]["kind"], "string");
         assert_eq!(payload[0]["default"], "release");
         assert_eq!(payload[0]["required"], false);
-        assert_eq!(payload[1]["name"], "TOKEN");
-        assert_eq!(payload[1]["secret"], true);
-        assert!(payload[1]["default"].is_null());
+        assert_eq!(payload[1]["name"], "CHANNEL");
+        assert_eq!(payload[1]["kind"], "choice");
+        assert_eq!(
+            payload[1]["choices"],
+            serde_json::json!(["staging", "production"])
+        );
+        assert_eq!(payload[2]["name"], "PUBLISH");
+        assert_eq!(payload[2]["kind"], "boolean");
+        assert_eq!(payload[2]["default"], "false");
+        assert_eq!(payload[3]["name"], "TOKEN");
+        assert_eq!(payload[3]["kind"], "password");
+        assert_eq!(payload[3]["secret"], true);
+        assert!(payload[3]["default"].is_null());
     }
 
     #[tokio::test]

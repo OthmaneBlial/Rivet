@@ -11,6 +11,9 @@ const MAX_AGENT_MEMORY_MB: u64 = 4 * 1024 * 1024;
 const MAX_ENVIRONMENT_VARIABLES: usize = 128;
 const MAX_ENVIRONMENT_NAME_BYTES: usize = 256;
 const MAX_ENVIRONMENT_VALUE_BYTES: usize = 16 * 1024;
+const MAX_PARAMETER_VALUE_BYTES: usize = 64 * 1024;
+const MAX_PARAMETER_CHOICES: usize = 64;
+const MAX_PARAMETER_CHOICE_BYTES: usize = 256;
 const MAX_STEP_RETRIES: u8 = 5;
 const MAX_STEP_RETRY_DELAY_SECONDS: u64 = 300;
 const MAX_CONTAINER_IMAGE_BYTES: usize = 512;
@@ -40,10 +43,33 @@ pub struct Pipeline {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParameterSpec {
     pub name: String,
+    /// The input shape exposed to operators. String remains the default so
+    /// existing Rivetfiles keep their original wire representation.
+    #[serde(default, skip_serializing_if = "is_string_parameter_kind")]
+    pub kind: ParameterKind,
     #[serde(default)]
     pub default: Option<String>,
     #[serde(default)]
     pub secret: bool,
+    /// Allowed values for a `choice` parameter. Other kinds must leave this
+    /// empty so the input contract cannot be ambiguous.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ParameterKind {
+    #[default]
+    String,
+    Text,
+    Boolean,
+    Choice,
+    Password,
+}
+
+fn is_string_parameter_kind(kind: &ParameterKind) -> bool {
+    *kind == ParameterKind::String
 }
 
 pub const REDACTED_PARAMETER_VALUE: &str = "[redacted]";
@@ -322,6 +348,20 @@ pub enum PipelineError {
     MissingParameter(String),
     #[error("secret parameter {0:?} cannot define a default value")]
     SecretParameterDefault(String),
+    #[error("password parameter {0:?} must be marked secret")]
+    PasswordParameterNotSecret(String),
+    #[error("choice parameter {0:?} must declare at least one choice")]
+    EmptyParameterChoices(String),
+    #[error("choice parameter {0:?} declares too many choices")]
+    TooManyParameterChoices(String),
+    #[error("parameter {name:?} has an invalid choice")]
+    InvalidParameterChoice { name: String },
+    #[error("choice parameter {0:?} repeats a choice")]
+    DuplicateParameterChoice(String),
+    #[error("parameter {0:?} declares choices but is not a choice parameter")]
+    ChoicesForNonChoiceParameter(String),
+    #[error("parameter {name:?} has an invalid value for kind {kind:?}")]
+    InvalidParameterValue { name: String, kind: ParameterKind },
     #[error("pipeline environment declares too many variables")]
     TooManyEnvironmentVariables,
     #[error("pipeline environment variable name {0:?} is invalid")]
@@ -435,6 +475,45 @@ impl Pipeline {
                 return Err(PipelineError::SecretParameterDefault(
                     parameter.name.clone(),
                 ));
+            }
+            if parameter.kind == ParameterKind::Password && !parameter.secret {
+                return Err(PipelineError::PasswordParameterNotSecret(
+                    parameter.name.clone(),
+                ));
+            }
+            if parameter.kind == ParameterKind::Choice {
+                if parameter.choices.is_empty() {
+                    return Err(PipelineError::EmptyParameterChoices(parameter.name.clone()));
+                }
+                if parameter.choices.len() > MAX_PARAMETER_CHOICES {
+                    return Err(PipelineError::TooManyParameterChoices(
+                        parameter.name.clone(),
+                    ));
+                }
+                let mut choices = HashSet::new();
+                for choice in &parameter.choices {
+                    if choice.is_empty()
+                        || choice.len() > MAX_PARAMETER_CHOICE_BYTES
+                        || choice.contains('\0')
+                        || choice.chars().any(char::is_control)
+                    {
+                        return Err(PipelineError::InvalidParameterChoice {
+                            name: parameter.name.clone(),
+                        });
+                    }
+                    if !choices.insert(choice.as_str()) {
+                        return Err(PipelineError::DuplicateParameterChoice(
+                            parameter.name.clone(),
+                        ));
+                    }
+                }
+            } else if !parameter.choices.is_empty() {
+                return Err(PipelineError::ChoicesForNonChoiceParameter(
+                    parameter.name.clone(),
+                ));
+            }
+            if let Some(default) = &parameter.default {
+                validate_parameter_value(parameter, default)?;
             }
         }
 
@@ -867,7 +946,11 @@ impl Pipeline {
                 supplied_value
                     .or(parameter.default.as_ref())
                     .cloned()
-                    .map(|value| (parameter.name.clone(), value))
+                    .map(|value| {
+                        validate_parameter_value(parameter, &value)
+                            .map(|()| (parameter.name.clone(), value))
+                    })
+                    .transpose()?
                     .ok_or_else(|| PipelineError::MissingParameter(parameter.name.clone()))
             })
             .collect()
@@ -929,6 +1012,30 @@ impl Pipeline {
             return Err(PipelineError::WorkspaceOutsideRepository(normalized));
         }
         Ok(normalized)
+    }
+}
+
+fn validate_parameter_value(parameter: &ParameterSpec, value: &str) -> Result<(), PipelineError> {
+    if value.len() > MAX_PARAMETER_VALUE_BYTES || value.contains('\0') {
+        return Err(PipelineError::InvalidParameterValue {
+            name: parameter.name.clone(),
+            kind: parameter.kind,
+        });
+    }
+    match parameter.kind {
+        ParameterKind::Boolean if !matches!(value, "true" | "false") => {
+            Err(PipelineError::InvalidParameterValue {
+                name: parameter.name.clone(),
+                kind: parameter.kind,
+            })
+        }
+        ParameterKind::Choice if !parameter.choices.iter().any(|choice| choice == value) => {
+            Err(PipelineError::InvalidParameterValue {
+                name: parameter.name.clone(),
+                kind: parameter.kind,
+            })
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1424,6 +1531,131 @@ program = "true"
         assert!(matches!(
             pipeline.resolve_parameters(&BTreeMap::new()),
             Err(PipelineError::MissingParameter(name)) if name == "release_channel"
+        ));
+    }
+
+    #[test]
+    fn typed_parameters_validate_values_and_preserve_legacy_string_defaults() {
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "typed-parameters"
+[[parameters]]
+name = "TARGET"
+kind = "choice"
+choices = ["debug", "release"]
+default = "debug"
+[[parameters]]
+name = "PUBLISH"
+kind = "boolean"
+default = "false"
+[[parameters]]
+name = "NOTES"
+kind = "text"
+[[parameters]]
+name = "TOKEN"
+kind = "password"
+secret = true
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("typed pipeline");
+
+        assert_eq!(pipeline.parameters[0].kind, ParameterKind::Choice);
+        assert_eq!(pipeline.parameters[0].choices, ["debug", "release"]);
+        assert_eq!(pipeline.parameters[1].kind, ParameterKind::Boolean);
+        assert_eq!(pipeline.parameters[2].kind, ParameterKind::Text);
+        assert_eq!(pipeline.parameters[3].kind, ParameterKind::Password);
+
+        let resolved = pipeline
+            .resolve_parameters(&BTreeMap::from([
+                ("NOTES".to_owned(), "line one\nline two".to_owned()),
+                ("TOKEN".to_owned(), "secret-value".to_owned()),
+            ]))
+            .expect("typed defaults resolve");
+        assert_eq!(resolved["TARGET"], "debug");
+        assert_eq!(resolved["PUBLISH"], "false");
+        assert!(matches!(
+            pipeline.resolve_parameters(&BTreeMap::from([(
+                "PUBLISH".to_owned(),
+                "yes".to_owned(),
+            )])),
+            Err(PipelineError::InvalidParameterValue { name, kind })
+                if name == "PUBLISH" && kind == ParameterKind::Boolean
+        ));
+        assert!(matches!(
+            pipeline.resolve_parameters(&BTreeMap::from([(
+                "TARGET".to_owned(),
+                "production".to_owned(),
+            )])),
+            Err(PipelineError::InvalidParameterValue { name, kind })
+                if name == "TARGET" && kind == ParameterKind::Choice
+        ));
+
+        let legacy = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "legacy-string"
+[[parameters]]
+name = "TARGET"
+default = "debug"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("legacy pipeline");
+        assert_eq!(legacy.parameters[0].kind, ParameterKind::String);
+        let serialized = toml::to_string(&legacy).expect("serialize legacy pipeline");
+        assert!(!serialized.contains("kind ="));
+    }
+
+    #[test]
+    fn typed_parameter_declarations_require_safe_shapes() {
+        let empty_choices = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "empty-choices"
+[[parameters]]
+name = "TARGET"
+kind = "choice"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect_err("choices are required");
+        assert!(matches!(
+            empty_choices,
+            PipelineError::EmptyParameterChoices(name) if name == "TARGET"
+        ));
+
+        let non_secret_password = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "public-password"
+[[parameters]]
+name = "TOKEN"
+kind = "password"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect_err("passwords must be secret");
+        assert!(matches!(
+            non_secret_password,
+            PipelineError::PasswordParameterNotSecret(name) if name == "TOKEN"
         ));
     }
 
