@@ -419,8 +419,10 @@ function App() {
       void Promise.all([loadBuildList(), loadBuildView()]);
     };
     socket.onerror = () => {
+      // A completed build may have no live event stream after a desktop
+      // restart. The HTTP engine can still be healthy, so do not turn an
+      // optional live channel failure into a global offline state.
       socket.close();
-      setEngineOnline(false);
     };
     return () => socket.close();
   }, [engineOnline, loadBuildList, loadBuildView, projectName, selectedBuild]);
