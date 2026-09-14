@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **94% verified** · `███████████████████░`<br>
-Weighted evidence score: **94.38 / 100** · displayed conservatively as the
+Weighted evidence score: **94.39 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -16,7 +16,7 @@ and unverified work remains at zero until it passes its gate.
 Last verified update: **2026-09-14** · native pipeline execution, priority-aware
 FIFO queue with pause/resume controls,
 SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
-inspection, persisted build-source identity, recursive Git submodule preparation,
+clone/inspection, persisted build-source identity, recursive Git submodule preparation,
 live queue telemetry, durable
 event replay, quiet engine offline recovery, explicit Git preparation at build
 admission, parameterized builds, local artifact storage and retention pruning,
@@ -363,7 +363,8 @@ builds, build details, persisted logs, cancellation, a live queue snapshot, dura
 and a per-build WebSocket event stream under `/api/v1/`. It also exposes
 persisted UTC cron schedules with create/list/pause/resume/delete operations,
 automatic server dispatch, Git repository inspection, and an explicit prepare
-operation for fetch/checkout/clean workflows. The server returns
+operation for fetch/checkout/clean workflows. The CLI also supports explicit
+repository cloning into a new or empty destination. The server returns
 `202 Accepted` when a build is queued. A build request may opt into Git
 fetching, revision checkout, workspace cleaning, and explicit recursive
 submodule initialization; the default remains inspection-only. Clients read
@@ -482,6 +483,8 @@ cargo run -p rivet -- scm prepare . --fetch --credential-id github \
   --credentials-file /secure/path/rivet.credentials.vault \
   --credentials-passphrase-file /secure/path/rivet.credentials.passphrase
 cargo run -p rivet -- scm prepare . --fetch --revision main --clean --submodules
+cargo run -p rivet -- scm clone https://github.com/example/project.git ./project \
+  --branch main --depth 20 --submodules
 cargo run -p rivet -- scm prepare . --fetch --credential-id deploy-key \
   --project release \
   --ssh-known-hosts-file /secure/path/known_hosts \

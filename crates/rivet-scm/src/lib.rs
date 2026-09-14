@@ -8,6 +8,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -56,6 +57,46 @@ impl Default for GitPrepareOptions {
             fetch_ref: None,
             clean: false,
             clean_ignored: false,
+            submodules: false,
+            credential_id: None,
+            known_hosts_file: None,
+        }
+    }
+}
+
+/// Explicit options for bootstrapping a repository checkout.
+///
+/// Cloning never overwrites a non-empty destination. The destination is
+/// created below an existing parent directory, and all network authentication
+/// is injected only into the short-lived Git process.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitCloneOptions {
+    pub remote: String,
+    pub destination: PathBuf,
+    /// Optional branch or tag passed to `git clone --branch`.
+    pub branch: Option<String>,
+    /// Optional shallow history depth. Values are bounded before invoking Git.
+    pub depth: Option<u32>,
+    /// Optional revision checked out after the clone completes.
+    pub revision: Option<String>,
+    /// Initialize and recursively update submodules after the requested
+    /// revision has been checked out.
+    pub submodules: bool,
+    /// Reference resolved by the hosting layer; the secret never enters this
+    /// serializable request object.
+    pub credential_id: Option<String>,
+    /// Optional operator-provided OpenSSH known-hosts policy.
+    pub known_hosts_file: Option<PathBuf>,
+}
+
+impl Default for GitCloneOptions {
+    fn default() -> Self {
+        Self {
+            remote: String::new(),
+            destination: PathBuf::new(),
+            branch: None,
+            depth: None,
+            revision: None,
             submodules: false,
             credential_id: None,
             known_hosts_file: None,
@@ -178,6 +219,8 @@ pub enum ScmError {
     InvalidRepository(PathBuf),
     #[error("path is not a Git repository: {0}")]
     NotGitRepository(PathBuf),
+    #[error("clone destination must be a new or empty directory: {0}")]
+    InvalidCloneDestination(PathBuf),
     #[error("Git {operation} failed with exit code {code:?}: {message}")]
     Command {
         operation: &'static str,
@@ -200,6 +243,84 @@ pub struct GitRepository {
 }
 
 impl GitRepository {
+    /// Clone a repository into a new or empty destination without credentials.
+    pub async fn clone_repository(options: &GitCloneOptions) -> Result<GitSnapshot, ScmError> {
+        Self::clone_repository_with_auth(options, None).await
+    }
+
+    /// Clone a repository with credentials and host-key policy scoped to the
+    /// Git child process, then return the resulting source snapshot.
+    pub async fn clone_repository_with_auth(
+        options: &GitCloneOptions,
+        credential: Option<&GitCredential>,
+    ) -> Result<GitSnapshot, ScmError> {
+        validate_clone_remote(&options.remote)?;
+        if let Some(branch) = options.branch.as_deref() {
+            validate_argument(branch, "clone branch")?;
+        }
+        if let Some(revision) = options.revision.as_deref() {
+            validate_argument(revision, "clone revision")?;
+        }
+        if let Some(depth) = options.depth {
+            if !(1..=10_000).contains(&depth) {
+                return Err(ScmError::Command {
+                    operation: "clone depth",
+                    code: None,
+                    message: "depth must be between 1 and 10000".to_owned(),
+                });
+            }
+        }
+        let destination = prepare_clone_destination(&options.destination)?;
+        let authentication =
+            git_auth_environment_with_known_hosts(credential, options.known_hosts_file.as_deref())?;
+
+        let mut args = vec![OsString::from("clone")];
+        if let Some(branch) = options.branch.as_deref() {
+            args.push(OsString::from("--branch"));
+            args.push(OsString::from(branch));
+        }
+        if let Some(depth) = options.depth {
+            args.push(OsString::from("--depth"));
+            args.push(OsString::from(depth.to_string()));
+        }
+        args.push(OsString::from("--"));
+        args.push(OsString::from(&options.remote));
+        args.push(destination.as_os_str().to_os_string());
+
+        let output = Command::new("git")
+            .args(&args)
+            .envs(&authentication.values)
+            .output()
+            .await
+            .map_err(ScmError::Filesystem)?;
+        if !output.status.success() {
+            let message =
+                redact_credential(String::from_utf8_lossy(&output.stderr).trim(), credential);
+            return Err(ScmError::Command {
+                operation: "clone",
+                code: output.status.code(),
+                message,
+            });
+        }
+
+        let repository = Self::open(&destination).await?;
+        if options.revision.is_some() || options.submodules {
+            return repository
+                .prepare_with_auth(
+                    &GitPrepareOptions {
+                        revision: options.revision.clone(),
+                        submodules: options.submodules,
+                        credential_id: options.credential_id.clone(),
+                        known_hosts_file: options.known_hosts_file.clone(),
+                        ..GitPrepareOptions::default()
+                    },
+                    credential,
+                )
+                .await;
+        }
+        repository.inspect().await
+    }
+
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, ScmError> {
         let path = path.as_ref();
         if !path.is_dir() {
@@ -655,7 +776,7 @@ fn parse_status_path(line: &str) -> Option<&str> {
 }
 
 fn validate_argument(value: &str, label: &'static str) -> Result<(), ScmError> {
-    if value.trim().is_empty() || value.contains('\0') {
+    if value.trim().is_empty() || value.contains('\0') || value.chars().any(char::is_control) {
         return Err(ScmError::Command {
             operation: label,
             code: None,
@@ -663,6 +784,51 @@ fn validate_argument(value: &str, label: &'static str) -> Result<(), ScmError> {
         });
     }
     Ok(())
+}
+
+fn validate_clone_remote(remote: &str) -> Result<(), ScmError> {
+    validate_argument(remote, "clone remote")?;
+    if remote.trim_start().starts_with('-') {
+        return Err(ScmError::Command {
+            operation: "clone remote",
+            code: None,
+            message: "remote cannot begin with '-'".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn prepare_clone_destination(destination: &Path) -> Result<PathBuf, ScmError> {
+    if destination.as_os_str().is_empty() {
+        return Err(ScmError::InvalidCloneDestination(destination.to_path_buf()));
+    }
+    let absolute = if destination.is_absolute() {
+        destination.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(destination)
+    };
+    let Some(name) = absolute.file_name() else {
+        return Err(ScmError::InvalidCloneDestination(absolute));
+    };
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| ScmError::InvalidCloneDestination(absolute.clone()))?;
+    std::fs::create_dir_all(parent)?;
+    let parent = std::fs::canonicalize(parent)?;
+    let destination = parent.join(name);
+    match std::fs::symlink_metadata(&destination) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(ScmError::InvalidCloneDestination(destination));
+            }
+            if std::fs::read_dir(&destination)?.next().is_some() {
+                return Err(ScmError::InvalidCloneDestination(destination));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ScmError::Filesystem(error)),
+    }
+    Ok(destination)
 }
 
 fn validate_refspec(refspec: &str) -> Result<(), ScmError> {
@@ -1184,6 +1350,72 @@ mod tests {
         assert_eq!(server.stats.unauthorized_requests.load(Ordering::SeqCst), 1);
         assert!(server.stats.authorized_requests.load(Ordering::SeqCst) >= 1);
         server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_clone_keeps_credentials_ephemeral() {
+        let source_dir = repository().await;
+        let remote_parent = tempfile::tempdir().expect("remote parent");
+        let remote_dir = remote_parent.path().join("fixture.git");
+        fs::create_dir(&remote_dir).expect("remote directory");
+        git(&remote_dir, &["init", "--bare", "-q"]).await;
+        let remote = remote_dir.to_str().expect("remote path");
+        git(source_dir.path(), &["remote", "add", "origin", remote]).await;
+        git(
+            source_dir.path(),
+            &["push", "-q", "origin", "HEAD:refs/heads/main"],
+        )
+        .await;
+        git(&remote_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]).await;
+        let revision = git(source_dir.path(), &["rev-parse", "HEAD"]).await;
+
+        let server = GitHttpServer::start(remote_parent.path().to_path_buf()).await;
+        let destination_parent = tempfile::tempdir().expect("destination parent");
+        let destination = destination_parent.path().join("checkout");
+        let credential = GitHttpCredential::new(HTTP_USERNAME, HTTP_SECRET).expect("credential");
+        let auth = GitCredential::HttpBasic(credential);
+        let snapshot = GitRepository::clone_repository_with_auth(
+            &GitCloneOptions {
+                remote: server.url("fixture.git"),
+                destination: destination.clone(),
+                credential_id: Some("fixture-id".into()),
+                ..GitCloneOptions::default()
+            },
+            Some(&auth),
+        )
+        .await
+        .expect("authenticated clone");
+
+        assert_eq!(snapshot.revision, revision);
+        assert_eq!(snapshot.remote, Some(server.url("fixture.git")));
+        assert!(!snapshot.dirty);
+        let config = fs::read_to_string(destination.join(".git/config")).expect("git config");
+        assert!(!config.contains(HTTP_SECRET));
+        assert!(!config.contains("Authorization"));
+        assert!(!format!("{snapshot:?}").contains(HTTP_SECRET));
+        assert_eq!(server.stats.unauthorized_requests.load(Ordering::SeqCst), 0);
+        assert!(server.stats.authorized_requests.load(Ordering::SeqCst) >= 1);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn clone_rejects_non_empty_destinations_without_mutating_them() {
+        let directory = tempfile::tempdir().expect("destination parent");
+        let destination = directory.path().join("existing");
+        fs::create_dir(&destination).expect("destination");
+        fs::write(destination.join("keep.txt"), "keep\n").expect("sentinel");
+
+        let result = GitRepository::clone_repository(&GitCloneOptions {
+            remote: "https://example.test/rivet.git".into(),
+            destination: destination.clone(),
+            ..GitCloneOptions::default()
+        })
+        .await;
+        assert!(matches!(result, Err(ScmError::InvalidCloneDestination(_))));
+        assert_eq!(
+            fs::read_to_string(destination.join("keep.txt")).unwrap(),
+            "keep\n"
+        );
     }
 
     #[tokio::test]

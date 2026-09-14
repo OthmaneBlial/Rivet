@@ -24,7 +24,8 @@ use rivet_migration::{analyze_jenkinsfile_file, generate_rivetfile_draft_file};
 use rivet_runner::execute_pipeline_with_parameters;
 use rivet_runner::{CacheStore, MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHandle, Scheduler};
 use rivet_scm::{
-    GitCredential, GitHttpCredential, GitPrepareOptions, GitRepository, GitSshCredential, ScmError,
+    GitCloneOptions, GitCredential, GitHttpCredential, GitPrepareOptions, GitRepository,
+    GitSshCredential, ScmError,
 };
 use rivet_storage::{SchedulePollConfig, ScheduleTrigger, Storage};
 use serde::{Deserialize, Serialize};
@@ -786,6 +787,38 @@ struct AgentArgs {
 enum ScmCommand {
     /// Print the current Git revision, branch, remote, and worktree state.
     Inspect { repository: PathBuf },
+    /// Clone a Git repository into a new or empty destination.
+    Clone {
+        remote: String,
+        destination: PathBuf,
+        /// Project context used to authorize a scoped credential.
+        #[arg(long)]
+        project: Option<String>,
+        /// Clone a branch or tag instead of the remote's default branch.
+        #[arg(long, conflicts_with = "revision")]
+        branch: Option<String>,
+        /// Check out this revision after cloning.
+        #[arg(long, conflicts_with = "branch")]
+        revision: Option<String>,
+        /// Request a shallow clone with this bounded history depth.
+        #[arg(long)]
+        depth: Option<u32>,
+        /// Initialize and recursively update Git submodules after checkout.
+        #[arg(long)]
+        submodules: bool,
+        /// Resolve this non-secret ID from an encrypted vault before cloning.
+        #[arg(long)]
+        credential_id: Option<String>,
+        /// Encrypted SCM credential vault used with --credential-id.
+        #[arg(long, requires = "credential_id")]
+        credentials_file: Option<PathBuf>,
+        /// Private passphrase file used with --credential-id.
+        #[arg(long, requires = "credential_id")]
+        credentials_passphrase_file: Option<PathBuf>,
+        /// Use this OpenSSH known-hosts file for strict SSH host-key verification.
+        #[arg(long)]
+        ssh_known_hosts_file: Option<PathBuf>,
+    },
     /// Optionally fetch, checkout, and clean before printing the final state.
     Prepare {
         repository: PathBuf,
@@ -2388,6 +2421,42 @@ fn default_agent_workspace_root() -> PathBuf {
 async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Error>> {
     let (repository_path, options, credential) = match command {
         ScmCommand::Inspect { repository } => (repository, None, None),
+        ScmCommand::Clone {
+            remote,
+            destination,
+            project,
+            branch,
+            revision,
+            depth,
+            submodules,
+            credential_id,
+            credentials_file,
+            credentials_passphrase_file,
+            ssh_known_hosts_file,
+        } => {
+            let credential = load_git_credential(
+                credential_id.as_deref(),
+                credentials_file.as_deref(),
+                credentials_passphrase_file.as_deref(),
+                project.as_deref(),
+            )?;
+            let snapshot = GitRepository::clone_repository_with_auth(
+                &GitCloneOptions {
+                    remote,
+                    destination,
+                    branch,
+                    depth,
+                    revision,
+                    submodules,
+                    credential_id,
+                    known_hosts_file: ssh_known_hosts_file,
+                },
+                credential.as_ref(),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            return Ok(());
+        }
         ScmCommand::Prepare {
             repository,
             project,

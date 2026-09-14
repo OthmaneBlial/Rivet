@@ -387,6 +387,7 @@ impl IntoResponse for ApiError {
             Self::Scm(error) => match error {
                 rivet_scm::ScmError::InvalidRepository(_)
                 | rivet_scm::ScmError::NotGitRepository(_)
+                | rivet_scm::ScmError::InvalidCloneDestination(_)
                 | rivet_scm::ScmError::InvalidCredential(_)
                 | rivet_scm::ScmError::InvalidHostKeyPolicy(_) => StatusCode::BAD_REQUEST,
                 rivet_scm::ScmError::Command { .. }
