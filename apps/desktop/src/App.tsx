@@ -42,6 +42,7 @@ import {
   updateSchedule,
 } from "./api";
 import type {
+  AgentCapabilities,
   AgentSummary,
   ArtifactRecord,
   BuildDetails,
@@ -1840,7 +1841,7 @@ function AgentsPanel({ agents, online }: { agents: AgentSummary[]; online: boole
                   <div className="agent-identity"><strong>{agent.name}</strong><small>{agent.agent_id.slice(0, 8)} · heartbeat #{agent.last_sequence}</small></div>
                   <div className="agent-capability"><span className="overline">Platform</span><strong>{agent.capabilities.os} · {agent.capabilities.arch}</strong></div>
                   <div className="agent-capability agent-labels"><span className="overline">Labels</span><strong>{agent.capabilities.labels.length ? agent.capabilities.labels.join(" · ") : "none"}</strong></div>
-                  <div className="agent-capacity"><span className="overline">Capacity</span><strong>{agent.available_executors} / {agent.capabilities.executors}</strong><small>{agent.running.length} running · {agent.reserved?.length ?? 0} reserved · {agent.capabilities.docker ? "Docker" : "Native"}</small></div>
+                  <div className="agent-capacity"><span className="overline">Capacity</span><strong>{agent.available_executors} / {agent.capabilities.executors}</strong><small>{agent.running.length} running · {agent.reserved?.length ?? 0} reserved · {agent.capabilities.docker ? "Docker" : "Native"}</small><small>{formatAgentResources(agent.capabilities)}</small></div>
                   <span className="agent-state">{statusLabel}</span>
                 </article>
               );
@@ -1851,6 +1852,15 @@ function AgentsPanel({ agents, online }: { agents: AgentSummary[]; online: boole
       <p className="agent-boundary"><span />Capacity discovery, assignment, remote execution, artifact transfer, one bounded replacement attempt, and durable event replay are verified locally.</p>
     </div>
   );
+}
+
+function formatAgentResources(capabilities: AgentCapabilities): string {
+  const resources = [
+    capabilities.cpu_cores ? `${capabilities.cpu_cores} CPU` : null,
+    capabilities.memory_mb ? `${capabilities.memory_mb} MiB RAM` : null,
+    capabilities.disk_mb ? `${capabilities.disk_mb} MiB disk` : null,
+  ].filter((resource): resource is string => resource !== null);
+  return resources.length ? resources.join(" · ") : "resource dimensions not advertised";
 }
 
 function ExtensionsPanel({

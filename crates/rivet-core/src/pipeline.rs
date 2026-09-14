@@ -8,6 +8,7 @@ const MAX_AGENT_REQUIREMENT_VALUE_BYTES: usize = 64;
 const MAX_AGENT_REQUIREMENT_LABELS: usize = 64;
 const MAX_AGENT_CPU_CORES: u16 = 4096;
 const MAX_AGENT_MEMORY_MB: u64 = 4 * 1024 * 1024;
+const MAX_AGENT_DISK_MB: u64 = 16 * 1024 * 1024;
 const MAX_ENVIRONMENT_VARIABLES: usize = 128;
 const MAX_ENVIRONMENT_NAME_BYTES: usize = 256;
 const MAX_ENVIRONMENT_VALUE_BYTES: usize = 16 * 1024;
@@ -241,6 +242,9 @@ pub struct AgentRequirement {
     /// An omitted value means the pipeline has no memory-specific requirement.
     #[serde(default)]
     pub memory_mb: Option<u64>,
+    /// Minimum free disk capacity in MiB required by the step's workspace.
+    #[serde(default)]
+    pub disk_mb: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -328,6 +332,12 @@ pub enum PipelineError {
     InvalidAgentCpuCores { stage: String, step: String },
     #[error("agent requirement memory_mb for step {step:?} in stage {stage:?} is too large")]
     InvalidAgentMemory { stage: String, step: String },
+    #[error(
+        "agent requirement disk_mb for step {step:?} in stage {stage:?} must request at least one MiB"
+    )]
+    ZeroAgentDisk { stage: String, step: String },
+    #[error("agent requirement disk_mb for step {step:?} in stage {stage:?} is too large")]
+    InvalidAgentDisk { stage: String, step: String },
     #[error("workspace escapes the repository root: {0}")]
     WorkspaceOutsideRepository(PathBuf),
     #[error("workspace does not exist: {0}")]
@@ -837,6 +847,18 @@ impl Pipeline {
                     }
                     if agent.memory_mb == Some(0) {
                         return Err(PipelineError::ZeroAgentMemory {
+                            stage: stage.name.clone(),
+                            step: step.name.clone(),
+                        });
+                    }
+                    if agent.disk_mb == Some(0) {
+                        return Err(PipelineError::ZeroAgentDisk {
+                            stage: stage.name.clone(),
+                            step: step.name.clone(),
+                        });
+                    }
+                    if agent.disk_mb.is_some_and(|disk| disk > MAX_AGENT_DISK_MB) {
+                        return Err(PipelineError::InvalidAgentDisk {
                             stage: stage.name.clone(),
                             step: step.name.clone(),
                         });
@@ -1381,6 +1403,7 @@ labels = ["large-memory"]
 executors = 2
 cpu_cores = 4
 memory_mb = 8192
+disk_mb = 16384
 "#,
         )
         .expect("remote requirement is valid");
@@ -1392,6 +1415,7 @@ memory_mb = 8192
         assert_eq!(requirement.executors, Some(2));
         assert_eq!(requirement.cpu_cores, Some(4));
         assert_eq!(requirement.memory_mb, Some(8192));
+        assert_eq!(requirement.disk_mb, Some(16384));
 
         let invalid = Pipeline::from_toml_str(
             r#"
@@ -1446,6 +1470,22 @@ memory_mb = 5_000_000
             invalid_memory,
             PipelineError::InvalidAgentMemory { .. }
         ));
+
+        let invalid_disk = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "invalid-remote-disk"
+[[stages]]
+name = "Build"
+[[stages.steps]]
+name = "compile"
+program = "true"
+[stages.steps.agent]
+disk_mb = 0
+"#,
+        )
+        .expect_err("zero remote disk must be rejected");
+        assert!(matches!(invalid_disk, PipelineError::ZeroAgentDisk { .. }));
     }
 
     #[test]

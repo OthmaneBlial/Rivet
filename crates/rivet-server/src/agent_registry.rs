@@ -39,6 +39,7 @@ pub struct AgentSummary {
     pub available_executors: u16,
     pub available_cpu_cores: Option<u16>,
     pub available_memory_mb: Option<u64>,
+    pub available_disk_mb: Option<u64>,
     pub status: AgentStatus,
 }
 
@@ -103,6 +104,7 @@ struct ReservedResources {
     executors: u16,
     cpu_cores: u16,
     memory_mb: u64,
+    disk_mb: u64,
 }
 
 impl Default for AgentRegistry {
@@ -282,6 +284,7 @@ impl AgentRegistry {
                 executors: requested,
                 cpu_cores: requirements.requested_cpu_cores(),
                 memory_mb: requirements.requested_memory_mb(),
+                disk_mb: requirements.requested_disk_mb(),
             },
         );
         Ok(AgentReservation {
@@ -319,6 +322,7 @@ impl AgentRegistry {
                 executors: requested,
                 cpu_cores: requirements.requested_cpu_cores(),
                 memory_mb: requirements.requested_memory_mb(),
+                disk_mb: requirements.requested_disk_mb(),
             },
         );
         Ok(AgentReservation {
@@ -408,6 +412,7 @@ fn summary(entry: &AgentEntry, status: AgentStatus) -> AgentSummary {
         available_executors: available_executors(entry),
         available_cpu_cores: available_cpu_cores(entry),
         available_memory_mb: available_memory_mb(entry),
+        available_disk_mb: available_disk_mb(entry),
         status,
     }
 }
@@ -439,6 +444,8 @@ fn resources_available(entry: &AgentEntry, requirements: &AgentRequirements) -> 
         available_cpu_cores(entry).is_some_and(|available| available >= required)
     }) && requirements.memory_mb.is_none_or(|required| {
         available_memory_mb(entry).is_some_and(|available| available >= required)
+    }) && requirements.disk_mb.is_none_or(|required| {
+        available_disk_mb(entry).is_some_and(|available| available >= required)
     })
 }
 
@@ -475,6 +482,19 @@ fn available_memory_mb(entry: &AgentEntry) -> Option<u64> {
     Some(capacity.saturating_sub(reserved))
 }
 
+fn available_disk_mb(entry: &AgentEntry) -> Option<u64> {
+    let capacity = entry.capabilities.disk_mb?;
+    if has_unreserved_running_build(entry) {
+        return Some(0);
+    }
+    let reserved = entry
+        .reserved
+        .values()
+        .map(|resources| resources.disk_mb)
+        .sum::<u64>();
+    Some(capacity.saturating_sub(reserved))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +513,7 @@ mod tests {
                 executors: 2,
                 cpu_cores: Some(8),
                 memory_mb: Some(16 * 1024),
+                disk_mb: Some(128 * 1024),
             },
         }
     }
@@ -638,6 +659,7 @@ mod tests {
                     executors: Some(2),
                     cpu_cores: Some(4),
                     memory_mb: Some(8 * 1024),
+                    disk_mb: Some(64 * 1024),
                 },
                 now,
             )
@@ -679,6 +701,7 @@ mod tests {
                 &AgentRequirements {
                     cpu_cores: Some(6),
                     memory_mb: Some(12 * 1024),
+                    disk_mb: Some(64 * 1024),
                     ..AgentRequirements::default()
                 },
                 Uuid::new_v4(),
@@ -693,6 +716,7 @@ mod tests {
             .expect("available resource summary");
         assert_eq!(available_summary.available_cpu_cores, Some(2));
         assert_eq!(available_summary.available_memory_mb, Some(4 * 1024));
+        assert_eq!(available_summary.available_disk_mb, Some(64 * 1024));
         assert!(
             registry
                 .matching(

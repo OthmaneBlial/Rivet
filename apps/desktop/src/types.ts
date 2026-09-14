@@ -192,6 +192,9 @@ export interface AgentCapabilities {
   docker: boolean;
   labels: string[];
   executors: number;
+  cpu_cores?: number | null;
+  memory_mb?: number | null;
+  disk_mb?: number | null;
 }
 
 export interface AgentSummary {
@@ -205,6 +208,9 @@ export interface AgentSummary {
   running: string[];
   reserved?: string[];
   available_executors: number;
+  available_cpu_cores?: number | null;
+  available_memory_mb?: number | null;
+  available_disk_mb?: number | null;
   status: AgentStatus;
 }
 

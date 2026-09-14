@@ -119,7 +119,7 @@ claim arbitrary Jenkins plugin compatibility.
 ### Add capacity without losing the signal
 
 Remote agents register through a versioned authenticated protocol, advertise
-executor/CPU/memory capabilities, receive compatible assignments, run through
+executor/CPU/memory/disk capabilities, receive compatible assignments, run through
 the shared Rust pipeline runner, and relay typed events, output, cancellation,
 artifacts, and bounded retry/recovery state.
 

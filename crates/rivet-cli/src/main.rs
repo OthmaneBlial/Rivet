@@ -882,6 +882,10 @@ struct AgentArgs {
     /// specific pipeline requirements will not match this agent.
     #[arg(long)]
     memory_mb: Option<u64>,
+    /// Optional allocatable disk capacity in MiB. If omitted, disk-specific
+    /// pipeline requirements will not match this agent.
+    #[arg(long)]
+    disk_mb: Option<u64>,
     /// Read a Bearer token from a private file without persisting it.
     #[arg(long)]
     token_file: Option<PathBuf>,
@@ -1852,6 +1856,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
             executors: args.executors,
             cpu_cores: args.cpu_cores,
             memory_mb: args.memory_mb,
+            disk_mb: args.disk_mb,
         },
     };
     registration.validate()?;

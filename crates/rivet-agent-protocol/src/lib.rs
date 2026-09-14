@@ -26,6 +26,7 @@ const MAX_RUNNING_BUILDS: usize = 256;
 const MAX_REQUIREMENT_VALUE_BYTES: usize = 64;
 const MAX_CPU_CORES: u16 = 4096;
 const MAX_MEMORY_MB: u64 = 4 * 1024 * 1024;
+const MAX_DISK_MB: u64 = 16 * 1024 * 1024;
 pub const MAX_WORKSPACE_CHUNK_BYTES: usize = 128 * 1024;
 pub const MAX_WORKSPACE_FILES: u32 = 100_000;
 pub const MAX_WORKSPACE_BYTES: u64 = 512 * 1024 * 1024;
@@ -47,6 +48,9 @@ pub struct AgentCapabilities {
     /// memory requirement.
     #[serde(default)]
     pub memory_mb: Option<u64>,
+    /// Optional allocatable disk capacity in MiB for workspace reservations.
+    #[serde(default)]
+    pub disk_mb: Option<u64>,
 }
 
 impl AgentCapabilities {
@@ -62,6 +66,7 @@ impl AgentCapabilities {
         }
         validate_capacity(self.cpu_cores, "cpu_cores")?;
         validate_memory(self.memory_mb, "memory_mb")?;
+        validate_disk(self.disk_mb)?;
         if self.labels.len() > MAX_LABELS {
             return Err(ProtocolError::TooManyLabels);
         }
@@ -98,6 +103,9 @@ impl AgentCapabilities {
                 self.memory_mb
                     .is_some_and(|available| available >= required)
             })
+            && requirements
+                .disk_mb
+                .is_none_or(|required| self.disk_mb.is_some_and(|available| available >= required))
     }
 }
 
@@ -117,6 +125,9 @@ pub struct AgentRequirements {
     pub cpu_cores: Option<u16>,
     #[serde(default)]
     pub memory_mb: Option<u64>,
+    /// Minimum disk capacity in MiB required by the build workspace.
+    #[serde(default)]
+    pub disk_mb: Option<u64>,
 }
 
 impl AgentRequirements {
@@ -151,6 +162,11 @@ impl AgentRequirements {
             ProtocolError::MemoryTooLarge(_) => ProtocolError::RequiredMemoryTooLarge,
             other => other,
         })?;
+        validate_disk(self.disk_mb).map_err(|error| match error {
+            ProtocolError::ZeroDisk => ProtocolError::ZeroRequiredDisk,
+            ProtocolError::DiskTooLarge => ProtocolError::RequiredDiskTooLarge,
+            other => other,
+        })?;
         Ok(())
     }
 
@@ -170,6 +186,10 @@ impl AgentRequirements {
     pub fn requested_memory_mb(&self) -> u64 {
         self.memory_mb.unwrap_or(0)
     }
+
+    pub fn requested_disk_mb(&self) -> u64 {
+        self.disk_mb.unwrap_or(0)
+    }
 }
 
 impl From<&AgentRequirement> for AgentRequirements {
@@ -182,6 +202,7 @@ impl From<&AgentRequirement> for AgentRequirements {
             executors: requirement.executors,
             cpu_cores: requirement.cpu_cores,
             memory_mb: requirement.memory_mb,
+            disk_mb: requirement.disk_mb,
         }
     }
 }
@@ -541,6 +562,10 @@ pub enum ProtocolError {
     ZeroMemory(&'static str),
     #[error("agent memory capability {0} exceeds the protocol limit")]
     MemoryTooLarge(&'static str),
+    #[error("agent disk capability must be positive")]
+    ZeroDisk,
+    #[error("agent disk capability exceeds the protocol limit")]
+    DiskTooLarge,
     #[error("agent requirement cpu_cores must be positive")]
     ZeroRequiredCpuCores,
     #[error("agent requirement cpu_cores exceeds the protocol limit")]
@@ -549,6 +574,10 @@ pub enum ProtocolError {
     ZeroRequiredMemory,
     #[error("agent requirement memory_mb exceeds the protocol limit")]
     RequiredMemoryTooLarge,
+    #[error("agent requirement disk_mb must be positive")]
+    ZeroRequiredDisk,
+    #[error("agent requirement disk_mb exceeds the protocol limit")]
+    RequiredDiskTooLarge,
     #[error("workspace transfer exceeds the protocol size limit")]
     WorkspaceTooLarge,
     #[error("workspace transfer contains too many files")]
@@ -628,6 +657,19 @@ fn validate_memory(value: Option<u64>, field: &'static str) -> Result<(), Protoc
     Ok(())
 }
 
+fn validate_disk(value: Option<u64>) -> Result<(), ProtocolError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value == 0 {
+        return Err(ProtocolError::ZeroDisk);
+    }
+    if value > MAX_DISK_MB {
+        return Err(ProtocolError::DiskTooLarge);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,6 +683,7 @@ mod tests {
             executors: 4,
             cpu_cores: Some(8),
             memory_mb: Some(16 * 1024),
+            disk_mb: Some(128 * 1024),
         }
     }
 
@@ -763,6 +806,9 @@ program = "true"
             registration.validate(),
             Err(ProtocolError::ZeroMemory("memory_mb"))
         );
+        registration.capabilities.memory_mb = None;
+        registration.capabilities.disk_mb = Some(0);
+        assert_eq!(registration.validate(), Err(ProtocolError::ZeroDisk));
     }
 
     #[test]
@@ -776,6 +822,7 @@ program = "true"
             executors: Some(2),
             cpu_cores: Some(4),
             memory_mb: Some(8 * 1024),
+            disk_mb: Some(64 * 1024),
         };
         requirements.validate().expect("valid requirements");
         assert!(capabilities.supports(&requirements));
@@ -793,6 +840,14 @@ program = "true"
         }));
         assert!(!capabilities.supports(&AgentRequirements {
             memory_mb: Some(32 * 1024),
+            ..AgentRequirements::default()
+        }));
+        assert!(capabilities.supports(&AgentRequirements {
+            disk_mb: Some(64 * 1024),
+            ..AgentRequirements::default()
+        }));
+        assert!(!capabilities.supports(&AgentRequirements {
+            disk_mb: Some(256 * 1024),
             ..AgentRequirements::default()
         }));
     }
@@ -832,6 +887,14 @@ program = "true"
             .validate(),
             Err(ProtocolError::ZeroRequiredMemory)
         );
+        assert_eq!(
+            AgentRequirements {
+                disk_mb: Some(0),
+                ..AgentRequirements::default()
+            }
+            .validate(),
+            Err(ProtocolError::ZeroRequiredDisk)
+        );
     }
 
     #[test]
@@ -844,6 +907,7 @@ program = "true"
             executors: Some(2),
             cpu_cores: Some(4),
             memory_mb: Some(8192),
+            disk_mb: Some(16384),
         };
         let wire = AgentRequirements::from(&pipeline_requirement);
         assert_eq!(wire.os.as_deref(), Some("linux"));
@@ -853,6 +917,7 @@ program = "true"
         assert_eq!(wire.executors, Some(2));
         assert_eq!(wire.cpu_cores, Some(4));
         assert_eq!(wire.memory_mb, Some(8192));
+        assert_eq!(wire.disk_mb, Some(16384));
     }
 
     #[test]

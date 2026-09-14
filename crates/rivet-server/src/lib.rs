@@ -7958,6 +7958,7 @@ program = "true"
                         executors: 2,
                         cpu_cores: Some(8),
                         memory_mb: Some(16 * 1024),
+                        disk_mb: Some(128 * 1024),
                     },
                 },
                 Utc::now(),
@@ -8167,6 +8168,7 @@ program = "true"
                 executors: 1,
                 cpu_cores: Some(4),
                 memory_mb: Some(8 * 1024),
+                disk_mb: Some(64 * 1024),
             },
         });
         socket
@@ -8304,6 +8306,7 @@ program = "true"
                     executors: 1,
                     cpu_cores: Some(4),
                     memory_mb: Some(8 * 1024),
+                    disk_mb: Some(64 * 1024),
                 },
             }));
         socket
@@ -8501,6 +8504,7 @@ agent = { os = "macos", arch = "aarch64", labels = ["recovery"] }
                         executors: 1,
                         cpu_cores: Some(4),
                         memory_mb: Some(8 * 1024),
+                        disk_mb: Some(64 * 1024),
                     },
                 },
                 Utc::now(),
