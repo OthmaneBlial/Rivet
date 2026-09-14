@@ -40,6 +40,7 @@ done
 
 grep -Fq "ROADMAP.md" .github/ISSUE_TEMPLATE/bug_report.md
 grep -Fq "SECURITY.md" SUPPORT.md
+grep -Fq "github.com/OthmaneBlial/Rivet/discussions" SUPPORT.md
 grep -Fq "Security Advisory" .github/ISSUE_TEMPLATE/config.yml
 
 if rg -n 'base/' README.md ROADMAP.md compat >/dev/null 2>&1; then

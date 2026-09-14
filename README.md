@@ -26,6 +26,7 @@ and full Jenkins parity are not claimed.
   <a href="https://github.com/OthmaneBlial/Rivet/releases">Download</a> ·
   <a href="ROADMAP.md">Roadmap</a> ·
   <a href="https://github.com/OthmaneBlial/Rivet/issues">Issues</a> ·
+  <a href="https://github.com/OthmaneBlial/Rivet/discussions">Discussions</a> ·
   <a href="CONTRIBUTING.md">Contributing</a> ·
   <a href="SUPPORT.md">Support</a> ·
   <a href="CODE_OF_CONDUCT.md">Code of Conduct</a> ·

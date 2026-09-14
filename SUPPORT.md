@@ -6,8 +6,9 @@ and existing GitHub issues.
 
 ## Questions and usage help
 
-Open a GitHub issue with the `question` label when the answer will help other
-Rivet users. Include the Rivet version or commit, operating system and
+Start a [GitHub Discussion](https://github.com/OthmaneBlial/Rivet/discussions)
+for questions and usage help; open an issue with the `question` label when the
+question includes a reproducible defect. Include the Rivet version or commit, operating system and
 architecture, the CLI/desktop/server surface, and the smallest sanitized
 reproduction. Never include provider tokens, private keys, passwords, customer
 repositories, or real hostnames.
