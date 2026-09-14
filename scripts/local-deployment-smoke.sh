@@ -11,10 +11,15 @@ fi
 
 deployment_dir=$(mktemp -d "${TMPDIR:-/tmp}/rivet-deployment.XXXXXX")
 server_pid=""
+admin_server_pid=""
 cleanup() {
     if [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; then
         kill -TERM "$server_pid" 2>/dev/null || true
         wait "$server_pid" 2>/dev/null || true
+    fi
+    if [ -n "$admin_server_pid" ] && kill -0 "$admin_server_pid" 2>/dev/null; then
+        kill -TERM "$admin_server_pid" 2>/dev/null || true
+        wait "$admin_server_pid" 2>/dev/null || true
     fi
     rm -rf -- "$deployment_dir"
 }
@@ -112,6 +117,45 @@ server_pid=""
 rg -Fq 'Rivet server shutdown requested' "$server_log"
 
 public_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+admin_data_dir="$deployment_dir/admin-data"
+admin_server_log="$deployment_dir/admin-server.log"
+admin_shutdown_body="$deployment_dir/admin-shutdown.json"
+admin_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+RUST_LOG=info "$release_binary" --data-dir "$admin_data_dir" server \
+    --bind "127.0.0.1:$admin_port" --token-file "$token_file" \
+    > "$admin_server_log" 2>&1 &
+admin_server_pid=$!
+
+attempt=0
+while [ "$attempt" -lt 80 ]; do
+    if curl -fsS "http://127.0.0.1:$admin_port/api/v1/health" >/dev/null 2>&1; then
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+test "$attempt" -lt 80
+
+shutdown_status=$(curl -sS -o "$admin_shutdown_body" -w '%{http_code}' \
+    -X POST \
+    -H "authorization: Bearer $token" \
+    "http://127.0.0.1:$admin_port/api/v1/admin/shutdown")
+test "$shutdown_status" = "202"
+jq -e '.status == "shutdown_requested"' "$admin_shutdown_body" >/dev/null
+
+attempt=0
+while kill -0 "$admin_server_pid" 2>/dev/null && [ "$attempt" -lt 80 ]; do
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+if kill -0 "$admin_server_pid" 2>/dev/null; then
+    printf '%s\n' "local deployment smoke refused: admin shutdown did not stop the server" >&2
+    exit 1
+fi
+wait "$admin_server_pid"
+admin_server_pid=""
+rg -Fq 'shutdown requested through the admin API' "$admin_server_log"
+
 if "$release_binary" --data-dir "$deployment_dir/public-data" server \
     --bind "0.0.0.0:$public_port" > "$public_bind_log" 2>&1; then
     printf '%s\n' "local deployment smoke refused: unauthenticated public bind was accepted" >&2

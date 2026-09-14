@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **95% verified** · `███████████████████░`<br>
-Weighted evidence score: **95.02 / 100** · displayed conservatively as the
+Weighted evidence score: **95.03 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -92,7 +92,7 @@ checking its embedded loopback engine, exercises real SCM clone plus
 create-project/run/history/inspect/logs workflows against temporary data,
 exercises a real server queue with priority ordering and queued cancellation,
 captures live compatibility snapshots, exercises authenticated local deployment
-hardening, verifies a checksum-backed local backup/restore of SQLite state and
+hardening including an administrator shutdown operation, verifies a checksum-backed local backup/restore of SQLite state and
 stored artifacts with a non-destructive replacement path, copies the CLI into a
 temporary release directory, and writes a
 versioned SHA-256 manifest:
@@ -112,13 +112,17 @@ their own exact `--allow-origin` values and authentication.
 
 The deployment smoke checks public health/readiness, token-protected API
 routes, exact security/request-ID headers, rejects an unauthenticated public
-bind, verifies graceful SIGTERM shutdown, and checks that the token is absent
-from server logs and persisted data. This produces a locally verifiable
-artifact, not a signed installer, store submission, or hosted CI result.
+bind, verifies graceful SIGTERM shutdown and an authenticated administrator
+shutdown operation, and checks that the token is absent from server logs and
+persisted data. This produces a locally verifiable artifact, not a signed
+installer, store submission, or hosted CI result.
 
 The headless server handles SIGINT/SIGTERM with a graceful HTTP shutdown and
-stops its schedule dispatcher after the listener closes. Rivet's extension
-surface is intentionally a separate, versioned contract.
+stops its schedule dispatcher after the listener closes. Authenticated
+administrators can request the same lifecycle operation with
+`POST /api/v1/admin/shutdown`; the server returns `202` only after the global
+`administer` permission check. Rivet's extension surface is intentionally a
+separate, versioned contract.
 `rivet-extension-protocol` validates WASM or direct-subprocess manifests,
 declared permissions, relative entrypoints, and bounded length-prefixed JSON
 frames. An optional local manifest directory is loaded with strict regular

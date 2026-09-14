@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **95 / 100 points** (**95.02 weighted evidence
+The current verified total is **95 / 100 points** (**95.03 weighted evidence
 points**, displayed conservatively as 95%).
 
 | Workstream | Weight | Current state | Gate for completion |
@@ -15,7 +15,7 @@ points**, displayed conservatively as 95%).
 | Native process runner | 6 | verified | stdout/stderr streaming with bounded 64 KiB line retention, timeout, cancellation, process-group cleanup tests |
 | Queue and scheduler | 6 | partial | FIFO tie ordering, bounded priorities, global/per-project limits, live telemetry, priority-ordered queue snapshots with a rendered queue control room, pre-execution cancellation, authenticated pause/resume administration, executor/CPU/memory-aware remote resource reservations, dependency-ordered stage graph admission, and parallel independent stage execution pass; richer local resource dimensions remain |
 | SQLite persistence | 6 | verified | Migration, build graph projection, reopen/history test |
-| API and live transport | 6 | partial | REST/loopback WebSocket, public liveness/readiness probes with a read-only SQLite check, durable event replay, queue telemetry, build retry, schedule endpoints/dispatch, graceful SIGINT/SIGTERM shutdown, safe request IDs with structured method/route/status tracing, exact CORS allow-list, body limits, security headers, policy-backed identity/project authorization pass, and an authenticated bounded Prometheus-compatible metrics surface; deployment operations remain |
+| API and live transport | 6 | verified | REST/loopback WebSocket, public liveness/readiness probes with a read-only SQLite check, durable event replay, queue telemetry, build retry, schedule endpoints/dispatch, graceful SIGINT/SIGTERM shutdown, authenticated administrator shutdown operations, safe request IDs with structured method/route/status tracing, exact CORS allow-list, body limits, security headers, policy-backed identity/project authorization pass, and an authenticated bounded Prometheus-compatible metrics surface |
 | CLI operator workflow | 3 | verified | project/run/history, local and remote project bootstrap, parameterized builds, artifact listing, retry, schedule management, detailed build inspection, and one-shot authenticated remote build cancellation command |
 | Tauri desktop control room | 10 | partial | native bundle, embedded engine health, rendered light-default/dark-toggle UX, artifact/retry views, schedule controls, desktop SCM preparation and runtime parameter controls, credential lifecycle view, online/offline recovery, real client build flow, and an ephemeral loopback engine origin in the packaged launch pass; final Tauri-window interaction and release QA remain |
 | Git/SCM integration | 8 | partial | direct Git clone/inspect/checkout/fetch/clean/submodule operations, server-side and CLI project bootstrap cloning into explicit destinations, bounded provider refspec fetches, REST/CLI surfaces, explicit build-admission preparation, persisted build source identity, provider-neutral credential IDs, ephemeral HTTP/SSH auth handoff, project-scoped credential resolution, provider push/PR adapters, strict deployment-controlled SSH host-key policy, and fixture-backed authenticated clone/fetch/checkout/clean/submodule secret-boundary test pass; broader provider lifecycle remains |
@@ -39,8 +39,7 @@ by evidence, and “verified” receives the full workstream weight. A local bui
 scaffold, passing unrelated test, or interface alone does not complete a gate.
 
 The next gates are the final Tauri-window
-flow inside the packaged app, API
-deployment hardening, broader provider lifecycle and deployment-specific keychain policy coverage, user
+flow inside the packaged app, broader provider lifecycle and deployment-specific keychain policy coverage, user
 accounts and external identity providers, a permanent differential regression
 corpus captured from deployed Jenkins, broader repository-event
 mapping and upstream provider triggers, full Groovy/plugin migration
