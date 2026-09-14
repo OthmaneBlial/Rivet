@@ -540,6 +540,9 @@ enum CredentialCommand {
         passphrase_file: PathBuf,
         #[arg(long)]
         vault_file: Option<PathBuf>,
+        /// Show only credentials owned by this identity.
+        #[arg(long)]
+        owner: Option<String>,
     },
     /// Remove one credential from the encrypted vault.
     Remove {
@@ -3734,11 +3737,21 @@ fn manage_credentials(
         CredentialCommand::List {
             passphrase_file,
             vault_file,
+            owner,
         } => {
             let vault_path = vault_file.unwrap_or_else(|| data_dir.join("credentials.vault"));
             let passphrase = read_private_value(&passphrase_file, "credential vault passphrase")?;
             let vault = CredentialVault::open(&vault_path, passphrase)?;
+            let owner = owner
+                .map(|owner| validate_owner_filter(&owner).map(|_| owner))
+                .transpose()?;
             for credential in vault.list() {
+                if owner
+                    .as_deref()
+                    .is_some_and(|owner| owner != credential.owner)
+                {
+                    continue;
+                }
                 let scope = if credential.projects.is_empty() {
                     "*".to_owned()
                 } else {
@@ -4534,6 +4547,16 @@ fn print_event(event: &BuildEvent) {
     }
 }
 
+fn validate_owner_filter(owner: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if owner.trim().is_empty() || owner.len() > 256 || owner.chars().any(char::is_control) {
+        return Err(
+            "credential owner filter must be non-empty, bounded, and free of control characters"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn status_label<T>(status: &T) -> &'static str
 where
     T: StatusLabel,
@@ -4587,6 +4610,14 @@ impl StatusLabel for rivet_core::StepStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_owner_filter_is_bounded_and_rejects_control_input() {
+        assert!(validate_owner_filter("user:42").is_ok());
+        assert!(validate_owner_filter("").is_err());
+        assert!(validate_owner_filter("user\n42").is_err());
+        assert!(validate_owner_filter(&"x".repeat(257)).is_err());
+    }
 
     #[test]
     fn cancel_endpoint_appends_encoded_build_route_to_a_base_url() {
