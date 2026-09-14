@@ -135,6 +135,12 @@ pub enum StorageError {
     MissingPipelineTriggerDelivery,
     #[error("invalid pipeline trigger enabled flag in database: {0}")]
     InvalidPipelineTriggerEnabled(i64),
+    #[error("provider trigger {field} is empty, too long, or contains control characters")]
+    InvalidProviderTriggerSelector { field: &'static str },
+    #[error("invalid provider trigger enabled flag in database: {0}")]
+    InvalidProviderTriggerEnabled(i64),
+    #[error("provider trigger delivery does not exist")]
+    MissingProviderTriggerDelivery,
     #[error("audit {field} is empty, too long, or contains control characters")]
     InvalidAuditField { field: &'static str },
     #[error("authentication session token digest is invalid")]
@@ -332,6 +338,18 @@ pub struct PipelineTriggerRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderTriggerRecord {
+    pub id: Uuid,
+    pub downstream_project_id: ProjectId,
+    pub provider: String,
+    pub source_repository: String,
+    /// `None` matches any supported pipeline/workflow name for the provider.
+    pub source_pipeline: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditEventRecord {
     pub sequence: i64,
     pub timestamp: DateTime<Utc>,
@@ -499,6 +517,11 @@ impl Storage {
             &connection,
             19,
             Some(include_str!("../migrations/019_pipeline_triggers.sql")),
+        )?;
+        apply_migration(
+            &connection,
+            20,
+            Some(include_str!("../migrations/020_provider_triggers.sql")),
         )?;
         backfill_event_hashes(&connection)?;
         Ok(Self {
@@ -1238,6 +1261,195 @@ impl Storage {
             Ok((parse_pipeline_trigger(raw)?, parse_uuid(&build_id)?))
         })
         .collect()
+    }
+
+    pub fn create_provider_trigger(
+        &self,
+        downstream_project_id: ProjectId,
+        provider: &str,
+        source_repository: &str,
+        source_pipeline: Option<&str>,
+    ) -> Result<Option<ProviderTriggerRecord>, StorageError> {
+        let provider = normalize_provider_trigger_selector(provider, "provider")?;
+        let source_repository =
+            normalize_provider_trigger_selector(source_repository, "source_repository")?;
+        let source_pipeline = source_pipeline
+            .map(|value| normalize_provider_trigger_selector(value, "source_pipeline"))
+            .transpose()?
+            .unwrap_or_default();
+        let trigger = ProviderTriggerRecord {
+            id: Uuid::new_v4(),
+            downstream_project_id,
+            provider,
+            source_repository,
+            source_pipeline: (!source_pipeline.is_empty()).then_some(source_pipeline.clone()),
+            enabled: true,
+            created_at: Utc::now(),
+        };
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "INSERT OR IGNORE INTO provider_triggers(
+                id, downstream_project_id, provider, source_repository,
+                source_pipeline, enabled, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                trigger.id.to_string(),
+                trigger.downstream_project_id.to_string(),
+                &trigger.provider,
+                &trigger.source_repository,
+                trigger.source_pipeline.as_deref().unwrap_or_default(),
+                1_i64,
+                trigger.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok((changed == 1).then_some(trigger))
+    }
+
+    pub fn list_provider_triggers_to(
+        &self,
+        downstream_project_id: ProjectId,
+    ) -> Result<Vec<ProviderTriggerRecord>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT id, downstream_project_id, provider, source_repository,
+                    source_pipeline, enabled, created_at
+             FROM provider_triggers
+             WHERE downstream_project_id = ?1
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = statement.query_map(
+            params![downstream_project_id.to_string()],
+            raw_provider_trigger,
+        )?;
+        rows.map(|row| {
+            row.map_err(StorageError::from)
+                .and_then(parse_provider_trigger)
+        })
+        .collect()
+    }
+
+    pub fn matching_provider_triggers(
+        &self,
+        downstream_project_id: ProjectId,
+        provider: &str,
+        source_repository: &str,
+        source_pipeline: Option<&str>,
+    ) -> Result<Vec<ProviderTriggerRecord>, StorageError> {
+        let provider = normalize_provider_trigger_selector(provider, "provider")?;
+        let source_repository =
+            normalize_provider_trigger_selector(source_repository, "source_repository")?;
+        let source_pipeline = source_pipeline
+            .map(|value| normalize_provider_trigger_selector(value, "source_pipeline"))
+            .transpose()?
+            .unwrap_or_default();
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT id, downstream_project_id, provider, source_repository,
+                    source_pipeline, enabled, created_at
+             FROM provider_triggers
+             WHERE downstream_project_id = ?1
+               AND provider = ?2
+               AND source_repository = ?3
+               AND enabled = 1
+               AND (source_pipeline = '' OR source_pipeline = ?4)
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = statement.query_map(
+            params![
+                downstream_project_id.to_string(),
+                provider,
+                source_repository,
+                source_pipeline,
+            ],
+            raw_provider_trigger,
+        )?;
+        rows.map(|row| {
+            row.map_err(StorageError::from)
+                .and_then(parse_provider_trigger)
+        })
+        .collect()
+    }
+
+    pub fn delete_provider_trigger(
+        &self,
+        downstream_project_id: ProjectId,
+        trigger_id: Uuid,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(connection.execute(
+            "DELETE FROM provider_triggers
+             WHERE id = ?1 AND downstream_project_id = ?2",
+            params![trigger_id.to_string(), downstream_project_id.to_string()],
+        )? == 1)
+    }
+
+    /// Claim one provider event for one configured mapping. The composite
+    /// primary key makes retries and restart reconciliation idempotent.
+    pub fn claim_provider_trigger_delivery(
+        &self,
+        trigger_id: Uuid,
+        event_id: &str,
+        triggered_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "INSERT OR IGNORE INTO provider_trigger_deliveries(
+                trigger_id, event_id, downstream_build_id, triggered_at
+             )
+             SELECT ?1, ?2, NULL, ?3
+             WHERE EXISTS (
+                 SELECT 1 FROM provider_triggers
+                 WHERE id = ?1 AND enabled = 1
+             )",
+            params![trigger_id.to_string(), event_id, triggered_at.to_rfc3339()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn complete_provider_trigger_delivery(
+        &self,
+        trigger_id: Uuid,
+        event_id: &str,
+        downstream_build_id: BuildId,
+    ) -> Result<(), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "UPDATE provider_trigger_deliveries
+             SET downstream_build_id = ?1
+             WHERE trigger_id = ?2 AND event_id = ?3
+               AND downstream_build_id IS NULL
+               AND EXISTS (
+                   SELECT 1
+                   FROM provider_triggers t
+                   JOIN builds b ON b.id = ?1
+                   WHERE t.id = ?2
+                     AND t.downstream_project_id = b.project_id
+               )",
+            params![
+                downstream_build_id.to_string(),
+                trigger_id.to_string(),
+                event_id,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::MissingProviderTriggerDelivery);
+        }
+        Ok(())
+    }
+
+    pub fn release_provider_trigger_delivery(
+        &self,
+        trigger_id: Uuid,
+        event_id: &str,
+    ) -> Result<(), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        connection.execute(
+            "DELETE FROM provider_trigger_deliveries
+             WHERE trigger_id = ?1 AND event_id = ?2
+               AND downstream_build_id IS NULL",
+            params![trigger_id.to_string(), event_id],
+        )?;
+        Ok(())
     }
 
     /// Append a bounded audit record. Authentication material and request
@@ -2426,6 +2638,7 @@ type RawSchedule = (
 type RawWebhookDelivery = (String, String, String, Option<String>, Option<i64>);
 type RawRepositoryPollEvent = (String, String, String, String, Option<String>, Option<i64>);
 type RawPipelineTrigger = (String, String, String, i64, String);
+type RawProviderTrigger = (String, String, String, String, String, i64, String);
 type RawAuditEvent = (i64, String, Option<String>, String, String, String);
 type RawAuthSession = (
     String,
@@ -2932,6 +3145,46 @@ fn parse_pipeline_trigger(raw: RawPipelineTrigger) -> Result<PipelineTriggerReco
         enabled,
         created_at: parse_timestamp(&raw.4)?,
     })
+}
+
+fn raw_provider_trigger(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProviderTrigger> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn parse_provider_trigger(raw: RawProviderTrigger) -> Result<ProviderTriggerRecord, StorageError> {
+    let enabled = match raw.5 {
+        0 => false,
+        1 => true,
+        value => return Err(StorageError::InvalidProviderTriggerEnabled(value)),
+    };
+    Ok(ProviderTriggerRecord {
+        id: parse_uuid(&raw.0)?,
+        downstream_project_id: parse_uuid(&raw.1)?,
+        provider: raw.2,
+        source_repository: raw.3,
+        source_pipeline: (!raw.4.is_empty()).then_some(raw.4),
+        enabled,
+        created_at: parse_timestamp(&raw.6)?,
+    })
+}
+
+fn normalize_provider_trigger_selector(
+    value: &str,
+    field: &'static str,
+) -> Result<String, StorageError> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+        return Err(StorageError::InvalidProviderTriggerSelector { field });
+    }
+    Ok(value.to_owned())
 }
 
 fn sha256_file(path: &Path) -> Result<String, StorageError> {
@@ -3821,6 +4074,96 @@ program = "true"
             reopened
                 .list_pipeline_triggers()
                 .expect("deleted trigger list")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn provider_triggers_match_workflows_and_deduplicate_deliveries() {
+        let directory = tempdir().expect("tempdir");
+        let database = directory.path().join("rivet.db");
+        let (project, pipeline, plan) = fixture();
+        let storage = Storage::open(&database).expect("open");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+
+        let trigger = storage
+            .create_provider_trigger(project.id, "github", "Acme/widgets", None)
+            .expect("provider trigger")
+            .expect("new provider trigger");
+        assert_eq!(trigger.source_pipeline, None);
+        assert!(
+            storage
+                .create_provider_trigger(project.id, "github", "Acme/widgets", None)
+                .expect("duplicate provider trigger")
+                .is_none()
+        );
+        assert_eq!(
+            storage
+                .matching_provider_triggers(
+                    project.id,
+                    "github",
+                    "Acme/widgets",
+                    Some("release.yml")
+                )
+                .expect("matching trigger"),
+            vec![trigger.clone()]
+        );
+        assert!(
+            storage
+                .matching_provider_triggers(
+                    project.id,
+                    "gitlab",
+                    "Acme/widgets",
+                    Some("release.yml")
+                )
+                .expect("non-matching provider")
+                .is_empty()
+        );
+
+        let event_id = "workflow-run-1";
+        let timestamp = Utc::now();
+        assert!(
+            storage
+                .claim_provider_trigger_delivery(trigger.id, event_id, timestamp)
+                .expect("claim provider event")
+        );
+        assert!(
+            !storage
+                .claim_provider_trigger_delivery(trigger.id, event_id, timestamp)
+                .expect("duplicate provider event")
+        );
+        let build = storage
+            .create_build(&project, &plan, &pipeline, None)
+            .expect("downstream build");
+        storage
+            .complete_provider_trigger_delivery(trigger.id, event_id, build.id)
+            .expect("complete provider event");
+        assert!(
+            storage
+                .claim_provider_trigger_delivery(trigger.id, event_id, timestamp)
+                .expect("completed provider event")
+                == false
+        );
+
+        drop(storage);
+        let reopened = Storage::open(&database).expect("reopen");
+        assert_eq!(
+            reopened
+                .list_provider_triggers_to(project.id)
+                .expect("reopened provider trigger"),
+            vec![trigger.clone()]
+        );
+        assert!(
+            reopened
+                .delete_provider_trigger(project.id, trigger.id)
+                .expect("delete provider trigger")
+        );
+        assert!(
+            reopened
+                .list_provider_triggers_to(project.id)
+                .expect("deleted provider trigger")
                 .is_empty()
         );
     }
