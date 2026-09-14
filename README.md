@@ -33,6 +33,8 @@ webhook delivery with idempotent redelivery, GitHub repository-dispatch
 revision triggers, and signed Bitbucket push/pull-request revision triggers,
 durable internal upstream-pipeline triggers with passed-build gating,
 cycle rejection, idempotent delivery claims, and restart reconciliation,
+provider-trigger mappings for signed GitHub workflow and GitLab pipeline
+completion events,
 policy-backed API identities with role/project authorization,
 secret-parameter redaction/masking, a passphrase-encrypted SCM credential vault
 with typed HTTP/SSH credentials, non-secret credential references, project allow-lists,
@@ -250,6 +252,26 @@ delivery claim is durable and idempotent, cycles are rejected, and pending
 passed builds are reconciled when the server starts. The downstream build uses
 the common local or remote-agent queue path; it does not install or start
 Docker or Podman.
+
+Provider workflow completion triggers connect an external GitHub Actions or
+GitLab pipeline to one Rivet project. Configure the downstream mapping with a
+provider repository and, optionally, an exact workflow/pipeline name:
+
+```sh
+curl -X POST http://127.0.0.1:7878/api/v1/projects/release/provider-triggers \
+  -H 'content-type: application/json' \
+  -d '{"provider":"github","source_repository":"acme/widgets","source_pipeline":"Release"}'
+curl http://127.0.0.1:7878/api/v1/projects/release/provider-triggers
+curl -X DELETE http://127.0.0.1:7878/api/v1/projects/release/provider-triggers/<trigger-id>
+```
+
+After the signed webhook is received, a successful GitHub `workflow_run`
+completion or GitLab `Pipeline Hook` completion queues the exact provider
+commit through Rivet's normal SCM and queue path. Running, failed, cancelled,
+or unmatched completions are acknowledged without a build. Delivery claims
+are durable per mapping and provider event ID, so retries do not create a
+second build. The mapping stores only provider identifiers and never webhook
+or SCM secrets.
 
 ## Run headless
 
@@ -481,9 +503,12 @@ POST /api/v1/webhooks/bitbucket/<rivet-project>
 
 GitHub accepts signed `push` and `pull_request` deliveries (and acknowledges
 `ping`) using `X-Hub-Signature-256`, `X-GitHub-Event`, and `X-GitHub-Delivery`.
-Known signed GitHub repository lifecycle, review, deployment, check, and
-workflow events are acknowledged as ignored because they do not identify a
-new source revision; unknown event names remain explicitly rejected. GitLab
+Signed `workflow_run` `completed` events can also feed an explicitly
+configured provider trigger using the run's exact `head_sha`; successful runs
+queue, while non-success conclusions are acknowledged as ignored. Other
+known signed GitHub repository lifecycle, review, deployment, and check events
+are acknowledged as ignored because they do not identify a new source
+revision; unknown event names remain explicitly rejected. GitLab
 accepts `Push Hook`, `Tag Push Hook`, and `Merge Request Hook` deliveries
 using the signed
 `webhook-id`/`webhook-timestamp`/`webhook-signature` headers; the legacy
@@ -491,7 +516,9 @@ using the signed
 the newer signing headers. Push adapters validate the commit SHA; PR/MR
 adapters accept only opened, reopened, or updated/synchronized actions, fetch
 the provider head ref through a bounded refspec, and then normalize to the same
-idempotent build admission path. All adapters can attach a default non-secret
+idempotent build admission path. A signed `Pipeline Hook` with `status =
+success` can feed an explicitly configured provider trigger using the exact
+pipeline SHA; other pipeline states are acknowledged as ignored. All adapters can attach a default non-secret
 Rivet credential ID for the fetch. Bitbucket Cloud accepts signed `repo:push`,
 `pullrequest:created`, and `pullrequest:updated` deliveries using
 `X-Hub-Signature`, `X-Event-Key`, and the per-delivery `X-Request-UUID` header.
@@ -501,9 +528,10 @@ Other known signed Bitbucket repository, review, comment, commit-status, and
 pipeline-span lifecycle deliveries are acknowledged as ignored because they do
 not identify a new source revision for a Rivet build; unknown event keys remain
 explicitly rejected.
-Known signed GitLab issue, comment, release, deployment, job, pipeline, and
-project lifecycle events are acknowledged as ignored for the same reason;
-unknown event names remain explicitly rejected.
+Known signed GitLab issue, comment, release, deployment, job, and project
+lifecycle events are acknowledged as ignored for the same reason; configured
+pipeline completions are handled as described above, and unknown event names
+remain explicitly rejected.
 
 Configure the provider keys through private files and, when needed, point each
 adapter at its vault credential ID:
@@ -529,8 +557,11 @@ and [GitLab's webhook integration documentation](https://docs.gitlab.com/user/pr
 Bitbucket's [event payload reference](https://support.atlassian.com/bitbucket-cloud/docs/event-payloads/)
 and [webhook security documentation](https://support.atlassian.com/bitbucket-cloud/docs/manage-webhooks/)
 define the event headers and HMAC contract used by this adapter.
-Provider-side upstream-trigger mapping remains a future gate; event types that
-do not identify a source revision are acknowledged safely, while unknown event
+The current provider-side mapping is deliberately bounded to GitHub workflow
+completion and GitLab pipeline completion, with exact repository/workflow
+selectors and no provider API polling. Broader provider-event mapping and
+additional external pipeline systems remain future gates; event types that do
+not identify a source revision are acknowledged safely, while unknown event
 types remain rejected.
 
 SCM credentials use a local passphrase-encrypted vault. The CLI reads the

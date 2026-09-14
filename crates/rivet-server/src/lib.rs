@@ -40,8 +40,8 @@ use rivet_scm::{
 };
 use rivet_storage::{
     AnnotationRecord, ArtifactRecord, AuditEventRecord, BuildDetails, BuildRecord,
-    PipelineTriggerRecord, RemoteAttemptRecord, SchedulePollConfig, ScheduleRecord,
-    ScheduleTrigger, Storage, StorageError,
+    PipelineTriggerRecord, ProviderTriggerRecord, RemoteAttemptRecord, SchedulePollConfig,
+    ScheduleRecord, ScheduleTrigger, Storage, StorageError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -295,6 +295,10 @@ enum ApiError {
     PipelineTriggerNotFound { project: String, trigger_id: Uuid },
     #[error("pipeline trigger already exists")]
     PipelineTriggerConflict,
+    #[error("provider trigger {trigger_id} not found for project {project}")]
+    ProviderTriggerNotFound { project: String, trigger_id: Uuid },
+    #[error("provider trigger already exists")]
+    ProviderTriggerConflict,
     #[error("repository path is not a directory: {0}")]
     InvalidRepository(PathBuf),
     #[error("pipeline path is not a file: {0}")]
@@ -361,7 +365,8 @@ impl IntoResponse for ApiError {
             Self::ProjectNotFound(_)
             | Self::BuildNotFound { .. }
             | Self::ScheduleNotFound { .. }
-            | Self::PipelineTriggerNotFound { .. } => StatusCode::NOT_FOUND,
+            | Self::PipelineTriggerNotFound { .. }
+            | Self::ProviderTriggerNotFound { .. } => StatusCode::NOT_FOUND,
             Self::InvalidRepository(_) | Self::InvalidPipeline(_) | Self::BadRequest(_) => {
                 StatusCode::BAD_REQUEST
             }
@@ -376,6 +381,7 @@ impl IntoResponse for ApiError {
             | Self::InvalidWebhookEventId => StatusCode::BAD_REQUEST,
             Self::WebhookEventConflict => StatusCode::CONFLICT,
             Self::PipelineTriggerConflict => StatusCode::CONFLICT,
+            Self::ProviderTriggerConflict => StatusCode::CONFLICT,
             Self::ArtifactNotFound(_) => StatusCode::NOT_FOUND,
             Self::ArtifactRead(_) | Self::ArtifactIntegrity => StatusCode::INTERNAL_SERVER_ERROR,
             Self::CredentialsUnavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -552,6 +558,18 @@ pub struct CreatePipelineTriggerRequest {
     pub upstream_project: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateProviderTriggerRequest {
+    /// Provider whose signed pipeline completion event will be accepted.
+    pub provider: String,
+    /// Provider repository identity, such as `acme/widgets`.
+    pub source_repository: String,
+    /// Optional exact workflow/pipeline name. Omit to match all supported
+    /// completion events from the selected repository.
+    #[serde(default)]
+    pub source_pipeline: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct CredentialWriteRequest {
     #[serde(default)]
@@ -635,6 +653,18 @@ struct WebhookBuildResponse {
     status: &'static str,
     deduplicated: bool,
     build: Option<BuildRecord>,
+}
+
+#[derive(Debug)]
+struct ProviderTriggerEvent {
+    provider: &'static str,
+    event_id: String,
+    project: String,
+    source_repository: String,
+    source_pipeline: Option<String>,
+    revision: Option<String>,
+    credential_id: Option<String>,
+    successful: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -775,6 +805,14 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
         .route(
             "/api/v1/projects/{name}/upstream-triggers/{trigger_id}",
             axum::routing::delete(delete_upstream_trigger),
+        )
+        .route(
+            "/api/v1/projects/{name}/provider-triggers",
+            get(list_provider_triggers).post(create_provider_trigger),
+        )
+        .route(
+            "/api/v1/projects/{name}/provider-triggers/{trigger_id}",
+            axum::routing::delete(delete_provider_trigger),
         )
         .route(
             "/api/v1/projects/{name}/builds/{number}/logs",
@@ -2874,6 +2912,97 @@ async fn delete_upstream_trigger(
     }
 }
 
+async fn list_provider_triggers(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<ProviderTriggerRecord>>, ApiError> {
+    require_project(&principal, Permission::Read, &name)?;
+    let project = project_by_name(&state.storage, &name)?;
+    Ok(Json(state.storage.list_provider_triggers_to(project.id)?))
+}
+
+async fn create_provider_trigger(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<CreateProviderTriggerRequest>,
+) -> Result<(StatusCode, Json<ProviderTriggerRecord>), ApiError> {
+    require_project(&principal, Permission::Build, &name)?;
+    let downstream = project_by_name(&state.storage, &name)?;
+    let provider = normalize_provider_trigger_provider(request.provider)?;
+    let source_repository =
+        normalize_provider_trigger_selector(request.source_repository, "source_repository")?;
+    let source_pipeline = match request.source_pipeline {
+        Some(value) => normalize_optional_provider_trigger_selector(value, "source_pipeline")?,
+        None => None,
+    };
+    let trigger = state
+        .storage
+        .create_provider_trigger(
+            downstream.id,
+            &provider,
+            &source_repository,
+            source_pipeline.as_deref(),
+        )?
+        .ok_or(ApiError::ProviderTriggerConflict)?;
+    Ok((StatusCode::CREATED, Json(trigger)))
+}
+
+async fn delete_provider_trigger(
+    State(state): State<AppState>,
+    AxumPath((name, trigger_id)): AxumPath<(String, Uuid)>,
+    Extension(principal): Extension<Principal>,
+) -> Result<StatusCode, ApiError> {
+    require_project(&principal, Permission::Build, &name)?;
+    let project = project_by_name(&state.storage, &name)?;
+    if state
+        .storage
+        .delete_provider_trigger(project.id, trigger_id)?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::ProviderTriggerNotFound {
+            project: name,
+            trigger_id,
+        })
+    }
+}
+
+fn normalize_provider_trigger_provider(provider: String) -> Result<String, ApiError> {
+    let provider = provider.trim().to_ascii_lowercase();
+    if !matches!(provider.as_str(), "github" | "gitlab") {
+        return Err(ApiError::BadRequest(
+            "provider must be github or gitlab".into(),
+        ));
+    }
+    Ok(provider)
+}
+
+fn normalize_provider_trigger_selector(
+    value: String,
+    field: &'static str,
+) -> Result<String, ApiError> {
+    let value = value.trim().to_owned();
+    if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest(format!(
+            "{field} is empty, too long, or contains control characters"
+        )));
+    }
+    Ok(value)
+}
+
+fn normalize_optional_provider_trigger_selector(
+    value: String,
+    field: &'static str,
+) -> Result<Option<String>, ApiError> {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    normalize_provider_trigger_selector(value, field).map(Some)
+}
+
 async fn webhook_build(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -2890,6 +3019,111 @@ async fn webhook_build(
     enqueue_webhook_build(&state, &principal, request).await
 }
 
+async fn enqueue_provider_trigger(
+    state: &AppState,
+    principal: &Principal,
+    event: ProviderTriggerEvent,
+) -> Result<(StatusCode, Json<WebhookBuildResponse>), ApiError> {
+    let event_id = validate_webhook_event_id(event.event_id)?;
+    let project_name = event.project.trim().to_owned();
+    require_project(principal, Permission::Build, &project_name)?;
+    let project = project_by_name(&state.storage, &project_name)?;
+    if !event.successful {
+        return Ok((
+            StatusCode::OK,
+            Json(WebhookBuildResponse {
+                status: "ignored",
+                deduplicated: false,
+                build: None,
+            }),
+        ));
+    }
+    let revision = event.revision.ok_or_else(|| {
+        ApiError::BadRequest("provider pipeline completion revision is missing".into())
+    })?;
+    let triggers = state.storage.matching_provider_triggers(
+        project.id,
+        event.provider,
+        &event.source_repository,
+        event.source_pipeline.as_deref(),
+    )?;
+    let trigger = triggers
+        .iter()
+        .find(|trigger| {
+            trigger.source_pipeline.is_some()
+                && trigger.source_pipeline.as_deref() == event.source_pipeline.as_deref()
+        })
+        .cloned()
+        .or_else(|| {
+            triggers
+                .into_iter()
+                .find(|trigger| trigger.source_pipeline.is_none())
+        });
+    let Some(trigger) = trigger else {
+        return Ok((
+            StatusCode::OK,
+            Json(WebhookBuildResponse {
+                status: "ignored",
+                deduplicated: false,
+                build: None,
+            }),
+        ));
+    };
+    if !state
+        .storage
+        .claim_provider_trigger_delivery(trigger.id, &event_id, Utc::now())?
+    {
+        return Ok((
+            StatusCode::OK,
+            Json(WebhookBuildResponse {
+                status: "already_received",
+                deduplicated: true,
+                build: None,
+            }),
+        ));
+    }
+
+    let queued = match enqueue_project_build(
+        state,
+        project,
+        QueueBuildRequest {
+            scm: Some(PrepareScmRequest {
+                remote: "origin".into(),
+                fetch: true,
+                revision: Some(revision),
+                fetch_ref: None,
+                clean: false,
+                clean_ignored: false,
+                submodules: false,
+                credential_id: event.credential_id,
+            }),
+            parameters: BTreeMap::new(),
+            priority: 0,
+        },
+    )
+    .await
+    {
+        Ok(queued) => queued,
+        Err(error) => {
+            state
+                .storage
+                .release_provider_trigger_delivery(trigger.id, &event_id)?;
+            return Err(error);
+        }
+    };
+    state
+        .storage
+        .complete_provider_trigger_delivery(trigger.id, &event_id, queued.build.id)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(WebhookBuildResponse {
+            status: "queued",
+            deduplicated: false,
+            build: Some(queued.build),
+        }),
+    ))
+}
+
 async fn github_webhook(
     State(state): State<AppState>,
     AxumPath(project): AxumPath<String>,
@@ -2901,6 +3135,15 @@ async fn github_webhook(
         .github_webhook_secret
         .as_deref()
         .ok_or(ApiError::GitHubWebhookNotConfigured)?;
+    if let Some(event) = normalize_github_provider_trigger(
+        secret,
+        &headers,
+        &body,
+        project.clone(),
+        state.github_webhook_credential_id.clone(),
+    )? {
+        return enqueue_provider_trigger(&state, &principal, event).await;
+    }
     let Some(request) = normalize_github_webhook(
         secret,
         &headers,
@@ -2932,6 +3175,15 @@ async fn gitlab_webhook(
         .gitlab_webhook_secret
         .as_deref()
         .ok_or(ApiError::GitLabWebhookNotConfigured)?;
+    if let Some(event) = normalize_gitlab_provider_trigger(
+        secret,
+        &headers,
+        &body,
+        project.clone(),
+        state.gitlab_webhook_credential_id.clone(),
+    )? {
+        return enqueue_provider_trigger(&state, &principal, event).await;
+    }
     let Some(request) = normalize_gitlab_webhook(
         secret,
         &headers,
@@ -3114,6 +3366,121 @@ async fn enqueue_webhook_build(
             build: Some(queued.build),
         }),
     ))
+}
+
+fn normalize_github_provider_trigger(
+    secret: &[u8],
+    headers: &HeaderMap,
+    body: &[u8],
+    project: String,
+    credential_id: Option<String>,
+) -> Result<Option<ProviderTriggerEvent>, ApiError> {
+    verify_hmac_hex_signature(secret, headers, "x-hub-signature-256", body)?;
+    let event = required_header(headers, "x-github-event")?;
+    if event != "workflow_run" {
+        return Ok(None);
+    }
+    let event_id = required_header(headers, "x-github-delivery")?;
+    let payload: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| ApiError::BadRequest(format!("invalid GitHub webhook JSON: {error}")))?;
+    let action = payload
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::BadRequest("GitHub workflow_run action is missing".into()))?;
+    if action != "completed" {
+        return Ok(None);
+    }
+    let workflow_run = payload
+        .get("workflow_run")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| ApiError::BadRequest("GitHub workflow_run payload is missing".into()))?;
+    let source_repository = payload
+        .get("repository")
+        .and_then(|repository| repository.get("full_name"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::BadRequest("GitHub repository.full_name is missing".into()))?
+        .to_owned();
+    let source_pipeline = workflow_run
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    let successful = workflow_run
+        .get("conclusion")
+        .and_then(serde_json::Value::as_str)
+        == Some("success");
+    let revision = if successful {
+        normalize_commit_revision(workflow_run.get("head_sha"), "GitHub workflow_run head_sha")?
+    } else {
+        None
+    };
+    Ok(Some(ProviderTriggerEvent {
+        provider: "github",
+        event_id,
+        project,
+        source_repository,
+        source_pipeline,
+        revision,
+        credential_id,
+        successful,
+    }))
+}
+
+fn normalize_gitlab_provider_trigger(
+    secret: &[u8],
+    headers: &HeaderMap,
+    body: &[u8],
+    project: String,
+    credential_id: Option<String>,
+) -> Result<Option<ProviderTriggerEvent>, ApiError> {
+    verify_gitlab_webhook_signature(secret, headers, body)?;
+    let event = required_header(headers, "x-gitlab-event")?;
+    if event != "Pipeline Hook" {
+        return Ok(None);
+    }
+    let event_id = first_header(
+        headers,
+        &["webhook-id", "x-gitlab-event-uuid", "idempotency-key"],
+    )
+    .ok_or(ApiError::EmptyWebhookEventId)?;
+    let payload: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| ApiError::BadRequest(format!("invalid GitLab webhook JSON: {error}")))?;
+    let attributes = payload
+        .get("object_attributes")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| ApiError::BadRequest("GitLab pipeline attributes are missing".into()))?;
+    let source_repository = payload
+        .get("project")
+        .and_then(|repository| repository.get("path_with_namespace"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::BadRequest("GitLab project.path_with_namespace is missing".into())
+        })?
+        .to_owned();
+    let source_pipeline = attributes
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    let successful =
+        attributes.get("status").and_then(serde_json::Value::as_str) == Some("success");
+    let revision = if successful {
+        normalize_commit_revision(attributes.get("sha"), "GitLab pipeline sha")?
+    } else {
+        None
+    };
+    Ok(Some(ProviderTriggerEvent {
+        provider: "gitlab",
+        event_id,
+        project,
+        source_repository,
+        source_pipeline,
+        revision,
+        credential_id,
+        successful,
+    }))
 }
 
 fn normalize_github_webhook(
@@ -9022,6 +9389,223 @@ program = "true"
     }
 
     #[tokio::test]
+    async fn github_provider_workflow_trigger_queues_success_once() {
+        let directory = tempdir().expect("tempdir");
+        let repository = directory.path().join("repository");
+        fs::create_dir_all(&repository).expect("repository");
+        let pipeline_path = repository.join("Rivetfile.toml");
+        fs::write(
+            &pipeline_path,
+            r#"
+version = 1
+name = "provider-workflow-trigger"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline file");
+        let pipeline = Pipeline::load(&pipeline_path).expect("pipeline");
+        let project = Project::new(
+            "workflow-downstream",
+            repository.to_string_lossy().into_owned(),
+            pipeline_path.to_string_lossy().into_owned(),
+        )
+        .expect("project");
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let mut state = AppState::new(storage.clone());
+        state.github_webhook_secret = Some(b"github-workflow-secret".to_vec());
+
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repository)
+                .output()
+                .expect("git available");
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "rivet@example.test"]);
+        git(&["config", "user.name", "Rivet Tests"]);
+        git(&["add", "Rivetfile.toml"]);
+        git(&["commit", "-qm", "workflow trigger fixture"]);
+        let revision = git(&["rev-parse", "HEAD"]);
+        let repository_string = repository.to_string_lossy().into_owned();
+        let output = std::process::Command::new("git")
+            .args(["remote", "add", "origin"])
+            .arg(&repository_string)
+            .current_dir(&repository)
+            .output()
+            .expect("git available");
+        assert!(
+            output.status.success(),
+            "git remote add: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/workflow-downstream/provider-triggers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"provider":"github","source_repository":"acme/widgets","source_pipeline":"Release"}"#,
+                    ))
+                    .expect("create provider trigger request"),
+            )
+            .await
+            .expect("create provider trigger response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("created provider trigger body"),
+        )
+        .expect("created provider trigger JSON");
+        assert_eq!(created["provider"], "github");
+        assert_eq!(created["source_repository"], "acme/widgets");
+        assert_eq!(created["source_pipeline"], "Release");
+        let trigger_id = created["id"].as_str().expect("provider trigger ID");
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/workflow-downstream/provider-triggers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"provider":"github","source_repository":"acme/widgets","source_pipeline":"Release"}"#,
+                    ))
+                    .expect("duplicate provider trigger request"),
+            )
+            .await
+            .expect("duplicate provider trigger response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/workflow-downstream/provider-triggers")
+                    .body(Body::empty())
+                    .expect("list provider trigger request"),
+            )
+            .await
+            .expect("list provider trigger response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("listed provider trigger body"),
+        )
+        .expect("listed provider trigger JSON");
+        assert_eq!(listed.as_array().map(Vec::len), Some(1));
+
+        let body = format!(
+            r#"{{
+            "action":"completed",
+            "repository":{{"full_name":"acme/widgets"}},
+            "workflow_run":{{"name":"Release","conclusion":"success","head_sha":"{revision}"}}
+        }}"#
+        )
+        .into_bytes();
+        let signature = sign_webhook("github-workflow-secret", &body);
+        let request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/webhooks/github/workflow-downstream")
+                .header("content-type", "application/json")
+                .header("x-github-event", "workflow_run")
+                .header("x-github-delivery", "github-workflow-delivery-1")
+                .header("x-hub-signature-256", &signature)
+                .body(Body::from(body.clone()))
+                .expect("workflow trigger request")
+        };
+        let response = router(state.clone())
+            .oneshot(request())
+            .await
+            .expect("workflow trigger response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let queued: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("queued provider trigger body"),
+        )
+        .expect("queued provider trigger JSON");
+        assert_eq!(queued["status"], "queued");
+
+        let response = router(state.clone())
+            .oneshot(request())
+            .await
+            .expect("duplicate workflow trigger response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let duplicate: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("duplicate provider trigger body"),
+        )
+        .expect("duplicate provider trigger JSON");
+        assert_eq!(duplicate["status"], "already_received");
+        assert_eq!(duplicate["deduplicated"], true);
+
+        let failed_body = br#"{
+            "action":"completed",
+            "repository":{"full_name":"acme/widgets"},
+            "workflow_run":{"name":"Release","conclusion":"failure"}
+        }"#
+        .to_vec();
+        let failed_signature = sign_webhook("github-workflow-secret", &failed_body);
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/webhooks/github/workflow-downstream")
+                    .header("content-type", "application/json")
+                    .header("x-github-event", "workflow_run")
+                    .header("x-github-delivery", "github-workflow-delivery-2")
+                    .header("x-hub-signature-256", &failed_signature)
+                    .body(Body::from(failed_body))
+                    .expect("failed workflow trigger request"),
+            )
+            .await
+            .expect("failed workflow trigger response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let ignored: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("ignored workflow trigger body"),
+        )
+        .expect("ignored workflow trigger JSON");
+        assert_eq!(ignored["status"], "ignored");
+        assert_eq!(storage.list_builds(project.id).expect("builds").len(), 1);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!(
+                        "/api/v1/projects/workflow-downstream/provider-triggers/{trigger_id}"
+                    ))
+                    .body(Body::empty())
+                    .expect("delete provider trigger request"),
+            )
+            .await
+            .expect("delete provider trigger response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
     async fn bitbucket_provider_route_queues_and_deduplicates_pushes() {
         let directory = tempdir().expect("tempdir");
         let repository = directory.path().join("repository");
@@ -9673,6 +10257,112 @@ program = "true"
             ),
             Err(ApiError::BadRequest(message)) if message.contains("future_event")
         ));
+    }
+
+    #[test]
+    fn github_workflow_completion_normalizes_success_and_failure() {
+        let body = br#"{
+            "action":"completed",
+            "repository":{"full_name":"acme/widgets"},
+            "workflow_run":{"name":"Release","conclusion":"success","head_sha":"c783c3523482029c449dcdff1209ed06409b83bc"}
+        }"#;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", HeaderValue::from_static("workflow_run"));
+        headers.insert(
+            "x-github-delivery",
+            HeaderValue::from_static("github-workflow-delivery-1"),
+        );
+        headers.insert(
+            "x-hub-signature-256",
+            HeaderValue::from_str(&sign_webhook("github-fixture-secret", body)).expect("signature"),
+        );
+        let event = normalize_github_provider_trigger(
+            b"github-fixture-secret",
+            &headers,
+            body,
+            "downstream".into(),
+            Some("github-credential".into()),
+        )
+        .expect("normalize")
+        .expect("provider event");
+        assert_eq!(event.provider, "github");
+        assert_eq!(event.event_id, "github-workflow-delivery-1");
+        assert_eq!(event.source_repository, "acme/widgets");
+        assert_eq!(event.source_pipeline.as_deref(), Some("Release"));
+        assert_eq!(
+            event.revision.as_deref(),
+            Some("c783c3523482029c449dcdff1209ed06409b83bc")
+        );
+        assert!(event.successful);
+
+        let failed_body = br#"{
+            "action":"completed",
+            "repository":{"full_name":"acme/widgets"},
+            "workflow_run":{"name":"Release","conclusion":"failure"}
+        }"#;
+        let mut failed_headers = headers;
+        failed_headers.insert(
+            "x-hub-signature-256",
+            HeaderValue::from_str(&sign_webhook("github-fixture-secret", failed_body))
+                .expect("failure signature"),
+        );
+        let failed = normalize_github_provider_trigger(
+            b"github-fixture-secret",
+            &failed_headers,
+            failed_body,
+            "downstream".into(),
+            None,
+        )
+        .expect("normalize failed event")
+        .expect("failed provider event");
+        assert!(!failed.successful);
+        assert_eq!(failed.revision, None);
+    }
+
+    #[test]
+    fn gitlab_pipeline_completion_normalizes_status_and_revision() {
+        let signing_key = b"gitlab-signing-fixture";
+        let signing_token = format!("whsec_{}", STANDARD.encode(signing_key));
+        let message_id = "gitlab-pipeline-delivery-1";
+        let timestamp = Utc::now().timestamp();
+        let body = br#"{
+            "project":{"path_with_namespace":"acme/widgets"},
+            "object_attributes":{"name":"Release","status":"success","sha":"c783c3523482029c449dcdff1209ed06409b83bc"}
+        }"#;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", HeaderValue::from_static("Pipeline Hook"));
+        headers.insert("webhook-id", HeaderValue::from_static(message_id));
+        headers.insert(
+            "webhook-timestamp",
+            HeaderValue::from_str(&timestamp.to_string()).expect("timestamp"),
+        );
+        headers.insert(
+            "webhook-signature",
+            HeaderValue::from_str(&sign_gitlab_webhook(
+                signing_key,
+                message_id,
+                timestamp,
+                body,
+            ))
+            .expect("signature"),
+        );
+        let event = normalize_gitlab_provider_trigger(
+            signing_token.as_bytes(),
+            &headers,
+            body,
+            "downstream".into(),
+            None,
+        )
+        .expect("normalize")
+        .expect("provider event");
+        assert_eq!(event.provider, "gitlab");
+        assert_eq!(event.source_repository, "acme/widgets");
+        assert_eq!(event.source_pipeline.as_deref(), Some("Release"));
+        assert_eq!(
+            event.revision.as_deref(),
+            Some("c783c3523482029c449dcdff1209ed06409b83bc")
+        );
+        assert!(event.successful);
     }
 
     #[test]
