@@ -114,6 +114,13 @@
       "notes": "Explicit project routes normalize GitHub push/pull_request deliveries and GitLab Push Hook/Tag Push Hook/Merge Request Hook deliveries into the common idempotent build path. GitHub HMAC-SHA256 and GitLab signed webhook headers are verified over the raw body, provider head refs are fetched through bounded refspecs, optional fetch credential IDs are attached, and stale/invalid messages are rejected; broader provider event coverage remains planned."
     },
     {
+      "category": "Triggers",
+      "feature": "Authenticated repository-change polling",
+      "status": "partial",
+      "evidence": ["crates/rivet-server/src/lib.rs", "crates/rivet-storage/migrations/016_repository_poll_events.sql", "apps/desktop/src/App.tsx"],
+      "notes": "A project-scoped authenticated endpoint inspects the local Git checkout, optionally fetches an explicit remote with a vault credential ID, compares the observed revision with the latest build, queues the exact revision, and durably deduplicates concurrent or repeated transitions; provider-side event delivery and upstream lifecycle mapping remain planned."
+    },
+    {
       "category": "Agents",
       "feature": "Versioned agent registration, assignment, and remote execution",
       "status": "partial",

@@ -109,6 +109,21 @@ export interface QueueResponse {
   status: BuildStatus;
 }
 
+export type RepositoryPollStatus =
+  | "queued"
+  | "unchanged"
+  | "already_queued"
+  | "already_checking";
+
+export interface RepositoryPollResponse {
+  status: RepositoryPollStatus;
+  changed: boolean;
+  deduplicated: boolean;
+  revision: string;
+  reference: string | null;
+  build: BuildRecord | null;
+}
+
 export interface QueueStats {
   queued: number;
   running: number;

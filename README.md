@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **94% verified** · `███████████████████░`<br>
-Weighted evidence score: **94.33 / 100** · displayed conservatively as the
+Weighted evidence score: **94.36 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -363,6 +363,15 @@ fetching, revision checkout, and workspace cleaning; the default remains
 inspection-only. Clients read durable state from the build resource and
 subscribe to live events separately.
 
+For repositories that do not have a provider webhook configured, an
+authenticated `POST /api/v1/projects/<project>/repository-changes` endpoint
+polls the local Git checkout and compares its observed revision with the
+latest build. It can optionally fetch a named remote with an explicit Rivet
+credential ID, then queues the exact observed revision once. Concurrent or
+repeated polls are durably deduplicated and report `queued`, `unchanged`,
+`already_queued`, or `already_checking`; this is a local repository poller,
+not a claim of provider-side event delivery.
+
 Generic webhook delivery is available at `POST /api/v1/webhooks/generic`. The
 server verifies `X-Rivet-Signature: sha256=<hex HMAC-SHA256 of the raw body>`
 before accepting this payload shape:
@@ -437,8 +446,8 @@ cargo run -p rivet -- --data-dir .rivet server \
 The provider contracts are documented by [GitHub's webhook signature
 validation guide](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)
 and [GitLab's webhook integration documentation](https://docs.gitlab.com/user/project/integrations/webhooks/).
-Upstream-trigger mapping and broader provider event coverage remain future
-gates.
+Broader provider event coverage and provider-side upstream-trigger mapping
+remain future gates.
 
 SCM credentials use a local passphrase-encrypted vault. The CLI reads the
 passphrase and provider secret from private files, so neither value is placed

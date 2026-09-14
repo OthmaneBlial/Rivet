@@ -459,6 +459,19 @@ pub struct QueueBuildRequest {
     pub priority: i32,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct RepositoryPollRequest {
+    /// Remote to fetch when `fetch` is enabled.
+    #[serde(default = "default_remote")]
+    pub remote: String,
+    /// Fetch the selected remote before inspecting the checkout.
+    #[serde(default)]
+    pub fetch: bool,
+    /// Non-secret ID resolved from the server's encrypted credential vault.
+    #[serde(default)]
+    pub credential_id: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateAnnotationRequest {
     pub kind: String,
@@ -563,6 +576,16 @@ struct WebhookBuildResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct RepositoryPollResponse {
+    status: &'static str,
+    changed: bool,
+    deduplicated: bool,
+    revision: String,
+    reference: Option<String>,
+    build: Option<BuildRecord>,
+}
+
+#[derive(Debug, Serialize)]
 struct QueueStatusResponse {
     queued: usize,
     running: usize,
@@ -648,6 +671,10 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
         .route(
             "/api/v1/projects/{name}/builds",
             get(list_builds).post(queue_build),
+        )
+        .route(
+            "/api/v1/projects/{name}/repository-changes",
+            post(poll_repository_changes),
         )
         .route("/api/v1/projects/{name}/builds/{number}", get(get_build))
         .route(
@@ -3081,6 +3108,27 @@ fn validate_webhook_event_id(event_id: String) -> Result<String, ApiError> {
     Ok(event_id.to_owned())
 }
 
+fn repository_poll_event_id(
+    project_id: rivet_core::ProjectId,
+    source: &SourceSnapshot,
+    previous_build: Option<&BuildRecord>,
+) -> String {
+    let previous_build = previous_build
+        .map(|build| build.id.to_string())
+        .unwrap_or_else(|| "initial".to_owned());
+    let mut digest = Sha256::new();
+    digest.update(project_id.as_bytes());
+    digest.update([0]);
+    digest.update(source.provider.as_bytes());
+    digest.update([0]);
+    digest.update(source.revision.as_bytes());
+    digest.update([0]);
+    digest.update(source.reference.as_deref().unwrap_or_default().as_bytes());
+    digest.update([0]);
+    digest.update(previous_build.as_bytes());
+    format!("rivet-poll-{}", hex::encode(digest.finalize()))
+}
+
 fn spawn_schedule_dispatcher(state: AppState, shutdown: CancellationToken) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -3495,6 +3543,146 @@ async fn queue_build(
     Ok((
         StatusCode::ACCEPTED,
         Json(enqueue_project_build(&state, project, request).await?),
+    ))
+}
+
+async fn poll_repository_changes(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
+    request: Option<Json<RepositoryPollRequest>>,
+) -> Result<(StatusCode, Json<RepositoryPollResponse>), ApiError> {
+    require_project(&principal, Permission::Build, &name)?;
+    let project = project_by_name(&state.storage, &name)?;
+    let request = request.map(|Json(request)| request).unwrap_or_default();
+    if request.credential_id.is_some() && !request.fetch {
+        return Err(ApiError::BadRequest(
+            "a repository poll credential requires fetch=true".into(),
+        ));
+    }
+
+    let prepare = PrepareScmRequest {
+        remote: if request.remote.trim().is_empty() {
+            default_remote()
+        } else {
+            request.remote
+        },
+        fetch: request.fetch,
+        revision: None,
+        fetch_ref: None,
+        clean: false,
+        clean_ignored: false,
+        credential_id: request.credential_id,
+    };
+    let source = capture_source_snapshot(
+        Path::new(&project.repository_path),
+        &project.name,
+        Some(&prepare),
+        state.credentials.as_ref(),
+        state.ssh_known_hosts_file.as_deref(),
+    )
+    .await?
+    .ok_or_else(|| ApiError::InvalidRepository(PathBuf::from(&project.repository_path)))?;
+
+    let latest = state.storage.list_builds(project.id)?.into_iter().next();
+    let unchanged = latest
+        .as_ref()
+        .and_then(|build| build.source.as_ref())
+        .is_some_and(|known| {
+            known.provider == source.provider && known.revision == source.revision
+        });
+    if unchanged {
+        return Ok((
+            StatusCode::OK,
+            Json(RepositoryPollResponse {
+                status: "unchanged",
+                changed: false,
+                deduplicated: false,
+                revision: source.revision,
+                reference: source.reference,
+                build: None,
+            }),
+        ));
+    }
+
+    let event_id = repository_poll_event_id(project.id, &source, latest.as_ref());
+    if !state.storage.claim_repository_poll_event(
+        &event_id,
+        project.id,
+        &source.revision,
+        Utc::now(),
+    )? {
+        let event = state
+            .storage
+            .repository_poll_event(&event_id)?
+            .ok_or_else(|| ApiError::BadRequest("repository poll event disappeared".into()))?;
+        let build = event.build_id.and_then(|build_id| {
+            state
+                .storage
+                .list_builds(project.id)
+                .ok()?
+                .into_iter()
+                .find(|build| build.id == build_id)
+        });
+        return Ok((
+            StatusCode::OK,
+            Json(RepositoryPollResponse {
+                status: if build.is_some() {
+                    "already_queued"
+                } else {
+                    "already_checking"
+                },
+                changed: true,
+                deduplicated: true,
+                revision: source.revision,
+                reference: source.reference,
+                build,
+            }),
+        ));
+    }
+
+    // Build the exact revision observed by this poll. The initial fetch has
+    // already happened, so admission does not repeat the network operation.
+    let queued = match enqueue_project_build(
+        &state,
+        project,
+        QueueBuildRequest {
+            scm: Some(PrepareScmRequest {
+                remote: source.remote.clone().unwrap_or_else(default_remote),
+                fetch: false,
+                revision: Some(source.revision.clone()),
+                fetch_ref: None,
+                clean: false,
+                clean_ignored: false,
+                credential_id: None,
+            }),
+            parameters: BTreeMap::new(),
+            priority: 0,
+        },
+    )
+    .await
+    {
+        Ok(queued) => queued,
+        Err(error) => {
+            state.storage.release_repository_poll_event(&event_id)?;
+            return Err(error);
+        }
+    };
+    state.storage.complete_repository_poll_event(
+        &event_id,
+        queued.build.id,
+        queued.build.number,
+    )?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RepositoryPollResponse {
+            status: "queued",
+            changed: true,
+            deduplicated: false,
+            revision: source.revision,
+            reference: source.reference,
+            build: Some(queued.build),
+        }),
     ))
 }
 
@@ -7562,6 +7750,157 @@ program = "true"
         let builds = storage.list_builds(project.id).expect("builds");
         assert_eq!(builds.len(), 1);
         assert!(builds[0].status.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn repository_poll_queues_only_when_the_head_revision_changes() {
+        let directory = tempdir().expect("tempdir");
+        let repository = directory.path().join("repository");
+        fs::create_dir_all(&repository).expect("repository");
+        let pipeline_path = repository.join("Rivetfile.toml");
+        fs::write(
+            &pipeline_path,
+            r#"
+version = 1
+name = "repository-poll"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline file");
+        let pipeline = Pipeline::load(&pipeline_path).expect("pipeline");
+        let project = Project::new(
+            "repository-poll",
+            repository.to_string_lossy().into_owned(),
+            pipeline_path.to_string_lossy().into_owned(),
+        )
+        .expect("project");
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let state = AppState::new(storage.clone());
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repository)
+                .output()
+                .expect("git available");
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "rivet@example.test"]);
+        git(&["config", "user.name", "Rivet Tests"]);
+        git(&["add", "Rivetfile.toml"]);
+        git(&["commit", "-qm", "initial poll fixture"]);
+        let first_revision = git(&["rev-parse", "HEAD"]);
+
+        let poll = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/projects/repository-poll/repository-changes")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("poll request")
+        };
+        let response = router(state.clone())
+            .oneshot(poll())
+            .await
+            .expect("first poll response");
+        let first_status = response.status();
+        let first_body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("first poll body");
+        assert_eq!(
+            first_status,
+            StatusCode::ACCEPTED,
+            "{}",
+            String::from_utf8_lossy(&first_body)
+        );
+        let first: serde_json::Value =
+            serde_json::from_slice(&first_body).expect("first poll JSON");
+        assert_eq!(first["status"], "queued");
+        assert_eq!(first["changed"], true);
+        assert_eq!(first["deduplicated"], false);
+        assert_eq!(first["revision"], first_revision);
+
+        for _ in 0..50 {
+            if storage
+                .list_builds(project.id)
+                .expect("builds")
+                .first()
+                .is_some_and(|build| build.status.is_terminal())
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let response = router(state.clone())
+            .oneshot(poll())
+            .await
+            .expect("unchanged poll response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let unchanged: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("unchanged poll body"),
+        )
+        .expect("unchanged poll JSON");
+        assert_eq!(unchanged["status"], "unchanged");
+        assert_eq!(unchanged["changed"], false);
+        assert_eq!(storage.list_builds(project.id).expect("one build").len(), 1);
+
+        fs::write(repository.join("change.txt"), "revision two\n").expect("change");
+        git(&["add", "change.txt"]);
+        git(&["commit", "-qm", "second poll fixture"]);
+        let second_revision = git(&["rev-parse", "HEAD"]);
+        let response = router(state.clone())
+            .oneshot(poll())
+            .await
+            .expect("changed poll response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let changed: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("changed poll body"),
+        )
+        .expect("changed poll JSON");
+        assert_eq!(changed["status"], "queued");
+        assert_eq!(changed["changed"], true);
+        assert_eq!(changed["revision"], second_revision);
+        assert_eq!(
+            storage.list_builds(project.id).expect("two builds").len(),
+            2
+        );
+
+        let response = router(state)
+            .oneshot(poll())
+            .await
+            .expect("duplicate changed poll response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let duplicate: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("duplicate changed poll body"),
+        )
+        .expect("duplicate changed poll JSON");
+        assert_eq!(duplicate["status"], "unchanged");
+        assert_eq!(
+            storage
+                .list_builds(project.id)
+                .expect("still two builds")
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

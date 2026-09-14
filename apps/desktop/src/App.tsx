@@ -20,6 +20,7 @@ import {
   initializeEngineOrigin,
   logs,
   pauseQueue,
+  pollRepositoryChanges,
   pipelineParameters as fetchPipelineParameters,
   queueItems as fetchQueueItems,
   projects,
@@ -186,6 +187,8 @@ function App() {
   const [scmClean, setScmClean] = useState(false);
   const [scmCleanIgnored, setScmCleanIgnored] = useState(false);
   const [scmCredentialId, setScmCredentialId] = useState("");
+  const [pollBusy, setPollBusy] = useState(false);
+  const [pollMessage, setPollMessage] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [showScheduleCreate, setShowScheduleCreate] = useState(false);
   const [migrationSource, setMigrationSource] = useState(DEFAULT_JENKINSFILE);
@@ -436,6 +439,38 @@ function App() {
       setError(cause instanceof Error ? cause.message : "Could not queue build");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function checkRepositoryChanges() {
+    if (!projectName) return;
+    setPollBusy(true);
+    setError(null);
+    setPollMessage(null);
+    try {
+      const result = await pollRepositoryChanges(projectName, {
+        remote: scmRemote.trim() || "origin",
+        fetch: scmFetch,
+        credential_id: scmFetch && scmCredentialId.trim() ? scmCredentialId.trim() : undefined,
+      });
+      const revision = shortRevision(result.revision);
+      if (result.build) {
+        setSelectedBuild(result.build.number);
+        await loadBuildList();
+      }
+      setPollMessage(
+        result.status === "queued"
+          ? `Change detected at ${revision} · run #${result.build?.number ?? "—"} queued.`
+          : result.status === "unchanged"
+            ? `No new commit detected · ${revision}.`
+            : result.status === "already_queued"
+              ? `This revision is already admitted · ${revision}.`
+              : `Another poll is checking ${revision}.`,
+      );
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not poll repository changes");
+    } finally {
+      setPollBusy(false);
     }
   }
 
@@ -861,6 +896,7 @@ function App() {
                     setSelectedBuild(null);
                     setParameterDefinitions([]);
                     setParameterValues({});
+                    setPollMessage(null);
                   }}
                 >
                   {projectsList.map((project) => <option key={project.id} value={project.name}>{project.name}</option>)}
@@ -893,6 +929,8 @@ function App() {
               onCredentialChange={setScmCredentialId}
             />
 
+            {pollMessage && <p className="poll-notice" role="status"><span>⌁</span>{pollMessage}</p>}
+
             {parameterDefinitions.length > 0 && (
               <ParameterPanel
                 definitions={parameterDefinitions}
@@ -917,6 +955,7 @@ function App() {
                 {queueStatus && <button className="button button-quiet" disabled={busy || !engineOnline} onClick={() => void toggleQueue()}>{queueStatus.paused ? "Resume queue" : "Pause queue"}</button>}
                 {isRunning && <button className="button button-danger" disabled={busy} onClick={() => void stopSelectedBuild()}>Stop run</button>}
                 {details && details.build.status !== "running" && details.build.status !== "queued" && <button className="button button-quiet" disabled={busy || !engineOnline} onClick={() => void retrySelectedBuild()}>↻ Retry run</button>}
+                <button className="button button-quiet" disabled={busy || pollBusy || !engineOnline} onClick={() => void checkRepositoryChanges()}>{pollBusy ? "Checking…" : "Check changes"}</button>
                 <button className="button button-primary" disabled={busy || !engineOnline} onClick={() => void runSelectedPipeline()}>
                   <span className="run-icon">▶</span> {busy ? "Working…" : "Run pipeline"}
                 </button>

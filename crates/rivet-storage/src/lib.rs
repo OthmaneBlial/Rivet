@@ -107,6 +107,8 @@ pub enum StorageError {
     InvalidScheduleEnabled(i64),
     #[error("webhook delivery {0} does not exist")]
     MissingWebhookDelivery(String),
+    #[error("repository poll event {0} does not exist")]
+    MissingRepositoryPollEvent(String),
     #[error("audit {field} is empty, too long, or contains control characters")]
     InvalidAuditField { field: &'static str },
     #[error("authentication session token digest is invalid")]
@@ -227,6 +229,16 @@ pub struct WebhookDeliveryRecord {
     pub event_id: String,
     pub project_id: ProjectId,
     pub received_at: DateTime<Utc>,
+    pub build_id: Option<BuildId>,
+    pub build_number: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryPollEventRecord {
+    pub event_id: String,
+    pub project_id: ProjectId,
+    pub revision: String,
+    pub checked_at: DateTime<Utc>,
     pub build_id: Option<BuildId>,
     pub build_number: Option<i64>,
 }
@@ -379,6 +391,11 @@ impl Storage {
             Some(include_str!(
                 "../migrations/015_remote_event_deliveries.sql"
             )),
+        )?;
+        apply_migration(
+            &connection,
+            16,
+            Some(include_str!("../migrations/016_repository_poll_events.sql")),
         )?;
         backfill_event_hashes(&connection)?;
         Ok(Self {
@@ -690,6 +707,78 @@ impl Storage {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         connection.execute(
             "DELETE FROM webhook_deliveries WHERE event_id = ?1 AND build_id IS NULL",
+            params![event_id],
+        )?;
+        Ok(())
+    }
+
+    /// Reserve one repository revision transition. The caller derives the
+    /// event ID from the project, observed revision, and previous baseline so
+    /// concurrent pollers cannot queue the same transition twice.
+    pub fn claim_repository_poll_event(
+        &self,
+        event_id: &str,
+        project_id: ProjectId,
+        revision: &str,
+        checked_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "INSERT OR IGNORE INTO repository_poll_events(
+                event_id, project_id, revision, checked_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                event_id,
+                project_id.to_string(),
+                revision,
+                checked_at.to_rfc3339()
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn repository_poll_event(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<RepositoryPollEventRecord>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let row = connection
+            .query_row(
+                "SELECT event_id, project_id, revision, checked_at, build_id, build_number
+                 FROM repository_poll_events WHERE event_id = ?1",
+                params![event_id],
+                raw_repository_poll_event,
+            )
+            .optional()?;
+        row.map(parse_repository_poll_event).transpose()
+    }
+
+    pub fn complete_repository_poll_event(
+        &self,
+        event_id: &str,
+        build_id: BuildId,
+        build_number: i64,
+    ) -> Result<(), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let changed = connection.execute(
+            "UPDATE repository_poll_events
+             SET build_id = ?1, build_number = ?2
+             WHERE event_id = ?3",
+            params![build_id.to_string(), build_number, event_id],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::MissingRepositoryPollEvent(
+                event_id.to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn release_repository_poll_event(&self, event_id: &str) -> Result<(), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        connection.execute(
+            "DELETE FROM repository_poll_events
+             WHERE event_id = ?1 AND build_id IS NULL",
             params![event_id],
         )?;
         Ok(())
@@ -1800,6 +1889,7 @@ type RawSchedule = (
     String,
 );
 type RawWebhookDelivery = (String, String, String, Option<String>, Option<i64>);
+type RawRepositoryPollEvent = (String, String, String, String, Option<String>, Option<i64>);
 type RawAuditEvent = (i64, String, Option<String>, String, String, String);
 type RawAuthSession = (
     String,
@@ -2191,6 +2281,30 @@ fn parse_webhook_delivery(raw: RawWebhookDelivery) -> Result<WebhookDeliveryReco
         received_at: parse_timestamp(&raw.2)?,
         build_id: raw.3.as_deref().map(parse_uuid).transpose()?,
         build_number: raw.4,
+    })
+}
+
+fn raw_repository_poll_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRepositoryPollEvent> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
+fn parse_repository_poll_event(
+    raw: RawRepositoryPollEvent,
+) -> Result<RepositoryPollEventRecord, StorageError> {
+    Ok(RepositoryPollEventRecord {
+        event_id: raw.0,
+        project_id: parse_uuid(&raw.1)?,
+        revision: raw.2,
+        checked_at: parse_timestamp(&raw.3)?,
+        build_id: raw.4.as_deref().map(parse_uuid).transpose()?,
+        build_number: raw.5,
     })
 }
 
@@ -2837,6 +2951,81 @@ program = "true"
                 .expect("reopened delivery")
                 .build_number,
             Some(build.number)
+        );
+    }
+
+    #[test]
+    fn repository_poll_transitions_are_idempotent_and_reopenable() {
+        let directory = tempdir().expect("tempdir");
+        let database = directory.path().join("rivet.db");
+        let (project, pipeline, plan) = fixture();
+        let storage = Storage::open(&database).expect("open");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let build = storage
+            .create_build(&project, &plan, &pipeline, None)
+            .expect("build");
+        let checked_at = Utc::now();
+
+        assert!(
+            storage
+                .claim_repository_poll_event(
+                    "poll-transition-1",
+                    project.id,
+                    "revision-1",
+                    checked_at,
+                )
+                .expect("claim")
+        );
+        assert!(
+            !storage
+                .claim_repository_poll_event(
+                    "poll-transition-1",
+                    project.id,
+                    "revision-1",
+                    checked_at,
+                )
+                .expect("duplicate claim")
+        );
+        storage
+            .complete_repository_poll_event("poll-transition-1", build.id, build.number)
+            .expect("complete");
+
+        drop(storage);
+        let reopened = Storage::open(&database).expect("reopen");
+        assert!(
+            !reopened
+                .claim_repository_poll_event(
+                    "poll-transition-1",
+                    project.id,
+                    "revision-1",
+                    checked_at,
+                )
+                .expect("reopened duplicate claim")
+        );
+        assert!(
+            reopened
+                .claim_repository_poll_event(
+                    "poll-transition-2",
+                    project.id,
+                    "revision-2",
+                    Utc::now(),
+                )
+                .expect("next transition")
+        );
+        reopened
+            .release_repository_poll_event("poll-transition-2")
+            .expect("release");
+        assert!(
+            reopened
+                .claim_repository_poll_event(
+                    "poll-transition-2",
+                    project.id,
+                    "revision-2",
+                    Utc::now(),
+                )
+                .expect("reclaimed transition")
         );
     }
 

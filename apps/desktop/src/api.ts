@@ -11,6 +11,7 @@ import type {
   QueueItem,
   QueueResponse,
   QueueStats,
+  RepositoryPollResponse,
   ScheduleRecord,
 } from "./types";
 import type { ExtensionManifest, ExtensionRuntimeStatus } from "./extensionModel";
@@ -177,6 +178,16 @@ export function queueStats(): Promise<QueueStats> {
 
 export function queueItems(): Promise<QueueItem[]> {
   return request<QueueItem[]>("/api/v1/queue/items");
+}
+
+export function pollRepositoryChanges(
+  project: string,
+  input: { remote?: string; fetch?: boolean; credential_id?: string } = {},
+): Promise<RepositoryPollResponse> {
+  return request<RepositoryPollResponse>(
+    `/api/v1/projects/${encodeURIComponent(project)}/repository-changes`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
 }
 
 export function pipelineParameters(project: string): Promise<PipelineParameter[]> {

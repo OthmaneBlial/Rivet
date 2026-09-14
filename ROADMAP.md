@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **94 / 100 points** (**94.28 weighted evidence
+The current verified total is **94 / 100 points** (**94.33 weighted evidence
 points**, displayed conservatively as 94%).
 
 | Workstream | Weight | Current state | Gate for completion |
@@ -19,7 +19,7 @@ points**, displayed conservatively as 94%).
 | CLI operator workflow | 3 | verified | project/run/history, parameterized builds, artifact listing, retry, schedule management, detailed build inspection, and one-shot authenticated remote build cancellation command |
 | Tauri desktop control room | 10 | partial | native bundle, embedded engine health, rendered light-default/dark-toggle UX, artifact/retry views, schedule controls, desktop SCM preparation and runtime parameter controls, credential lifecycle view, online/offline recovery, real client build flow, and an ephemeral loopback engine origin in the packaged launch pass; final Tauri-window interaction and release QA remain |
 | Git/SCM integration | 8 | partial | direct Git inspect/checkout/fetch/clean operations, bounded provider refspec fetches, REST/CLI surfaces, explicit build-admission preparation, persisted build source identity, provider-neutral credential IDs, ephemeral HTTP/SSH auth handoff, project-scoped credential resolution, provider push/PR adapters, strict deployment-controlled SSH host-key policy, and fixture-backed authenticated fetch/checkout/clean secret-boundary test pass; broader provider lifecycle remains |
-| Triggers and scheduling | 5 | partial | manual/API entry points, validated persistent UTC cron schedules/server dispatch, signed generic webhook delivery with bounded upstream completion gating, and signed GitHub/GitLab push plus PR/MR adapters pass; broader repository-event mapping and upstream provider lifecycle remain |
+| Triggers and scheduling | 5 | partial | manual/API entry points, validated persistent UTC cron schedules/server dispatch, signed generic webhook delivery with bounded upstream completion gating, signed GitHub/GitLab push plus PR/MR adapters, and authenticated repository-change polling with exact-revision queueing plus durable transition deduplication pass; broader provider event mapping and upstream lifecycle remain |
 | Remote agents | 10 | verified | authenticated versioned registration/heartbeat contract, explicit pipeline requirements with local safety refusal, reconnecting agent CLI, reconnect-safe sessions, stale detection, capacity-aware online matching, explicit CPU/memory capability matching and reservation, rendered fleet view, matching capacity reservation, bounded workspace and artifact transfer, shared-runner remote execution, typed event/output relay, cancellation, bounded step retry policy, one bounded replacement-agent attempt with clean terminal failure, persisted event-redelivery idempotence, idempotent startup reconciliation of persisted incomplete builds, redacted durable remote-attempt metadata with same-build/plan startup redispatch, persisted replacement-agent selection and retry budget, bounded session-scoped reliable delivery with ACKs, duplicate suppression, timed retransmission, and durable attempt/sequence identities atomically projected with build events; local replay and conflict tests pass |
 | Container execution | 4 | partial | validated image pull/network/workspace-volume declarations, explicit Docker/Podman runtime selection, bounded command assembly, signal proxying, cleanup flags, and local runtime-shim execution tests pass without Docker installation; Docker/Podman daemon behavior, image policy enforcement, timeout/cancellation, and artifact extraction remain unverified |
 | Artifacts | 4 | partial | local and remote workspace collection, upload/download, bounded checksum-verified transfer, metadata, storage boundary, and explicit retention pruning for completed builds pass; remote object backends remain |
@@ -43,6 +43,6 @@ flow inside the packaged app, API
 deployment hardening, broader provider lifecycle and deployment-specific keychain policy coverage, user
 accounts and external identity providers, a permanent differential regression
 corpus captured from deployed Jenkins, broader repository-event
-mapping, upstream triggers, full Groovy/plugin migration
+mapping and upstream provider triggers, full Groovy/plugin migration
 semantics, typed migration constructs, and broader generated Rivetfile
 conversion with fixture-backed migration regressions.
