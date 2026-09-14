@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **94% verified** · `███████████████████░`<br>
-Weighted evidence score: **94.96 / 100** · displayed conservatively as the
+Weighted evidence score: **94.97 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -29,7 +29,8 @@ downloads with checksum-verified streaming and integrity headers, a priority-ord
 and a light-default desktop theme with an accessible dark-mode
 toggle, persistent UTC cron schedules with repository-poll remote/fetch
 configuration, server dispatch, desktop schedule controls, signed generic
-webhook delivery with idempotent redelivery,
+webhook delivery with idempotent redelivery, GitHub repository-dispatch
+revision triggers,
 policy-backed API identities with role/project authorization,
 secret-parameter redaction/masking, a passphrase-encrypted SCM credential vault
 with typed HTTP/SSH credentials, non-secret credential references, project allow-lists,

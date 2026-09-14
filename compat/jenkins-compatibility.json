@@ -111,7 +111,7 @@
       "feature": "Signed GitHub and GitLab push, pull-request, and merge-request adapters",
       "status": "partial",
       "evidence": ["crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
-      "notes": "Explicit project routes normalize GitHub push/pull_request deliveries and GitLab Push Hook/Tag Push Hook/Merge Request Hook deliveries into the common idempotent build path. GitHub HMAC-SHA256 and GitLab signed webhook headers are verified over the raw body, provider head refs are fetched through bounded refspecs, optional fetch credential IDs are attached, and stale/invalid messages are rejected; broader provider event coverage remains planned."
+      "notes": "Explicit project routes normalize GitHub push/pull_request/pull_request_target and repository_dispatch deliveries plus GitLab Push Hook/Tag Push Hook/Merge Request Hook deliveries into the common idempotent build path. GitHub HMAC-SHA256 and GitLab signed webhook headers are verified over the raw body, repository_dispatch accepts only an exact SHA and bounded string parameters, provider head refs are fetched through bounded refspecs, optional fetch credential IDs are attached, and stale/invalid messages are rejected; broader provider event coverage remains planned."
     },
     {
       "category": "Triggers",

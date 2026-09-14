@@ -2963,7 +2963,7 @@ fn normalize_github_webhook(
                 upstream: None,
             }))
         }
-        "pull_request" => {
+        "pull_request" | "pull_request_target" => {
             let action = payload
                 .get("action")
                 .and_then(serde_json::Value::as_str)
@@ -2999,6 +2999,38 @@ fn normalize_github_webhook(
                 credential_id,
                 submodules: false,
                 parameters: BTreeMap::new(),
+                upstream: None,
+            }))
+        }
+        "repository_dispatch" => {
+            let client_payload = payload
+                .get("client_payload")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "GitHub repository_dispatch client_payload is missing".into(),
+                    )
+                })?;
+            let Some(revision) = normalize_commit_revision(
+                client_payload.get("rivet_revision"),
+                "GitHub repository_dispatch client_payload.rivet_revision",
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(WebhookBuildRequest {
+                event_id,
+                project,
+                revision: Some(revision),
+                fetch_ref: None,
+                remote: Some("origin".into()),
+                fetch: true,
+                credential_id,
+                submodules: false,
+                parameters: webhook_parameters(
+                    client_payload.get("rivet_parameters"),
+                    "GitHub repository_dispatch",
+                )?,
                 upstream: None,
             }))
         }
@@ -3128,6 +3160,25 @@ fn normalize_commit_revision(
         )));
     }
     Ok(Some(revision.to_owned()))
+}
+
+fn webhook_parameters(
+    value: Option<&serde_json::Value>,
+    provider_event: &str,
+) -> Result<BTreeMap<String, String>, ApiError> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let parameters =
+        serde_json::from_value::<BTreeMap<String, String>>(value.clone()).map_err(|error| {
+            ApiError::BadRequest(format!("{provider_event} parameters are invalid: {error}"))
+        })?;
+    if parameters.len() > 64 {
+        return Err(ApiError::BadRequest(format!(
+            "{provider_event} accepts at most 64 parameters"
+        )));
+    }
+    Ok(parameters)
 }
 
 fn required_header(headers: &HeaderMap, name: &'static str) -> Result<String, ApiError> {
@@ -8673,6 +8724,60 @@ program = "true"
             .expect("ignored normalize")
             .is_none()
         );
+    }
+
+    #[test]
+    fn github_repository_dispatch_requires_an_exact_revision_and_maps_parameters() {
+        let body = br#"{"client_payload":{"rivet_revision":"c783c3523482029c449dcdff1209ed06409b83bc","rivet_parameters":{"ENV":"staging"}}}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-github-event",
+            HeaderValue::from_static("repository_dispatch"),
+        );
+        headers.insert(
+            "x-github-delivery",
+            HeaderValue::from_static("github-dispatch-delivery-1"),
+        );
+        headers.insert(
+            "x-hub-signature-256",
+            HeaderValue::from_str(&sign_webhook("github-fixture-secret", body)).expect("signature"),
+        );
+
+        let request = normalize_github_webhook(
+            b"github-fixture-secret",
+            &headers,
+            body,
+            "demo".into(),
+            Some("github".into()),
+        )
+        .expect("normalize")
+        .expect("dispatch request");
+        assert_eq!(request.event_id, "github-dispatch-delivery-1");
+        assert_eq!(
+            request.revision.as_deref(),
+            Some("c783c3523482029c449dcdff1209ed06409b83bc")
+        );
+        assert_eq!(request.parameters.get("ENV"), Some(&"staging".to_owned()));
+        assert!(request.fetch);
+        assert_eq!(request.credential_id.as_deref(), Some("github"));
+
+        let invalid = br#"{"client_payload":{"rivet_parameters":{"ENV":"staging"}}}"#;
+        let mut invalid_headers = headers;
+        invalid_headers.insert(
+            "x-hub-signature-256",
+            HeaderValue::from_str(&sign_webhook("github-fixture-secret", invalid))
+                .expect("signature"),
+        );
+        assert!(matches!(
+            normalize_github_webhook(
+                b"github-fixture-secret",
+                &invalid_headers,
+                invalid,
+                "demo".into(),
+                None,
+            ),
+            Err(ApiError::BadRequest(message)) if message.contains("rivet_revision")
+        ));
     }
 
     #[test]
