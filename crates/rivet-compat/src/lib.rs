@@ -297,11 +297,11 @@ fn normalize_status(value: &str, kind: &'static str) -> Result<&'static str, Com
         "success" | "passed" | "pass" => Ok("passed"),
         "failure" | "failed" | "error" => Ok("failed"),
         "aborted" | "cancelled" | "canceled" => Ok("cancelled"),
+        "not_built" | "not-built" | "skipped" => Ok("skipped"),
         "unstable" => Ok("unstable"),
         "queued" => Ok("queued"),
         "running" => Ok("running"),
         "pending" => Ok("pending"),
-        "skipped" => Ok("skipped"),
         _ => Err(CompatError::InvalidStatus {
             kind,
             value: value.to_owned(),

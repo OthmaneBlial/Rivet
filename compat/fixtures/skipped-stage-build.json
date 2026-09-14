@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "scenario": "skipped-stage-build",
+  "jenkins": {
+    "status": "SUCCESS",
+    "stages": [
+      {
+        "name": "Test",
+        "status": "SUCCESS",
+        "steps": [
+          { "name": "unit", "status": "SUCCESS", "exit_code": 0 }
+        ]
+      },
+      { "name": "Deploy", "status": "NOT_BUILT", "steps": [] }
+    ],
+    "parameters": { "PUBLISH": "false" },
+    "artifacts": [],
+    "logs": ["deploy stage skipped\n"]
+  },
+  "rivet": {
+    "status": "passed",
+    "stages": [
+      {
+        "name": "Test",
+        "status": "passed",
+        "steps": [
+          { "name": "unit", "status": "passed", "exit_code": 0 }
+        ]
+      },
+      { "name": "Deploy", "status": "skipped", "steps": [] }
+    ],
+    "parameters": { "PUBLISH": "false" },
+    "artifacts": [],
+    "logs": ["deploy stage skipped\n"]
+  }
+}

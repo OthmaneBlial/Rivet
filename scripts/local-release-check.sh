@@ -68,10 +68,13 @@ echo "[11/14] exercising local user authentication"
 echo "[12/14] exercising live compatibility capture adapters"
 ./scripts/local-compat-capture-smoke.sh
 
-echo "[13/14] exercising local deployment hardening"
+echo "[13/15] exercising the permanent compatibility corpus"
+./scripts/local-compat-corpus-smoke.sh
+
+echo "[14/15] exercising local deployment hardening"
 ./scripts/local-deployment-smoke.sh
 
-echo "[14/14] writing the local release manifest"
+echo "[15/15] writing the local release manifest"
 jq -n \
     --arg commit "$(git rev-parse HEAD)" \
     --arg generated_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
@@ -82,7 +85,7 @@ jq -n \
     '{schema_version: 1, source_commit: $commit, generated_at: $generated_at,
       github_actions: false, checks: {format: true, workspace_tests: true,
       cli_release_build: true, desktop_web_build: true, tauri_host_check: true,
-      tauri_bundle_smoke: true, local_e2e_smoke: true, local_queue_smoke: true, local_backup_restore_smoke: true, local_auth_smoke: true, compat_capture_smoke: true,
+      tauri_bundle_smoke: true, local_e2e_smoke: true, local_queue_smoke: true, local_backup_restore_smoke: true, local_auth_smoke: true, compat_capture_smoke: true, compat_corpus_smoke: true,
       local_deployment_smoke: true},
       artifacts: [{name: $binary, path: $binary, sha256: $sha256},
         {name: $desktop, path: $desktop, sha256: $desktop_sha256}]}' \

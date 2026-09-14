@@ -38,7 +38,7 @@ and full Jenkins parity are not claimed.
 </p>
 
 **95% verified** · `███████████████████░`<br>
-Weighted evidence score: **95.09 / 100** · displayed conservatively as the
+Weighted evidence score: **95.49 / 100** · displayed conservatively as the
 whole-number floor. This measures the weighted product scope in
 [ROADMAP.md](ROADMAP.md), not Jenkins parity.
 
@@ -243,7 +243,7 @@ boundaries in mind:
 
 ## Current status
 
-The repository currently reports **95.09 / 100 weighted evidence points** and
+The repository currently reports **95.49 / 100 weighted evidence points** and
 displays **95% verified**. This is an engineering progress measure, not a
 promise of complete platform coverage.
 
@@ -279,9 +279,10 @@ The gate checks repository hygiene and progress consistency, Rust formatting
 and tests, the optimized CLI, the desktop web client, the native Tauri host,
 the unsigned macOS bundle and packaged loopback engine, real temporary-data
 SCM/CLI workflows, queue priority and cancellation, backup/restore,
-authentication, compatibility adapters, and deployment hardening. It writes a
-versioned SHA-256 manifest to a temporary release directory. The gate is local
-by design; this repository intentionally has no GitHub Actions workflow.
+authentication, the checked-in compatibility corpus and live adapters, and
+deployment hardening. It writes a versioned SHA-256 manifest to a temporary
+release directory. The gate is local by design; this repository intentionally
+has no GitHub Actions workflow.
 
 ## Roadmap
 
