@@ -26,7 +26,7 @@ use rivet_runner::{CacheStore, MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHand
 use rivet_scm::{
     GitCredential, GitHttpCredential, GitPrepareOptions, GitRepository, GitSshCredential, ScmError,
 };
-use rivet_storage::{ScheduleTrigger, Storage};
+use rivet_storage::{SchedulePollConfig, ScheduleTrigger, Storage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -396,6 +396,15 @@ enum ScheduleCommand {
         /// Trigger mode: build or repository-poll.
         #[arg(long, default_value = "build", value_parser = parse_schedule_trigger)]
         trigger: ScheduleTrigger,
+        /// Git remote used by a repository-poll schedule.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Fetch the configured remote before checking the repository head.
+        #[arg(long)]
+        fetch: bool,
+        /// Project-scoped credential ID used for an authenticated fetch.
+        #[arg(long)]
+        credential_id: Option<String>,
         #[arg(long)]
         disabled: bool,
     },
@@ -2438,6 +2447,9 @@ fn manage_schedule(
             name,
             expression,
             trigger,
+            remote,
+            fetch,
+            credential_id,
             disabled,
         } => {
             let project_record = storage
@@ -2446,11 +2458,28 @@ fn manage_schedule(
             let name = validate_schedule_name(name)?;
             let expression = CronExpression::parse(&expression)?;
             let next_run_at = expression.next_after(Utc::now())?;
-            let schedule = storage.create_schedule_with_trigger(
+            let poll = match trigger {
+                ScheduleTrigger::Build => {
+                    if remote != "origin" || fetch || credential_id.is_some() {
+                        return Err(
+                            "--remote, --fetch, and --credential-id require --trigger repository-poll"
+                                .into(),
+                        );
+                    }
+                    None
+                }
+                ScheduleTrigger::RepositoryPoll => Some(SchedulePollConfig {
+                    remote,
+                    fetch,
+                    credential_id,
+                }),
+            };
+            let schedule = storage.create_schedule_with_trigger_and_poll(
                 project_record.id,
                 name,
                 expression.expression(),
                 trigger,
+                poll,
                 !disabled,
                 next_run_at,
             )?;

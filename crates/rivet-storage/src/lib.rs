@@ -107,6 +107,12 @@ pub enum StorageError {
     InvalidScheduleEnabled(i64),
     #[error("invalid schedule trigger in database: {0}")]
     InvalidScheduleTrigger(String),
+    #[error("invalid schedule poll remote in database: {0}")]
+    InvalidSchedulePollRemote(String),
+    #[error("invalid schedule poll fetch flag in database: {0}")]
+    InvalidSchedulePollFetch(i64),
+    #[error("invalid schedule poll credential ID in database: {0}")]
+    InvalidSchedulePollCredential(String),
     #[error("webhook delivery {0} does not exist")]
     MissingWebhookDelivery(String),
     #[error("repository poll event {0} does not exist")]
@@ -214,7 +220,7 @@ pub struct ArtifactPruneResult {
     pub remaining_bytes: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleTrigger {
     Build,
@@ -237,12 +243,32 @@ impl ScheduleTrigger {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchedulePollConfig {
+    pub remote: String,
+    pub fetch: bool,
+    pub credential_id: Option<String>,
+}
+
+impl Default for SchedulePollConfig {
+    fn default() -> Self {
+        Self {
+            remote: "origin".to_owned(),
+            fetch: false,
+            credential_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScheduleRecord {
     pub id: ScheduleId,
     pub project_id: ProjectId,
     pub name: String,
     pub expression: String,
     pub trigger: ScheduleTrigger,
+    /// Repository polling configuration. Build schedules intentionally omit
+    /// this field so the API cannot imply that every schedule mutates Git.
+    pub poll: Option<SchedulePollConfig>,
     pub enabled: bool,
     pub next_run_at: DateTime<Utc>,
     pub last_run_at: Option<DateTime<Utc>>,
@@ -427,6 +453,11 @@ impl Storage {
             17,
             Some(include_str!("../migrations/017_schedule_triggers.sql")),
         )?;
+        apply_migration(
+            &connection,
+            18,
+            Some(include_str!("../migrations/018_schedule_poll_config.sql")),
+        )?;
         backfill_event_hashes(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -563,12 +594,43 @@ impl Storage {
         enabled: bool,
         next_run_at: DateTime<Utc>,
     ) -> Result<ScheduleRecord, StorageError> {
+        self.create_schedule_with_trigger_and_poll(
+            project_id,
+            name,
+            expression,
+            trigger,
+            None,
+            enabled,
+            next_run_at,
+        )
+    }
+
+    pub fn create_schedule_with_trigger_and_poll(
+        &self,
+        project_id: ProjectId,
+        name: impl Into<String>,
+        expression: impl Into<String>,
+        trigger: ScheduleTrigger,
+        poll: Option<SchedulePollConfig>,
+        enabled: bool,
+        next_run_at: DateTime<Utc>,
+    ) -> Result<ScheduleRecord, StorageError> {
+        let poll = match trigger {
+            ScheduleTrigger::Build => None,
+            ScheduleTrigger::RepositoryPoll => {
+                Some(normalize_schedule_poll_config(poll.unwrap_or_default())?)
+            }
+        };
+        if let Some(poll) = poll.as_ref() {
+            validate_schedule_poll_config(poll)?;
+        }
         let schedule = ScheduleRecord {
             id: Uuid::new_v4(),
             project_id,
             name: name.into(),
             expression: expression.into(),
             trigger,
+            poll: poll.clone(),
             enabled,
             next_run_at,
             last_run_at: None,
@@ -577,8 +639,9 @@ impl Storage {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         connection.execute(
             "INSERT INTO schedules(
-                id, project_id, name, expression, trigger, enabled, next_run_at, last_run_at, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                id, project_id, name, expression, trigger, enabled, next_run_at, last_run_at,
+                created_at, poll_remote, poll_fetch, poll_credential_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 schedule.id.to_string(),
                 schedule.project_id.to_string(),
@@ -589,6 +652,11 @@ impl Storage {
                 schedule.next_run_at.to_rfc3339(),
                 Option::<String>::None,
                 schedule.created_at.to_rfc3339(),
+                poll.as_ref()
+                    .map(|poll| poll.remote.as_str())
+                    .unwrap_or("origin"),
+                i64::from(poll.as_ref().is_some_and(|poll| poll.fetch)),
+                poll.as_ref().and_then(|poll| poll.credential_id.as_deref()),
             ],
         )?;
         Ok(schedule)
@@ -600,7 +668,8 @@ impl Storage {
     ) -> Result<Vec<ScheduleRecord>, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
-            "SELECT id, project_id, name, expression, trigger, enabled, next_run_at, last_run_at, created_at
+            "SELECT id, project_id, name, expression, trigger, enabled, next_run_at, last_run_at,
+                    created_at, poll_remote, poll_fetch, poll_credential_id
              FROM schedules WHERE project_id = ?1 ORDER BY name ASC",
         )?;
         let rows = statement.query_map(params![project_id.to_string()], raw_schedule)?;
@@ -616,7 +685,8 @@ impl Storage {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let row = connection
             .query_row(
-                "SELECT id, project_id, name, expression, trigger, enabled, next_run_at, last_run_at, created_at
+                "SELECT id, project_id, name, expression, trigger, enabled, next_run_at, last_run_at,
+                        created_at, poll_remote, poll_fetch, poll_credential_id
                  FROM schedules WHERE project_id = ?1 AND id = ?2",
                 params![project_id.to_string(), schedule_id.to_string()],
                 raw_schedule,
@@ -628,7 +698,8 @@ impl Storage {
     pub fn due_schedules(&self, now: DateTime<Utc>) -> Result<Vec<ScheduleRecord>, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
-            "SELECT id, project_id, name, expression, trigger, enabled, next_run_at, last_run_at, created_at
+            "SELECT id, project_id, name, expression, trigger, enabled, next_run_at, last_run_at,
+                    created_at, poll_remote, poll_fetch, poll_credential_id
              FROM schedules
              WHERE enabled = 1 AND next_run_at <= ?1
              ORDER BY next_run_at ASC, created_at ASC, id ASC",
@@ -681,7 +752,8 @@ impl Storage {
             return Ok(None);
         }
         let row = connection.query_row(
-            "SELECT id, project_id, name, expression, trigger, enabled, next_run_at, last_run_at, created_at
+            "SELECT id, project_id, name, expression, trigger, enabled, next_run_at, last_run_at,
+                    created_at, poll_remote, poll_fetch, poll_credential_id
              FROM schedules WHERE project_id = ?1 AND id = ?2",
             params![project_id.to_string(), schedule_id.to_string()],
             raw_schedule,
@@ -1939,6 +2011,9 @@ type RawSchedule = (
     String,
     Option<String>,
     String,
+    String,
+    i64,
+    Option<String>,
 );
 type RawWebhookDelivery = (String, String, String, Option<String>, Option<i64>);
 type RawRepositoryPollEvent = (String, String, String, String, Option<String>, Option<i64>);
@@ -1974,6 +2049,44 @@ fn validate_audit_field(value: &str, field: &'static str) -> Result<(), StorageE
         return Err(StorageError::InvalidAuditField { field });
     }
     Ok(())
+}
+
+fn validate_schedule_poll_config(config: &SchedulePollConfig) -> Result<(), StorageError> {
+    if config.remote.trim().is_empty()
+        || config.remote.starts_with('-')
+        || config.remote.chars().any(char::is_control)
+    {
+        return Err(StorageError::InvalidSchedulePollRemote(
+            config.remote.clone(),
+        ));
+    }
+    if let Some(credential_id) = config.credential_id.as_deref() {
+        if credential_id.trim().is_empty()
+            || credential_id.len() > 256
+            || credential_id.chars().any(char::is_control)
+        {
+            return Err(StorageError::InvalidSchedulePollCredential(
+                credential_id.to_owned(),
+            ));
+        }
+    }
+    if config.credential_id.is_some() && !config.fetch {
+        return Err(StorageError::InvalidSchedulePollRemote(
+            "a poll credential requires fetch=true".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_schedule_poll_config(
+    mut config: SchedulePollConfig,
+) -> Result<SchedulePollConfig, StorageError> {
+    validate_schedule_poll_config(&config)?;
+    config.remote = config.remote.trim().to_owned();
+    if let Some(credential_id) = config.credential_id.as_mut() {
+        *credential_id = credential_id.trim().to_owned();
+    }
+    Ok(config)
 }
 
 fn validate_annotation_field(
@@ -2296,6 +2409,9 @@ fn raw_schedule(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSchedule> {
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
     ))
 }
 
@@ -2310,12 +2426,29 @@ fn parse_schedule(raw: RawSchedule) -> Result<ScheduleRecord, StorageError> {
         1 => true,
         value => return Err(StorageError::InvalidScheduleEnabled(value)),
     };
+    let poll = if matches!(trigger, ScheduleTrigger::RepositoryPoll) {
+        let fetch = match raw.10 {
+            0 => false,
+            1 => true,
+            value => return Err(StorageError::InvalidSchedulePollFetch(value)),
+        };
+        let poll = SchedulePollConfig {
+            remote: raw.9,
+            fetch,
+            credential_id: raw.11,
+        };
+        validate_schedule_poll_config(&poll)?;
+        Some(poll)
+    } else {
+        None
+    };
     Ok(ScheduleRecord {
         id: parse_uuid(&raw.0)?,
         project_id: parse_uuid(&raw.1)?,
         name: raw.2,
         expression: raw.3,
         trigger,
+        poll,
         enabled,
         next_run_at: parse_timestamp(&raw.6)?,
         last_run_at: raw.7.as_deref().map(parse_timestamp).transpose()?,
@@ -2952,6 +3085,74 @@ program = "true"
         assert_eq!(persisted.trigger, ScheduleTrigger::Build);
         assert_eq!(persisted.next_run_at, next_at);
         assert_eq!(persisted.last_run_at, Some(due_at));
+    }
+
+    #[test]
+    fn repository_poll_schedule_options_survive_reopen() {
+        let directory = tempdir().expect("tempdir");
+        let database = directory.path().join("rivet.db");
+        let (project, pipeline, _) = fixture();
+        let storage = Storage::open(&database).expect("open");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let due_at = Utc
+            .with_ymd_and_hms(2026, 9, 13, 12, 0, 0)
+            .single()
+            .expect("due timestamp");
+        let poll = SchedulePollConfig {
+            remote: "upstream".into(),
+            fetch: true,
+            credential_id: Some("scm-prod".into()),
+        };
+        let schedule = storage
+            .create_schedule_with_trigger_and_poll(
+                project.id,
+                "poll-upstream",
+                "*/5 * * * *",
+                ScheduleTrigger::RepositoryPoll,
+                Some(poll.clone()),
+                true,
+                due_at,
+            )
+            .expect("schedule");
+        assert_eq!(schedule.poll, Some(poll.clone()));
+        drop(storage);
+
+        let reopened = Storage::open(&database).expect("reopen");
+        let persisted = reopened
+            .list_schedules(project.id)
+            .expect("persisted")
+            .pop()
+            .expect("schedule exists");
+        assert_eq!(persisted.poll, Some(poll));
+    }
+
+    #[test]
+    fn repository_poll_schedule_rejects_credentials_without_fetch() {
+        let (project, pipeline, _) = fixture();
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let result = storage.create_schedule_with_trigger_and_poll(
+            project.id,
+            "invalid-poll",
+            "* * * * *",
+            ScheduleTrigger::RepositoryPoll,
+            Some(SchedulePollConfig {
+                remote: "origin".into(),
+                fetch: false,
+                credential_id: Some("scm-prod".into()),
+            }),
+            true,
+            Utc::now(),
+        );
+        assert!(matches!(
+            result,
+            Err(StorageError::InvalidSchedulePollRemote(message))
+                if message.contains("fetch=true")
+        ));
     }
 
     #[test]

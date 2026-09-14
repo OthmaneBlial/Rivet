@@ -96,8 +96,8 @@
       "category": "Triggers",
       "feature": "Manual/API builds and persistent UTC cron schedules",
       "status": "partial",
-      "evidence": ["crates/rivet-core/src/schedule.rs", "crates/rivet-storage/migrations/006_schedules.sql", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
-      "notes": "Five-field cron expressions are validated, persisted, atomically claimed, and exposed through API, CLI, and desktop controls. Schedules can either admit a build every occurrence or run the authenticated repository poller and admit only an unrecorded exact Git revision; signed provider PR/MR actions are normalized into real builds, while broader repository-event and upstream trigger mapping remain planned."
+      "evidence": ["crates/rivet-core/src/schedule.rs", "crates/rivet-storage/migrations/006_schedules.sql", "crates/rivet-storage/migrations/017_schedule_triggers.sql", "crates/rivet-storage/migrations/018_schedule_poll_config.sql", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs", "apps/desktop/src/App.tsx"],
+      "notes": "Five-field cron expressions are validated, persisted, atomically claimed, and exposed through API, CLI, and desktop controls. Schedules can either admit a build every occurrence or run the authenticated repository poller with persisted remote, fetch, and opaque credential-ID options; polling admits only an unrecorded exact Git revision. Signed provider PR/MR actions are normalized into real builds, while broader repository-event and upstream trigger mapping remain planned."
     },
     {
       "category": "Triggers",
@@ -118,7 +118,7 @@
       "feature": "Authenticated repository-change polling",
       "status": "partial",
       "evidence": ["crates/rivet-server/src/lib.rs", "crates/rivet-storage/migrations/016_repository_poll_events.sql", "crates/rivet-cli/src/main.rs", "apps/desktop/src/App.tsx"],
-      "notes": "A project-scoped authenticated endpoint inspects the local Git checkout, optionally fetches an explicit remote with a vault credential ID, compares the observed revision with the latest build, queues the exact revision, and durably deduplicates concurrent or repeated transitions; provider-side event delivery and upstream lifecycle mapping remain planned."
+      "notes": "A project-scoped authenticated endpoint inspects the local Git checkout, optionally fetches an explicit remote with a vault credential ID, compares the observed revision with the latest build, queues the exact revision, and durably deduplicates concurrent or repeated transitions. Persistent repository-poll schedules reuse those bounded options at dispatch time; provider-side event delivery and upstream lifecycle mapping remain planned."
     },
     {
       "category": "Agents",

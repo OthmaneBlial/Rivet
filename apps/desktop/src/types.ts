@@ -99,6 +99,7 @@ export interface ScheduleRecord {
   name: string;
   expression: string;
   trigger: ScheduleTrigger;
+  poll: SchedulePollConfig | null;
   enabled: boolean;
   next_run_at: string;
   last_run_at: string | null;
@@ -106,6 +107,12 @@ export interface ScheduleRecord {
 }
 
 export type ScheduleTrigger = "build" | "repository_poll";
+
+export interface SchedulePollConfig {
+  remote: string;
+  fetch: boolean;
+  credential_id: string | null;
+}
 
 export interface QueueResponse {
   build: BuildRecord;

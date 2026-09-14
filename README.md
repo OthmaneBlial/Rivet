@@ -24,8 +24,9 @@ transport with safe request IDs and structured method/route/status tracing,
 build retry, pre-execution queue cancellation, build artifact
 downloads, a priority-ordered queue snapshot and rendered queue control room,
 and a light-default desktop theme with an accessible dark-mode
-toggle, persistent UTC cron schedules, server dispatch, desktop schedule
-controls, signed generic webhook delivery with idempotent redelivery,
+toggle, persistent UTC cron schedules with repository-poll remote/fetch
+configuration, server dispatch, desktop schedule controls, signed generic
+webhook delivery with idempotent redelivery,
 policy-backed API identities with role/project authorization,
 secret-parameter redaction/masking, a passphrase-encrypted SCM credential vault
 with typed HTTP/SSH credentials, non-secret credential references, project allow-lists,
@@ -625,15 +626,18 @@ the familiar five-field form:
 cargo run -p rivet -- schedule create rivet \
   --name nightly --expression "0 2 * * *"
 cargo run -p rivet -- schedule create rivet \
-  --name poll-main --expression "*/5 * * * *" --trigger repository-poll
+  --name poll-main --expression "*/5 * * * *" --trigger repository-poll \
+  --remote origin --fetch --credential-id scm-read
 cargo run -p rivet -- schedule list rivet
 ```
 
 Schedules default to `build`, which admits one pipeline run at each due UTC
 occurrence. `--trigger repository-poll` instead inspects the project's local
 Git checkout at each occurrence and admits a build only for a revision not yet
-recorded for that project; the API and desktop schedule form expose the same
-two trigger modes.
+recorded for that project. Repository-poll schedules persist the selected
+remote, whether a fetch is requested, and only the opaque credential ID used
+to resolve a vault entry at dispatch time. The API accepts the same values in
+a `poll` object, and the desktop schedule form exposes the same controls.
 
 The first executable pipeline format is deliberately explicit:
 

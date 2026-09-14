@@ -40,7 +40,8 @@ use rivet_scm::{
 };
 use rivet_storage::{
     AnnotationRecord, ArtifactRecord, AuditEventRecord, BuildDetails, BuildRecord, LogRecord,
-    RemoteAttemptRecord, ScheduleRecord, ScheduleTrigger, Storage, StorageError,
+    RemoteAttemptRecord, SchedulePollConfig, ScheduleRecord, ScheduleTrigger, Storage,
+    StorageError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -459,7 +460,7 @@ pub struct QueueBuildRequest {
     pub priority: i32,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct RepositoryPollRequest {
     /// Remote to fetch when `fetch` is enabled.
     #[serde(default = "default_remote")]
@@ -486,6 +487,10 @@ pub struct CreateScheduleRequest {
     pub expression: String,
     #[serde(default)]
     pub trigger: ScheduleTrigger,
+    /// Poll options are only accepted for repository_poll schedules. The
+    /// credential is an opaque vault ID; its secret never enters the record.
+    #[serde(default)]
+    pub poll: Option<RepositoryPollRequest>,
     #[serde(default = "default_schedule_enabled")]
     pub enabled: bool,
 }
@@ -2560,11 +2565,30 @@ async fn create_schedule(
     let next_run_at = expression
         .next_after(now)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let schedule = state.storage.create_schedule_with_trigger(
+    let poll = match request.trigger {
+        ScheduleTrigger::Build => {
+            if request.poll.is_some() {
+                return Err(ApiError::BadRequest(
+                    "poll options require trigger=repository_poll".into(),
+                ));
+            }
+            None
+        }
+        ScheduleTrigger::RepositoryPoll => {
+            let request = normalize_repository_poll_request(request.poll.unwrap_or_default())?;
+            Some(SchedulePollConfig {
+                remote: request.remote,
+                fetch: request.fetch,
+                credential_id: request.credential_id,
+            })
+        }
+    };
+    let schedule = state.storage.create_schedule_with_trigger_and_poll(
         project.id,
         schedule_name,
         expression.expression(),
         request.trigger,
+        poll,
         request.enabled,
         next_run_at,
     )?;
@@ -3378,13 +3402,19 @@ async fn dispatch_due_schedules(state: &AppState, now: DateTime<Utc>) -> Result<
                     .await
                     .map(|_| true)
             }
-            ScheduleTrigger::RepositoryPoll => poll_repository_changes_for_project(
-                state,
-                project,
-                RepositoryPollRequest::default(),
-            )
-            .await
-            .map(|response| response.status == "queued"),
+            ScheduleTrigger::RepositoryPoll => {
+                let poll = schedule
+                    .poll
+                    .map(|poll| RepositoryPollRequest {
+                        remote: poll.remote,
+                        fetch: poll.fetch,
+                        credential_id: poll.credential_id,
+                    })
+                    .unwrap_or_default();
+                poll_repository_changes_for_project(state, project, poll)
+                    .await
+                    .map(|response| response.status == "queued")
+            }
         };
         match queued {
             Ok(true) => dispatched += 1,
@@ -3410,6 +3440,37 @@ fn validate_schedule_name(name: String) -> Result<String, ApiError> {
         ));
     }
     Ok(name.to_owned())
+}
+
+fn normalize_repository_poll_request(
+    mut request: RepositoryPollRequest,
+) -> Result<RepositoryPollRequest, ApiError> {
+    let remote = request.remote.trim();
+    if remote.is_empty() {
+        request.remote = default_remote();
+    } else if remote.len() > 256 || remote.starts_with('-') || remote.chars().any(char::is_control)
+    {
+        return Err(ApiError::BadRequest(
+            "repository poll remote must be a bounded Git remote name".into(),
+        ));
+    } else {
+        request.remote = remote.to_owned();
+    }
+    if let Some(credential_id) = request.credential_id.as_mut() {
+        let trimmed = credential_id.trim();
+        if trimmed.is_empty() || trimmed.len() > 256 || trimmed.chars().any(char::is_control) {
+            return Err(ApiError::BadRequest(
+                "repository poll credential_id must be a bounded opaque ID".into(),
+            ));
+        }
+        *credential_id = trimmed.to_owned();
+    }
+    if request.credential_id.is_some() && !request.fetch {
+        return Err(ApiError::BadRequest(
+            "a repository poll credential requires fetch=true".into(),
+        ));
+    }
+    Ok(request)
 }
 
 async fn create_project(
@@ -3588,11 +3649,7 @@ async fn poll_repository_changes_for_project(
     project: Project,
     request: RepositoryPollRequest,
 ) -> Result<RepositoryPollResponse, ApiError> {
-    if request.credential_id.is_some() && !request.fetch {
-        return Err(ApiError::BadRequest(
-            "a repository poll credential requires fetch=true".into(),
-        ));
-    }
+    let request = normalize_repository_poll_request(request)?;
 
     let prepare = PrepareScmRequest {
         remote: if request.remote.trim().is_empty() {
@@ -8360,7 +8417,7 @@ program = "true"
                     .uri("/api/v1/projects/demo/schedules")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"name":"every-five","expression":"*/5 * * * *","trigger":"repository_poll"}"#,
+                        r#"{"name":"every-five","expression":"*/5 * * * *","trigger":"repository_poll","poll":{"remote":"upstream","fetch":true,"credential_id":"scm-prod"}}"#,
                     ))
                     .expect("request"),
             )
@@ -8370,6 +8427,14 @@ program = "true"
         let body = to_bytes(response.into_body(), 8192).await.expect("body");
         let schedule: ScheduleRecord = serde_json::from_slice(&body).expect("schedule");
         assert_eq!(schedule.trigger, ScheduleTrigger::RepositoryPoll);
+        assert_eq!(
+            schedule.poll,
+            Some(SchedulePollConfig {
+                remote: "upstream".into(),
+                fetch: true,
+                credential_id: Some("scm-prod".into()),
+            })
+        );
 
         let response = router(state.clone())
             .oneshot(
@@ -8384,6 +8449,21 @@ program = "true"
         let body = to_bytes(response.into_body(), 8192).await.expect("body");
         let schedules: Vec<ScheduleRecord> = serde_json::from_slice(&body).expect("schedules");
         assert_eq!(schedules, vec![schedule.clone()]);
+
+        let invalid_poll = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/projects/demo/schedules")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"invalid-poll","expression":"*/5 * * * *","trigger":"repository_poll","poll":{"credential_id":"scm-prod"}}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(invalid_poll.status(), StatusCode::BAD_REQUEST);
 
         let response = router(state.clone())
             .oneshot(

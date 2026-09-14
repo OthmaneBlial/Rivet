@@ -12,6 +12,7 @@ import type {
   QueueResponse,
   QueueStats,
   RepositoryPollResponse,
+  SchedulePollConfig,
   ScheduleRecord,
   ScheduleTrigger,
 } from "./types";
@@ -317,7 +318,13 @@ export function schedules(project: string): Promise<ScheduleRecord[]> {
 
 export function createSchedule(
   project: string,
-  input: { name: string; expression: string; trigger?: ScheduleTrigger; enabled?: boolean },
+  input: {
+    name: string;
+    expression: string;
+    trigger?: ScheduleTrigger;
+    poll?: SchedulePollConfig;
+    enabled?: boolean;
+  },
 ): Promise<ScheduleRecord> {
   return request<ScheduleRecord>(
     `/api/v1/projects/${encodeURIComponent(project)}/schedules`,

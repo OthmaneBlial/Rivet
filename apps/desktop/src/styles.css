@@ -181,13 +181,15 @@ select:focus { border-color: var(--amber); }
 
 .schedules-panel { margin-bottom: 10px; }
 .schedule-heading-actions { display: flex; align-items: center; gap: 12px; }
-.schedule-form { display: grid; grid-template-columns: minmax(130px, .7fr) minmax(175px, 1fr) minmax(220px, 1.3fr) auto; align-items: end; gap: 12px; padding: 15px 19px; border-bottom: 1px solid var(--line); background: var(--stage-surface); }
+.schedule-form { display: grid; grid-template-columns: minmax(130px, .7fr) minmax(175px, 1fr) minmax(180px, 1fr) minmax(150px, .9fr) minmax(180px, 1fr) minmax(150px, .9fr) auto; align-items: end; gap: 12px; padding: 15px 19px; border-bottom: 1px solid var(--line); background: var(--stage-surface); }
 .schedule-form label { display: grid; gap: 7px; color: var(--muted); font: 10px "Azeret Mono", monospace; letter-spacing: .05em; text-transform: uppercase; }
 .schedule-form input, .schedule-form select { width: 100%; min-height: 37px; padding: 10px 11px; border: 1px solid var(--line-strong); outline: none; border-radius: 2px; color: var(--white); background: var(--input-surface); font: 12px "DM Sans", sans-serif; }
 .schedule-form input:focus { border-color: var(--amber); box-shadow: 0 0 0 2px rgba(166,94,20,.1); }
 .schedule-form select:focus { border-color: var(--amber); box-shadow: 0 0 0 2px rgba(166,94,20,.1); }
 .schedule-form small { color: var(--faint); font: 9px "Azeret Mono", monospace; letter-spacing: 0; text-transform: none; }
 .schedule-form .button { min-height: 39px; }
+.schedule-checkbox { display: flex !important; align-items: center; align-self: stretch; gap: 9px !important; padding-bottom: 2px; color: var(--muted); font: 10px "Azeret Mono", monospace; text-transform: uppercase; }
+.schedule-checkbox input { width: 15px; min-height: 15px; accent-color: var(--amber); }
 .schedule-list { display: grid; }
 .schedule-row { display: grid; grid-template-columns: 8px minmax(0, 1fr) 54px auto 26px; align-items: center; gap: 10px; min-height: 66px; padding: 0 19px; border-bottom: 1px solid var(--row-line); }
 .schedule-row:last-child { border-bottom: 0; }
