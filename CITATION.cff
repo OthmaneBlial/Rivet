@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+title: "Rivet"
+message: "If Rivet helps your work, please cite the project and the release you used."
+type: software
+abstract: "Rust-native, self-hosted CI/CD automation platform and modern Jenkins alternative for local and remote build pipelines."
+authors:
+  - family-names: Blial
+    given-names: Othmane
+    website: https://github.com/OthmaneBlial
+repository-code: https://github.com/OthmaneBlial/Rivet
+url: https://github.com/OthmaneBlial/Rivet
+license: Apache-2.0
+version: 0.1.0-alpha
+date-released: 2026-09-14

@@ -29,7 +29,8 @@ and full Jenkins parity are not claimed.
   <a href="SUPPORT.md">Support</a> ·
   <a href="CODE_OF_CONDUCT.md">Code of Conduct</a> ·
   <a href="SECURITY.md">Security</a> ·
-  <a href="CHANGELOG.md">Changelog</a>
+  <a href="CHANGELOG.md">Changelog</a> ·
+  <a href="CITATION.cff">Citation</a>
 </p>
 
 <p align="center">

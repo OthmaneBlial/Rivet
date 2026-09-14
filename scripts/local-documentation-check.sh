@@ -12,6 +12,7 @@ test -s SECURITY.md
 test -s SUPPORT.md
 test -s CODE_OF_CONDUCT.md
 test -s CHANGELOG.md
+test -s CITATION.cff
 test -s .github/pull_request_template.md
 test -s .github/CODEOWNERS
 test -s .github/ISSUE_TEMPLATE/bug_report.md
@@ -23,7 +24,7 @@ test -s assets/demo/rivet-desktop-demo.gif
 test -s assets/demo/rivet-desktop-demo.mp4
 test -s apps/desktop/src-tauri/icons/icon.svg
 
-for path in ROADMAP.md CONTRIBUTING.md SECURITY.md LICENSE CHANGELOG.md \
+for path in ROADMAP.md CONTRIBUTING.md SECURITY.md LICENSE CHANGELOG.md CITATION.cff \
     SUPPORT.md CODE_OF_CONDUCT.md \
     compat/jenkins-compatibility.json \
     assets/demo/rivet-desktop-demo.gif \
