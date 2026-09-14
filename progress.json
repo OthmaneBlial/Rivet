@@ -11,7 +11,7 @@
     {"id": "foundation", "weight": 4, "completion": 1.0, "status": "verified"},
     {"id": "pipeline", "weight": 4, "completion": 1.0, "status": "verified"},
     {"id": "runner", "weight": 6, "completion": 1.0, "status": "verified"},
-    {"id": "scheduler", "weight": 6, "completion": 0.998, "status": "partial"},
+    {"id": "scheduler", "weight": 6, "completion": 0.999, "status": "partial"},
     {"id": "storage", "weight": 6, "completion": 1.0, "status": "verified"},
     {"id": "api", "weight": 6, "completion": 1.0, "status": "verified"},
     {"id": "cli", "weight": 3, "completion": 1.0, "status": "verified"},

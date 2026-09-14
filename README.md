@@ -14,7 +14,7 @@ behavior backed by current tests or an exercised local workflow; incomplete
 and unverified work remains at zero until it passes its gate.
 
 Last verified update: **2026-09-14** · native pipeline execution, priority-aware
-FIFO queue with pause/resume controls,
+FIFO queue with bounded anti-starvation aging and pause/resume controls,
 SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
 clone/inspection, local/remote project onboarding, server-side project bootstrap
 cloning into explicit destinations, and CLI project bootstrap cloning,
