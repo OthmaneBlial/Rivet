@@ -28,6 +28,7 @@ health_headers="$deployment_dir/health.headers"
 fallback_headers="$deployment_dir/fallback.headers"
 health_body="$deployment_dir/health.json"
 projects_body="$deployment_dir/projects.json"
+metrics_body="$deployment_dir/metrics.prom"
 unauthorized_body="$deployment_dir/unauthorized.json"
 public_bind_log="$deployment_dir/public-bind.log"
 
@@ -79,6 +80,13 @@ curl -fsS -o "$projects_body" \
     -H "authorization: Bearer $token" \
     "http://127.0.0.1:$auth_port/api/v1/projects"
 jq -e 'type == "array"' "$projects_body" >/dev/null
+
+curl -fsS -o "$metrics_body" \
+    -H "authorization: Bearer $token" \
+    "http://127.0.0.1:$auth_port/api/v1/metrics"
+rg -Fq 'rivet_info{service="rivet-server"} 1' "$metrics_body"
+rg -Fq 'rivet_projects_total 0' "$metrics_body"
+rg -Fq 'rivet_queue_capacity 2' "$metrics_body"
 
 if rg -a -F -q "$token" "$server_log"; then
     printf '%s\n' "local deployment smoke refused: token reached server logs" >&2

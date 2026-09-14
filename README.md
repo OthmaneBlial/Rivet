@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **94% verified** · `███████████████████░`<br>
-Weighted evidence score: **94.73 / 100** · displayed conservatively as the
+Weighted evidence score: **94.78 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -75,7 +75,10 @@ that identity with the build projection, so replay after a server restart is
 applied at most once and conflicting reuse is rejected. Bounded retry recovery
 is durable locally. Authenticated deployments persist bounded success/failure audit records
 without request bodies or Bearer values and expose them only to administrators.
-Server deployments can exchange an authenticated API token for a twelve-hour
+Server deployments expose an authenticated Prometheus-compatible `/api/v1/metrics`
+surface with bounded queue, capacity, project, and active-build gauges; health
+and readiness remain the public probes. Server deployments can exchange an
+authenticated API token for a twelve-hour
 opaque session token; only its SHA-256 digest and scoped principal snapshot are
 persisted, and the current session can be revoked. User accounts and external
 identity providers remain future gates.

@@ -664,6 +664,7 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
     Ok(Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/ready", get(readiness))
+        .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/me", get(auth_me))
         .route("/api/v1/auth/sessions", post(create_session))
@@ -1690,6 +1691,45 @@ async fn readiness(State(state): State<AppState>) -> Response {
                 .into_response()
         }
     }
+}
+
+async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let queue = state.scheduler.stats();
+    let project_count = state.storage.list_projects()?.len();
+    let active_builds = state.active_builds.lock().await.len();
+    let body = format!(
+        "# HELP rivet_info Static metadata for the Rivet server.\n\
+# TYPE rivet_info gauge\n\
+rivet_info{{service=\"rivet-server\"}} 1\n\
+# HELP rivet_projects_total Number of projects known to this server.\n\
+# TYPE rivet_projects_total gauge\n\
+rivet_projects_total {project_count}\n\
+# HELP rivet_builds_active Builds currently owned by the execution service.\n\
+# TYPE rivet_builds_active gauge\n\
+rivet_builds_active {active_builds}\n\
+# HELP rivet_queue_queued Builds waiting for scheduler admission.\n\
+# TYPE rivet_queue_queued gauge\n\
+rivet_queue_queued {}\n\
+# HELP rivet_queue_running Builds currently occupying scheduler capacity.\n\
+# TYPE rivet_queue_running gauge\n\
+rivet_queue_running {}\n\
+# HELP rivet_queue_capacity Configured scheduler capacity.\n\
+# TYPE rivet_queue_capacity gauge\n\
+rivet_queue_capacity {}\n\
+# HELP rivet_queue_paused Whether new scheduler admissions are paused.\n\
+# TYPE rivet_queue_paused gauge\n\
+rivet_queue_paused {}\n",
+        queue.queued,
+        queue.running,
+        queue.capacity,
+        usize::from(queue.paused),
+    );
+    let mut response = (StatusCode::OK, body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    Ok(response)
 }
 
 async fn analyze_jenkinsfile(
@@ -5407,6 +5447,61 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_route_is_authenticated_and_reports_bounded_gauges() {
+        let pipeline = Pipeline::from_toml_str(
+            "version = 1\nname = \"metrics\"\n[[stages]]\nname = \"Test\"\n[[stages.steps]]\nname = \"noop\"\nprogram = \"true\"\n",
+        )
+        .expect("pipeline");
+        let project = Project::new("metrics", ".", "Rivetfile.toml").expect("project");
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let raw_token = "metrics-secret";
+        let mut state = AppState::new(storage);
+        state.auth_digest = Some(Sha256::digest(raw_token.as_bytes()).into());
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/metrics")
+                    .body(Body::empty())
+                    .expect("unauthenticated request"),
+            )
+            .await
+            .expect("unauthenticated response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/metrics")
+                    .header(header::AUTHORIZATION, format!("Bearer {raw_token}"))
+                    .body(Body::empty())
+                    .expect("metrics request"),
+            )
+            .await
+            .expect("metrics response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("metrics body")
+                .to_vec(),
+        )
+        .expect("metrics UTF-8");
+        assert!(body.contains("rivet_projects_total 1\n"));
+        assert!(body.contains("rivet_builds_active 0\n"));
+        assert!(body.contains("rivet_queue_capacity 2\n"));
+        assert!(body.contains("rivet_queue_paused 0\n"));
+        assert!(!body.contains(raw_token));
     }
 
     #[tokio::test]
