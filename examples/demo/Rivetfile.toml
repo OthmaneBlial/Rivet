@@ -1,0 +1,20 @@
+version = 1
+name = "rivet-demo"
+
+[[stages]]
+name = "Validate source"
+
+[[stages.steps]]
+name = "checkout"
+program = "/bin/sh"
+args = ["-c", "test -f Rivetfile.toml && printf 'source checkout ready\\n'"]
+timeout_seconds = 30
+
+[[stages]]
+name = "Publish signal"
+
+[[stages.steps]]
+name = "package"
+program = "/bin/sh"
+args = ["-c", "printf 'pipeline passed locally\\n'"]
+timeout_seconds = 30
