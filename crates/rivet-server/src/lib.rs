@@ -3319,6 +3319,30 @@ fn normalize_bitbucket_webhook(
                 upstream: None,
             }))
         }
+        // Bitbucket sends these signed lifecycle/review events to the same
+        // webhook endpoint when a repository webhook subscribes to them.
+        // They are valid deliveries, but they do not represent a new source
+        // revision for a Rivet build. Acknowledge them after signature and
+        // delivery-ID validation so Bitbucket does not retry them as failures.
+        "repo:fork"
+        | "repo:updated"
+        | "repo:transfer"
+        | "repo:commit_comment_created"
+        | "repo:commit_status_created"
+        | "repo:commit_status_updated"
+        | "repo:deleted"
+        | "pullrequest:changes_request_created"
+        | "pullrequest:changes_request_removed"
+        | "pullrequest:approved"
+        | "pullrequest:unapproved"
+        | "pullrequest:fulfilled"
+        | "pullrequest:rejected"
+        | "pullrequest:comment_created"
+        | "pullrequest:comment_updated"
+        | "pullrequest:comment_deleted"
+        | "pullrequest:comment_resolved"
+        | "pullrequest:comment_reopened"
+        | "pipeline:span_created" => Ok(None),
         _ => Err(ApiError::BadRequest(format!(
             "unsupported Bitbucket webhook event: {event}"
         ))),
@@ -9451,6 +9475,63 @@ program = "true"
             Some("+refs/pull-requests/17/from:refs/remotes/origin/pull-requests/17")
         );
         assert!(request.fetch);
+    }
+
+    #[test]
+    fn bitbucket_signed_lifecycle_events_are_acknowledged_without_builds() {
+        let ignored_events = [
+            "repo:fork",
+            "repo:updated",
+            "repo:transfer",
+            "repo:commit_comment_created",
+            "repo:commit_status_created",
+            "repo:commit_status_updated",
+            "repo:deleted",
+            "pullrequest:changes_request_created",
+            "pullrequest:changes_request_removed",
+            "pullrequest:approved",
+            "pullrequest:unapproved",
+            "pullrequest:fulfilled",
+            "pullrequest:rejected",
+            "pullrequest:comment_created",
+            "pullrequest:comment_updated",
+            "pullrequest:comment_deleted",
+            "pullrequest:comment_resolved",
+            "pullrequest:comment_reopened",
+            "pipeline:span_created",
+        ];
+
+        for (index, event) in ignored_events.into_iter().enumerate() {
+            let body = br#"{}"#;
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-event-key",
+                HeaderValue::from_str(event).expect("event header"),
+            );
+            headers.insert(
+                "x-request-uuid",
+                HeaderValue::from_str(&format!("bitbucket-ignored-{index}"))
+                    .expect("request header"),
+            );
+            headers.insert(
+                "x-hub-signature",
+                HeaderValue::from_str(&sign_webhook("bitbucket-fixture-secret", body))
+                    .expect("signature"),
+            );
+
+            assert!(
+                normalize_bitbucket_webhook(
+                    b"bitbucket-fixture-secret",
+                    &headers,
+                    body,
+                    "demo".into(),
+                    None,
+                )
+                .expect("lifecycle event should be accepted")
+                .is_none(),
+                "event {event} should not queue a build"
+            );
+        }
     }
 
     #[test]

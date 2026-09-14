@@ -466,6 +466,10 @@ Rivet credential ID for the fetch. Bitbucket Cloud accepts signed `repo:push`,
 `X-Hub-Signature`, `X-Event-Key`, and the per-delivery `X-Request-UUID` header.
 Deleted pushes are ignored, multi-ref pushes are rejected as ambiguous, and
 pull-request source refs are fetched through a bounded Bitbucket refspec.
+Other known signed Bitbucket repository, review, comment, commit-status, and
+pipeline-span lifecycle deliveries are acknowledged as ignored because they do
+not identify a new source revision for a Rivet build; unknown event keys remain
+explicitly rejected.
 
 Configure the provider keys through private files and, when needed, point each
 adapter at its vault credential ID:
