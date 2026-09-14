@@ -168,6 +168,69 @@
       "status": "partial",
       "evidence": ["crates/rivet-compat/src/lib.rs", "crates/rivet-cli/src/main.rs", "compat/fixtures/sequential-build.json", "scripts/local-compat-capture-smoke.sh"],
       "notes": "The harness validates bounded JSON snapshots, normalizes provider status spelling, line endings, checksum prefixes, and redaction markers, then returns a non-zero result for semantic differences. CLI adapters capture Rivet and Jenkins HTTP build/stage/artifact metadata with private token-file authentication and bounded responses; a local smoke test exercises a real Rivet server plus a protocol-compatible Jenkins fixture. A permanent corpus from deployed Jenkins remains planned."
+    },
+    {
+      "category": "Jenkinsfile",
+      "feature": "Declarative environment and typed parameters",
+      "status": "mostly-supported",
+      "evidence": ["crates/rivet-migration/src/lib.rs", "crates/rivet-core/src/pipeline.rs"],
+      "notes": "Static environment assignments and bounded string, text, boolean, choice, and password parameters are analyzed and can be emitted into a Rivetfile draft; dynamic Groovy expressions remain reviewable rather than silently converted."
+    },
+    {
+      "category": "Pipeline",
+      "feature": "Stage dependencies and independent parallel work",
+      "status": "mostly-supported",
+      "evidence": ["crates/rivet-core/src/pipeline.rs", "crates/rivet-runner/src/pipeline.rs"],
+      "notes": "Rivet validates a deterministic DAG, runs independent stages concurrently, and propagates cancellation and failure state. Jenkins-specific post semantics and plugin-defined orchestration remain outside the current boundary."
+    },
+    {
+      "category": "Parameters",
+      "feature": "Runtime secret parameters without persisted values",
+      "status": "mostly-supported",
+      "evidence": ["crates/rivet-core/src/pipeline.rs", "crates/rivet-storage/src/lib.rs", "crates/rivet-runner/src/pipeline.rs"],
+      "notes": "Secret values are supplied at execution time, redacted from persisted records and API responses, masked in logs, and requested again for retries. Jenkins credential binding syntax still requires migration review."
+    },
+    {
+      "category": "REST API",
+      "feature": "Authenticated build, log, artifact, queue, and agent control API",
+      "status": "intentionally-different",
+      "evidence": ["crates/rivet-server/src/lib.rs", "crates/rivet-auth/src/lib.rs"],
+      "notes": "Rivet exposes a bounded versioned API designed for its event model and security policy; it does not claim drop-in compatibility with Jenkins endpoints."
+    },
+    {
+      "category": "CLI",
+      "feature": "Local operator CLI for projects, builds, migration, backup, and agents",
+      "status": "supported",
+      "evidence": ["crates/rivet-cli/src/main.rs", "README.md"],
+      "notes": "The CLI provides local project and build workflows plus migration analysis, credential, schedule, compatibility, backup/restore, and remote-agent operations."
+    },
+    {
+      "category": "Scheduling",
+      "feature": "Persistent UTC cron and repository polling",
+      "status": "mostly-supported",
+      "evidence": ["crates/rivet-core/src/schedule.rs", "crates/rivet-storage/src/lib.rs", "crates/rivet-server/src/lib.rs"],
+      "notes": "Validated UTC schedules persist, claim occurrences once, and can poll an authenticated repository for an exact new revision. Provider-specific scheduling semantics remain partial."
+    },
+    {
+      "category": "Distributed execution",
+      "feature": "Remote agents with capability-aware reservations",
+      "status": "mostly-supported",
+      "evidence": ["crates/rivet-agent-protocol/src/lib.rs", "crates/rivet-server/src/agent_registry.rs", "crates/rivet-server/src/workspace_archive.rs"],
+      "notes": "Versioned agents negotiate capabilities, reserve executor/CPU/memory/disk capacity, transfer bounded workspaces, relay events, and support reconnect-safe delivery. Production fleet and long-running deployment evidence remain external."
+    },
+    {
+      "category": "Docker",
+      "feature": "OCI runtime command boundary",
+      "status": "partial",
+      "evidence": ["crates/rivet-core/src/pipeline.rs", "crates/rivet-runner/src/pipeline.rs"],
+      "notes": "Rivet validates and assembles direct Docker/Podman commands and refuses missing runtimes without installing or starting them. Daemon behavior and image policy enforcement are not locally verified."
+    },
+    {
+      "category": "Operations",
+      "feature": "Local backup, restore, checksums, and release manifest",
+      "status": "mostly-supported",
+      "evidence": ["crates/rivet-storage/src/lib.rs", "crates/rivet-cli/src/main.rs", "scripts/local-release-check.sh"],
+      "notes": "SQLite and artifact backups are checksum-validated and restored through a staging directory; local release checks generate a versioned SHA-256 manifest. Signed installers and hosted upgrade orchestration remain planned."
     }
   ]
 }

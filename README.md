@@ -116,7 +116,9 @@ cargo run -p rivet -- migrate Jenkinsfile --output Rivetfile.toml
 ```
 
 Review the generated file and every warning before running it. Rivet does not
-claim arbitrary Jenkins plugin compatibility.
+claim arbitrary Jenkins plugin compatibility. The machine-readable
+[Jenkins compatibility matrix](compat/jenkins-compatibility.json) records each
+claim with an explicit status and evidence path.
 
 ### Add capacity without losing the signal
 
