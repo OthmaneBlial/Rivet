@@ -4803,10 +4803,9 @@ async fn download_artifact(
         .replace(['"', '\r', '\n'], "_");
     let file = tokio::fs::File::from_std(file);
     let mut response = Response::new(Body::from_stream(tokio_util::io::ReaderStream::new(file)));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
+    if let Ok(value) = HeaderValue::from_str(&artifact.mime_type) {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
     if let Ok(value) = HeaderValue::from_str(&content_length.to_string()) {
         response.headers_mut().insert(header::CONTENT_LENGTH, value);
     }
@@ -6554,6 +6553,7 @@ mod tests {
             relative_path: "dist/app.bin".into(),
             size_bytes: original.len() as u64,
             checksum: format!("sha256:{:x}", Sha256::digest(original)),
+            mime_type: "application/octet-stream".into(),
             created_at: Utc::now(),
         };
 

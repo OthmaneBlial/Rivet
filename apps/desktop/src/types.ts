@@ -90,6 +90,7 @@ export interface ArtifactRecord {
   relative_path: string;
   size_bytes: number;
   checksum: string;
+  mime_type: string;
   created_at: string;
 }
 

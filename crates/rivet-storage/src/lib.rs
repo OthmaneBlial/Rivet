@@ -234,6 +234,7 @@ pub struct ArtifactRecord {
     pub relative_path: String,
     pub size_bytes: u64,
     pub checksum: String,
+    pub mime_type: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -522,6 +523,11 @@ impl Storage {
             &connection,
             20,
             Some(include_str!("../migrations/020_provider_triggers.sql")),
+        )?;
+        apply_migration(
+            &connection,
+            21,
+            Some(include_str!("../migrations/021_artifact_mime.sql")),
         )?;
         backfill_event_hashes(&connection)?;
         Ok(Self {
@@ -2292,6 +2298,7 @@ impl Storage {
                 i64::try_from(size_bytes)
                     .map_err(|_| StorageError::ArtifactTooLarge(size_bytes))?;
                 let checksum = sha256_file(&source_path)?;
+                let mime_type = artifact_mime_type(&relative_path);
                 let destination_dir = self.artifact_root.join(build_id.to_string());
                 fs::create_dir_all(&destination_dir)?;
                 fs::copy(&source_path, destination_dir.join(artifact_id.to_string()))?;
@@ -2302,6 +2309,7 @@ impl Storage {
                     relative_path,
                     size_bytes,
                     checksum,
+                    mime_type,
                     created_at: Utc::now(),
                 });
             }
@@ -2315,8 +2323,8 @@ impl Storage {
                     .map_err(|_| StorageError::ArtifactTooLarge(artifact.size_bytes))?;
                 transaction.execute(
                     "INSERT INTO build_artifacts(
-                        id, build_id, name, relative_path, size_bytes, checksum, created_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        id, build_id, name, relative_path, size_bytes, checksum, mime_type, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         artifact.id.to_string(),
                         artifact.build_id.to_string(),
@@ -2324,6 +2332,7 @@ impl Storage {
                         artifact.relative_path,
                         size_bytes,
                         artifact.checksum,
+                        artifact.mime_type,
                         artifact.created_at.to_rfc3339(),
                     ],
                 )?;
@@ -2337,7 +2346,7 @@ impl Storage {
     pub fn artifacts(&self, build_id: BuildId) -> Result<Vec<ArtifactRecord>, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
-            "SELECT id, build_id, name, relative_path, size_bytes, checksum, created_at
+            "SELECT id, build_id, name, relative_path, size_bytes, checksum, mime_type, created_at
              FROM build_artifacts
              WHERE build_id = ?1 ORDER BY name ASC, relative_path ASC",
         )?;
@@ -2350,6 +2359,7 @@ impl Storage {
                 row.get::<_, i64>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
             ))
         })?;
         rows.map(|row| row.map_err(StorageError::from).and_then(parse_artifact))
@@ -2443,7 +2453,7 @@ impl Storage {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let row = connection
             .query_row(
-                "SELECT id, build_id, name, relative_path, size_bytes, checksum, created_at
+                "SELECT id, build_id, name, relative_path, size_bytes, checksum, mime_type, created_at
                  FROM build_artifacts WHERE id = ?1",
                 params![artifact_id.to_string()],
                 |row| {
@@ -2455,6 +2465,7 @@ impl Storage {
                         row.get::<_, i64>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
@@ -2478,7 +2489,7 @@ impl Storage {
             let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
             let mut statement = connection.prepare(
                 "SELECT a.id, a.build_id, a.name, a.relative_path, a.size_bytes,
-                        a.checksum, a.created_at
+                        a.checksum, a.mime_type, a.created_at
                  FROM build_artifacts a
                  JOIN builds b ON b.id = a.build_id
                  WHERE b.status IN ('passed', 'failed', 'cancelled')
@@ -2493,6 +2504,7 @@ impl Storage {
                     row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             })?;
             rows.map(|row| {
@@ -2619,7 +2631,7 @@ type RawStep = (
     Option<String>,
     Option<String>,
 );
-type RawArtifact = (String, String, String, String, i64, String, String);
+type RawArtifact = (String, String, String, String, i64, String, String, String);
 type RawAnnotation = (String, String, Option<String>, String, String, String);
 type RawSchedule = (
     String,
@@ -3003,8 +3015,37 @@ fn parse_artifact(raw: RawArtifact) -> Result<ArtifactRecord, StorageError> {
         relative_path: raw.3,
         size_bytes: u64::try_from(raw.4).map_err(|_| StorageError::InvalidArtifactSize(raw.4))?,
         checksum: raw.5,
-        created_at: parse_timestamp(&raw.6)?,
+        mime_type: raw.6,
+        created_at: parse_timestamp(&raw.7)?,
     })
+}
+
+fn artifact_mime_type(path: &str) -> String {
+    let extension = path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "css" => "text/css",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "js" | "mjs" => "text/javascript",
+        "json" | "map" => "application/json",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "txt" | "log" => "text/plain",
+        "toml" => "application/toml",
+        "xml" => "application/xml",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "wasm" => "application/wasm",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 fn parse_annotation(raw: RawAnnotation) -> Result<AnnotationRecord, StorageError> {
@@ -3627,6 +3668,7 @@ program = "true"
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].relative_path, "dist/app.js");
         assert_eq!(collected[0].name, "bundle");
+        assert_eq!(collected[0].mime_type, "text/javascript");
         assert!(collected[0].checksum.starts_with("sha256:"));
 
         let again = storage
