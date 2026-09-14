@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **94% verified** · `███████████████████░`<br>
-Weighted evidence score: **94.41 / 100** · displayed conservatively as the
+Weighted evidence score: **94.53 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -85,6 +85,7 @@ builds the optimized CLI, builds the desktop web client, checks the native
 Tauri host, produces and launches a non-signed macOS `Rivet.app` bundle while
 checking its embedded loopback engine, exercises real SCM clone plus
 create-project/run/history/inspect/logs workflows against temporary data,
+exercises a real server queue with priority ordering and queued cancellation,
 captures live compatibility snapshots, exercises authenticated local deployment
 hardening, copies the CLI into a temporary release directory, and writes a
 versioned SHA-256 manifest:
