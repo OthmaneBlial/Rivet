@@ -699,6 +699,9 @@ struct RunArgs {
     clean: bool,
     #[arg(long)]
     clean_ignored: bool,
+    /// Initialize and recursively update Git submodules after preparation.
+    #[arg(long)]
+    submodules: bool,
     /// Resolve this non-secret ID from an encrypted vault before fetching.
     #[arg(long)]
     credential_id: Option<String>,
@@ -799,6 +802,9 @@ enum ScmCommand {
         clean: bool,
         #[arg(long)]
         clean_ignored: bool,
+        /// Initialize and recursively update Git submodules after preparation.
+        #[arg(long)]
+        submodules: bool,
         /// Resolve this non-secret ID from an encrypted vault before fetching.
         #[arg(long)]
         credential_id: Option<String>,
@@ -2390,6 +2396,7 @@ async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Erro
             revision,
             clean,
             clean_ignored,
+            submodules,
             credential_id,
             credentials_file,
             credentials_passphrase_file,
@@ -2407,6 +2414,7 @@ async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Erro
                     fetch_ref: None,
                     clean,
                     clean_ignored,
+                    submodules,
                     credential_id: credential_id.clone(),
                     known_hosts_file: ssh_known_hosts_file.clone(),
                 }
@@ -3173,6 +3181,7 @@ async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::
         || args.revision.is_some()
         || args.clean
         || args.clean_ignored
+        || args.submodules
         || args.remote != "origin"
         || args.credential_id.is_some()
         || args.ssh_known_hosts_file.is_some()
@@ -3184,6 +3193,7 @@ async fn run_project(data_dir: &Path, args: RunArgs) -> Result<(), Box<dyn std::
             fetch_ref: None,
             clean: args.clean,
             clean_ignored: args.clean_ignored,
+            submodules: args.submodules,
             credential_id: args.credential_id.clone(),
             known_hosts_file: args.ssh_known_hosts_file.clone(),
         })

@@ -63,6 +63,7 @@ export interface ScmPrepareOptions {
   fetch_ref?: string;
   clean?: boolean;
   clean_ignored?: boolean;
+  submodules?: boolean;
   credential_id?: string;
 }
 

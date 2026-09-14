@@ -186,6 +186,7 @@ function App() {
   const [scmRevision, setScmRevision] = useState("");
   const [scmClean, setScmClean] = useState(false);
   const [scmCleanIgnored, setScmCleanIgnored] = useState(false);
+  const [scmSubmodules, setScmSubmodules] = useState(false);
   const [scmCredentialId, setScmCredentialId] = useState("");
   const [pollBusy, setPollBusy] = useState(false);
   const [pollMessage, setPollMessage] = useState<string | null>(null);
@@ -515,6 +516,7 @@ function App() {
         revision?: string;
         clean?: boolean;
         clean_ignored?: boolean;
+        submodules?: boolean;
         credential_id?: string;
       };
       parameters?: Record<string, string>;
@@ -525,13 +527,14 @@ function App() {
       ),
     );
     if (Object.keys(parameters).length > 0) options.parameters = parameters;
-    if (scmFetch || revision || scmClean) {
+    if (scmFetch || revision || scmClean || scmSubmodules) {
       options.scm = {
         remote: scmFetch ? scmRemote.trim() || "origin" : undefined,
         fetch: scmFetch,
         revision: revision || undefined,
         clean: scmClean,
         clean_ignored: scmClean && scmCleanIgnored,
+        submodules: scmSubmodules,
         credential_id: credential || undefined,
       };
     }
@@ -926,6 +929,7 @@ function App() {
               revision={scmRevision}
               clean={scmClean}
               cleanIgnored={scmCleanIgnored}
+              submodules={scmSubmodules}
               credentialId={scmCredentialId}
               credentials={credentialList}
               onToggle={toggleScmOptions}
@@ -934,6 +938,7 @@ function App() {
               onRevisionChange={setScmRevision}
               onCleanChange={setScmClean}
               onCleanIgnoredChange={setScmCleanIgnored}
+              onSubmodulesChange={setScmSubmodules}
               onCredentialChange={setScmCredentialId}
             />
 
@@ -1024,6 +1029,7 @@ function SourcePreparationPanel({
   revision,
   clean,
   cleanIgnored,
+  submodules,
   credentialId,
   credentials,
   onToggle,
@@ -1032,6 +1038,7 @@ function SourcePreparationPanel({
   onRevisionChange,
   onCleanChange,
   onCleanIgnoredChange,
+  onSubmodulesChange,
   onCredentialChange,
 }: {
   open: boolean;
@@ -1040,6 +1047,7 @@ function SourcePreparationPanel({
   revision: string;
   clean: boolean;
   cleanIgnored: boolean;
+  submodules: boolean;
   credentialId: string;
   credentials: CredentialSummary[];
   onToggle: () => void;
@@ -1048,6 +1056,7 @@ function SourcePreparationPanel({
   onRevisionChange: (value: string) => void;
   onCleanChange: (value: boolean) => void;
   onCleanIgnoredChange: (value: boolean) => void;
+  onSubmodulesChange: (value: boolean) => void;
   onCredentialChange: (value: string) => void;
 }) {
   return (
@@ -1068,6 +1077,7 @@ function SourcePreparationPanel({
           <div className="scm-checks">
             <label className="scm-check"><input type="checkbox" checked={clean} onChange={(event) => onCleanChange(event.target.checked)} /><span>Remove untracked files</span></label>
             <label className="scm-check"><input type="checkbox" checked={cleanIgnored} onChange={(event) => onCleanIgnoredChange(event.target.checked)} disabled={!clean} /><span>Include ignored files</span></label>
+            <label className="scm-check"><input type="checkbox" checked={submodules} onChange={(event) => onSubmodulesChange(event.target.checked)} /><span>Initialize submodules</span></label>
           </div>
           <p className="scm-notice"><span>!</span>Credential values never enter this request. Only the non-secret ID is sent to the engine.</p>
         </div>

@@ -36,6 +36,9 @@ pub struct GitPrepareOptions {
     pub fetch_ref: Option<String>,
     pub clean: bool,
     pub clean_ignored: bool,
+    /// Initialize and recursively update repository submodules after the
+    /// checkout/clean boundary has been prepared.
+    pub submodules: bool,
     /// Reference resolved by the hosting layer; the secret never enters this
     /// serializable request object.
     pub credential_id: Option<String>,
@@ -53,6 +56,7 @@ impl Default for GitPrepareOptions {
             fetch_ref: None,
             clean: false,
             clean_ignored: false,
+            submodules: false,
             credential_id: None,
             known_hosts_file: None,
         }
@@ -408,6 +412,15 @@ impl GitRepository {
         }
         if options.clean {
             self.clean(options.clean_ignored).await?;
+        }
+        if options.submodules {
+            self.run_with_known_hosts(
+                ["submodule", "update", "--init", "--recursive"],
+                "update submodules",
+                credential,
+                options.known_hosts_file.as_deref(),
+            )
+            .await?;
         }
         self.inspect().await
     }
@@ -1003,6 +1016,43 @@ mod tests {
         assert_eq!(snapshot.branch, None);
         assert!(!dir.path().join("throwaway.txt").exists());
         assert!(!snapshot.dirty);
+    }
+
+    #[tokio::test]
+    async fn prepare_initializes_recursive_submodules_only_when_requested() {
+        let parent = repository().await;
+        let child = repository().await;
+        let child_path = child.path().to_str().expect("child path");
+        git(
+            parent.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                child_path,
+                "vendor/fixture",
+            ],
+        )
+        .await;
+        git(parent.path(), &["commit", "-qm", "add fixture submodule"]).await;
+        let submodule_path = parent.path().join("vendor/fixture");
+        fs::remove_dir_all(&submodule_path).expect("remove checked out submodule");
+
+        let repository = GitRepository::open(parent.path()).await.expect("open");
+        let snapshot = repository
+            .prepare(&GitPrepareOptions {
+                submodules: true,
+                ..GitPrepareOptions::default()
+            })
+            .await
+            .expect("prepare submodules");
+        assert!(!snapshot.dirty);
+        assert_eq!(
+            fs::read_to_string(submodule_path.join("README.md")).expect("submodule file"),
+            "first\n"
+        );
     }
 
     #[tokio::test]

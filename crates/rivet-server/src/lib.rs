@@ -529,6 +529,9 @@ pub struct WebhookBuildRequest {
     pub fetch: bool,
     #[serde(default)]
     pub credential_id: Option<String>,
+    /// Initialize and recursively update Git submodules after preparation.
+    #[serde(default)]
+    pub submodules: bool,
     #[serde(default)]
     pub parameters: BTreeMap<String, String>,
     /// Optional upstream build proof used by the signed generic webhook
@@ -791,6 +794,9 @@ pub struct PrepareScmRequest {
     pub clean: bool,
     #[serde(default)]
     pub clean_ignored: bool,
+    /// Initialize and recursively update Git submodules after preparation.
+    #[serde(default)]
+    pub submodules: bool,
     /// Non-secret ID resolved from the server's encrypted credential vault.
     #[serde(default)]
     pub credential_id: Option<String>,
@@ -846,6 +852,7 @@ async fn prepare_scm(
                     fetch_ref: request.fetch_ref,
                     clean: request.clean,
                     clean_ignored: request.clean_ignored,
+                    submodules: request.submodules,
                     credential_id: request.credential_id,
                     known_hosts_file: state.ssh_known_hosts_file.clone(),
                 },
@@ -2791,6 +2798,7 @@ async fn enqueue_webhook_build(
             fetch_ref: request.fetch_ref,
             clean: false,
             clean_ignored: false,
+            submodules: request.submodules,
             credential_id: request.credential_id,
         })
     } else {
@@ -2862,6 +2870,7 @@ fn normalize_github_webhook(
                 remote: Some("origin".into()),
                 fetch: true,
                 credential_id,
+                submodules: false,
                 parameters: BTreeMap::new(),
                 upstream: None,
             }))
@@ -2900,6 +2909,7 @@ fn normalize_github_webhook(
                 remote: Some("origin".into()),
                 fetch: true,
                 credential_id,
+                submodules: false,
                 parameters: BTreeMap::new(),
                 upstream: None,
             }))
@@ -2940,6 +2950,7 @@ fn normalize_gitlab_webhook(
                 remote: Some("origin".into()),
                 fetch: true,
                 credential_id,
+                submodules: false,
                 parameters: BTreeMap::new(),
                 upstream: None,
             }))
@@ -2980,6 +2991,7 @@ fn normalize_gitlab_webhook(
                 remote: Some("origin".into()),
                 fetch: true,
                 credential_id,
+                submodules: false,
                 parameters: BTreeMap::new(),
                 upstream: None,
             }))
@@ -3662,6 +3674,7 @@ async fn poll_repository_changes_for_project(
         fetch_ref: None,
         clean: false,
         clean_ignored: false,
+        submodules: false,
         credential_id: request.credential_id,
     };
     let source = capture_source_snapshot(
@@ -3738,6 +3751,7 @@ async fn poll_repository_changes_for_project(
                 fetch_ref: None,
                 clean: false,
                 clean_ignored: false,
+                submodules: false,
                 credential_id: None,
             }),
             parameters: BTreeMap::new(),
@@ -5073,6 +5087,7 @@ async fn capture_source_snapshot(
                                 fetch_ref: request.fetch_ref.clone(),
                                 clean: request.clean,
                                 clean_ignored: request.clean_ignored,
+                                submodules: request.submodules,
                                 credential_id: request.credential_id.clone(),
                                 known_hosts_file: ssh_known_hosts_file.map(Path::to_path_buf),
                             },

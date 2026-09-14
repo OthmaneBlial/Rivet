@@ -90,7 +90,7 @@
       "feature": "Git checkout and webhooks",
       "status": "partial",
       "evidence": ["crates/rivet-scm/src/lib.rs", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
-      "notes": "Explicit local fetch, detached revision checkout, clean preparation, and bounded provider refspec fetches are supported at build admission. A provider-neutral credential ID can resolve through Rivet's encrypted local vault and reach Git through ephemeral HTTP Basic configuration; signed GitHub and GitLab push plus PR/MR adapters can feed the same build admission path with an explicit project route. Credential lifecycle and broader provider event mapping remain planned."
+      "notes": "Explicit local fetch, detached revision checkout, clean preparation, recursive submodule initialization, and bounded provider refspec fetches are supported at build admission. A provider-neutral credential ID can resolve through Rivet's encrypted local vault and reach Git through ephemeral HTTP Basic configuration; signed GitHub and GitLab push plus PR/MR adapters can feed the same build admission path with an explicit project route. Credential lifecycle and broader provider event mapping remain planned."
     },
     {
       "category": "Triggers",
