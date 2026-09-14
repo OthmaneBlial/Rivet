@@ -265,6 +265,16 @@ curl http://127.0.0.1:7878/api/v1/projects/release/provider-triggers
 curl -X DELETE http://127.0.0.1:7878/api/v1/projects/release/provider-triggers/<trigger-id>
 ```
 
+The same local operator flow is available without HTTP:
+
+```sh
+cargo run -p rivet -- provider-trigger create release \
+  --provider github --source-repository acme/widgets \
+  --source-pipeline Release
+cargo run -p rivet -- provider-trigger list release
+cargo run -p rivet -- provider-trigger delete release <trigger-id>
+```
+
 After the signed webhook is received, a successful GitHub `workflow_run`
 completion or GitLab `Pipeline Hook` completion queues the exact provider
 commit through Rivet's normal SCM and queue path. Running, failed, cancelled,

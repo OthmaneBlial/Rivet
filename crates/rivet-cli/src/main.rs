@@ -361,6 +361,11 @@ enum Command {
         #[command(subcommand)]
         command: UpstreamCommand,
     },
+    /// Manage provider workflow/pipeline completion triggers.
+    ProviderTrigger {
+        #[command(subcommand)]
+        command: ProviderTriggerCommand,
+    },
     /// Manage passphrase-encrypted SCM credentials.
     Credential {
         #[command(subcommand)]
@@ -459,6 +464,24 @@ enum UpstreamCommand {
     /// List upstream triggers targeting a downstream project.
     List { downstream: String },
     /// Remove an upstream trigger by UUID.
+    Delete { downstream: String, id: uuid::Uuid },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderTriggerCommand {
+    /// Queue a project after a successful GitHub or GitLab pipeline event.
+    Create {
+        downstream: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long, value_name = "OWNER/REPOSITORY")]
+        source_repository: String,
+        #[arg(long)]
+        source_pipeline: Option<String>,
+    },
+    /// List provider completion triggers targeting a project.
+    List { downstream: String },
+    /// Remove a provider completion trigger by UUID.
     Delete { downstream: String, id: uuid::Uuid },
 }
 
@@ -1026,6 +1049,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Scm { command } => inspect_scm(command).await?,
         Command::Schedule { command } => manage_schedule(&cli.data_dir, command)?,
         Command::Upstream { command } => manage_upstream(&cli.data_dir, command)?,
+        Command::ProviderTrigger { command } => manage_provider_trigger(&cli.data_dir, command)?,
         Command::Credential { command } => manage_credentials(&cli.data_dir, command)?,
         Command::Auth { command } => manage_auth(&cli.data_dir, command)?,
         Command::Cache { command } => manage_cache(&cli.data_dir, command)?,
@@ -3010,6 +3034,97 @@ fn manage_upstream(
     Ok(())
 }
 
+fn manage_provider_trigger(
+    data_dir: &Path,
+    command: ProviderTriggerCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = open_storage(data_dir)?;
+    match command {
+        ProviderTriggerCommand::Create {
+            downstream,
+            provider,
+            source_repository,
+            source_pipeline,
+        } => {
+            let downstream_record = storage
+                .get_project_by_name(&downstream)?
+                .ok_or_else(|| format!("project not found: {downstream}"))?;
+            let provider = provider.trim().to_ascii_lowercase();
+            if !matches!(provider.as_str(), "github" | "gitlab") {
+                return Err("provider must be github or gitlab".into());
+            }
+            let source_repository = source_repository.trim();
+            if source_repository.is_empty()
+                || source_repository.len() > 512
+                || source_repository.chars().any(char::is_control)
+            {
+                return Err(
+                    "source repository must be non-empty, bounded, and free of control characters"
+                        .into(),
+                );
+            }
+            let source_pipeline = source_pipeline
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            if source_pipeline
+                .as_deref()
+                .is_some_and(|value| value.len() > 512 || value.chars().any(char::is_control))
+            {
+                return Err(
+                    "source pipeline must be bounded and free of control characters".into(),
+                );
+            }
+            let trigger = storage
+                .create_provider_trigger(
+                    downstream_record.id,
+                    &provider,
+                    source_repository,
+                    source_pipeline.as_deref(),
+                )?
+                .ok_or_else(|| "provider trigger already exists".to_owned())?;
+            println!(
+                "Created provider trigger {}: {} {} [{}] -> {}",
+                trigger.id,
+                trigger.provider,
+                trigger.source_repository,
+                trigger.source_pipeline.as_deref().unwrap_or("<any>"),
+                downstream
+            );
+        }
+        ProviderTriggerCommand::List { downstream } => {
+            let downstream_record = storage
+                .get_project_by_name(&downstream)?
+                .ok_or_else(|| format!("project not found: {downstream}"))?;
+            for trigger in storage.list_provider_triggers_to(downstream_record.id)? {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    trigger.id,
+                    if trigger.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    trigger.provider,
+                    trigger.source_repository,
+                    trigger.source_pipeline.as_deref().unwrap_or("<any>"),
+                );
+            }
+        }
+        ProviderTriggerCommand::Delete { downstream, id } => {
+            let downstream_record = storage
+                .get_project_by_name(&downstream)?
+                .ok_or_else(|| format!("project not found: {downstream}"))?;
+            if !storage.delete_provider_trigger(downstream_record.id, id)? {
+                return Err(format!("provider trigger not found: {downstream} {id}").into());
+            }
+            println!("Deleted provider trigger {id}");
+        }
+    }
+    Ok(())
+}
+
 fn parse_schedule_trigger(value: &str) -> Result<ScheduleTrigger, String> {
     match value.trim() {
         "build" => Ok(ScheduleTrigger::Build),
@@ -4558,6 +4673,81 @@ program = "true"
             storage
                 .list_pipeline_triggers_to(downstream.id)
                 .expect("triggers")
+                .is_empty()
+        );
+        drop(storage);
+        fs::remove_dir_all(data_dir).expect("remove test data directory");
+    }
+
+    #[test]
+    fn provider_trigger_cli_manages_persisted_mappings() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "rivet-cli-provider-trigger-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&data_dir).expect("data directory");
+        let storage = Storage::open(data_dir.join("rivet.db")).expect("storage");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "provider-trigger"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+        let downstream = Project::new("downstream", ".", "Rivetfile.toml").expect("project");
+        storage
+            .create_project(&downstream, &pipeline)
+            .expect("downstream project");
+        drop(storage);
+
+        manage_provider_trigger(
+            &data_dir,
+            ProviderTriggerCommand::Create {
+                downstream: "downstream".into(),
+                provider: "GitHub".into(),
+                source_repository: "acme/widgets".into(),
+                source_pipeline: Some("Release".into()),
+            },
+        )
+        .expect("create provider trigger");
+        let storage = Storage::open(data_dir.join("rivet.db")).expect("reopen storage");
+        let trigger = storage
+            .list_provider_triggers_to(downstream.id)
+            .expect("provider triggers")
+            .pop()
+            .expect("provider trigger");
+        assert_eq!(trigger.provider, "github");
+        assert_eq!(trigger.source_repository, "acme/widgets");
+        assert_eq!(trigger.source_pipeline.as_deref(), Some("Release"));
+        assert!(
+            manage_provider_trigger(
+                &data_dir,
+                ProviderTriggerCommand::Create {
+                    downstream: "downstream".into(),
+                    provider: "github".into(),
+                    source_repository: "acme/widgets".into(),
+                    source_pipeline: Some("Release".into()),
+                },
+            )
+            .is_err()
+        );
+        manage_provider_trigger(
+            &data_dir,
+            ProviderTriggerCommand::Delete {
+                downstream: "downstream".into(),
+                id: trigger.id,
+            },
+        )
+        .expect("delete provider trigger");
+        assert!(
+            storage
+                .list_provider_triggers_to(downstream.id)
+                .expect("deleted provider triggers")
                 .is_empty()
         );
         drop(storage);
