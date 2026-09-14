@@ -6554,6 +6554,7 @@ mod tests {
             size_bytes: original.len() as u64,
             checksum: format!("sha256:{:x}", Sha256::digest(original)),
             mime_type: "application/octet-stream".into(),
+            expires_at: None,
             created_at: Utc::now(),
         };
 

@@ -81,6 +81,9 @@ pub struct ArtifactSpec {
     pub paths: Vec<String>,
     #[serde(default)]
     pub allow_empty: bool,
+    /// Optional retention period for completed-build artifacts.
+    #[serde(default)]
+    pub retention_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -392,6 +395,8 @@ pub enum PipelineError {
     InvalidArtifactPath { artifact: String, path: String },
     #[error("duplicate artifact name {0:?}")]
     DuplicateArtifact(String),
+    #[error("artifact {0:?} retention cannot exceed 3650 days")]
+    ArtifactRetentionTooLong(String),
     #[error("cache name cannot be empty")]
     EmptyCacheName,
     #[error("cache name {0:?} is invalid")]
@@ -544,6 +549,11 @@ impl Pipeline {
             }
             if artifact.paths.is_empty() {
                 return Err(PipelineError::EmptyArtifactPaths(artifact.name.clone()));
+            }
+            if artifact.retention_days.is_some_and(|days| days > 3650) {
+                return Err(PipelineError::ArtifactRetentionTooLong(
+                    artifact.name.clone(),
+                ));
             }
             for path in &artifact.paths {
                 let path_value = Path::new(path);

@@ -91,6 +91,7 @@ export interface ArtifactRecord {
   size_bytes: number;
   checksum: string;
   mime_type: string;
+  expires_at: string | null;
   created_at: string;
 }
 

@@ -235,6 +235,7 @@ pub struct ArtifactRecord {
     pub size_bytes: u64,
     pub checksum: String,
     pub mime_type: String,
+    pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -528,6 +529,11 @@ impl Storage {
             &connection,
             21,
             Some(include_str!("../migrations/021_artifact_mime.sql")),
+        )?;
+        apply_migration(
+            &connection,
+            22,
+            Some(include_str!("../migrations/022_artifact_expiration.sql")),
         )?;
         backfill_event_hashes(&connection)?;
         Ok(Self {
@@ -2299,6 +2305,10 @@ impl Storage {
                     .map_err(|_| StorageError::ArtifactTooLarge(size_bytes))?;
                 let checksum = sha256_file(&source_path)?;
                 let mime_type = artifact_mime_type(&relative_path);
+                let created_at = Utc::now();
+                let expires_at = specification
+                    .retention_days
+                    .map(|days| created_at + chrono::Duration::days(i64::from(days)));
                 let destination_dir = self.artifact_root.join(build_id.to_string());
                 fs::create_dir_all(&destination_dir)?;
                 fs::copy(&source_path, destination_dir.join(artifact_id.to_string()))?;
@@ -2310,7 +2320,8 @@ impl Storage {
                     size_bytes,
                     checksum,
                     mime_type,
-                    created_at: Utc::now(),
+                    expires_at,
+                    created_at,
                 });
             }
         }
@@ -2323,8 +2334,8 @@ impl Storage {
                     .map_err(|_| StorageError::ArtifactTooLarge(artifact.size_bytes))?;
                 transaction.execute(
                     "INSERT INTO build_artifacts(
-                        id, build_id, name, relative_path, size_bytes, checksum, mime_type, created_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        id, build_id, name, relative_path, size_bytes, checksum, mime_type, expires_at, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         artifact.id.to_string(),
                         artifact.build_id.to_string(),
@@ -2333,6 +2344,7 @@ impl Storage {
                         size_bytes,
                         artifact.checksum,
                         artifact.mime_type,
+                        artifact.expires_at.map(|value| value.to_rfc3339()),
                         artifact.created_at.to_rfc3339(),
                     ],
                 )?;
@@ -2346,7 +2358,7 @@ impl Storage {
     pub fn artifacts(&self, build_id: BuildId) -> Result<Vec<ArtifactRecord>, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
-            "SELECT id, build_id, name, relative_path, size_bytes, checksum, mime_type, created_at
+            "SELECT id, build_id, name, relative_path, size_bytes, checksum, mime_type, expires_at, created_at
              FROM build_artifacts
              WHERE build_id = ?1 ORDER BY name ASC, relative_path ASC",
         )?;
@@ -2359,7 +2371,8 @@ impl Storage {
                 row.get::<_, i64>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
             ))
         })?;
         rows.map(|row| row.map_err(StorageError::from).and_then(parse_artifact))
@@ -2453,7 +2466,7 @@ impl Storage {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let row = connection
             .query_row(
-                "SELECT id, build_id, name, relative_path, size_bytes, checksum, mime_type, created_at
+                "SELECT id, build_id, name, relative_path, size_bytes, checksum, mime_type, expires_at, created_at
                  FROM build_artifacts WHERE id = ?1",
                 params![artifact_id.to_string()],
                 |row| {
@@ -2465,7 +2478,8 @@ impl Storage {
                         row.get::<_, i64>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, String>(8)?,
                     ))
                 },
             )
@@ -2489,7 +2503,7 @@ impl Storage {
             let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
             let mut statement = connection.prepare(
                 "SELECT a.id, a.build_id, a.name, a.relative_path, a.size_bytes,
-                        a.checksum, a.mime_type, a.created_at
+                        a.checksum, a.mime_type, a.expires_at, a.created_at
                  FROM build_artifacts a
                  JOIN builds b ON b.id = a.build_id
                  WHERE b.status IN ('passed', 'failed', 'cancelled')
@@ -2504,7 +2518,8 @@ impl Storage {
                     row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             })?;
             rows.map(|row| {
@@ -2523,8 +2538,12 @@ impl Storage {
         });
         let mut removed_entries = 0;
         let mut removed_bytes = 0_u64;
+        let now = Utc::now();
         for (artifact, path) in candidates {
-            if remaining_bytes <= max_bytes {
+            let expired = artifact
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= now);
+            if !expired && remaining_bytes <= max_bytes {
                 break;
             }
             match fs::symlink_metadata(&path) {
@@ -2631,7 +2650,17 @@ type RawStep = (
     Option<String>,
     Option<String>,
 );
-type RawArtifact = (String, String, String, String, i64, String, String, String);
+type RawArtifact = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    Option<String>,
+    String,
+);
 type RawAnnotation = (String, String, Option<String>, String, String, String);
 type RawSchedule = (
     String,
@@ -3016,7 +3045,8 @@ fn parse_artifact(raw: RawArtifact) -> Result<ArtifactRecord, StorageError> {
         size_bytes: u64::try_from(raw.4).map_err(|_| StorageError::InvalidArtifactSize(raw.4))?,
         checksum: raw.5,
         mime_type: raw.6,
-        created_at: parse_timestamp(&raw.7)?,
+        expires_at: raw.7.as_deref().map(parse_timestamp).transpose()?,
+        created_at: parse_timestamp(&raw.8)?,
     })
 }
 
@@ -3874,6 +3904,80 @@ program = "true"
                 .expect("active artifacts")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn expired_completed_artifacts_are_pruned_even_under_a_large_budget() {
+        let directory = tempdir().expect("tempdir");
+        let workspace = directory.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("artifact.txt"), "expire me").expect("artifact");
+        let project = Project::new(
+            "expiration",
+            workspace.to_string_lossy().into_owned(),
+            workspace
+                .join("Rivetfile.toml")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .expect("project");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "expiration"
+[[artifacts]]
+name = "bundle"
+paths = ["artifact.txt"]
+retention_days = 0
+[[stages]]
+name = "Build"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+        let storage = Storage::open(directory.path().join("rivet.db")).expect("open");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let plan = ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), project.id);
+        let build = storage
+            .create_build(&project, &plan, &pipeline, None)
+            .expect("build");
+        let artifact = storage
+            .collect_artifacts(build.id, &pipeline, &workspace)
+            .expect("collect")[0]
+            .clone();
+        storage
+            .apply_event(&BuildEvent::BuildQueued {
+                build_id: build.id,
+                project_id: project.id,
+                timestamp: Utc::now(),
+            })
+            .expect("queued");
+        storage
+            .apply_event(&BuildEvent::BuildStarted {
+                build_id: build.id,
+                timestamp: Utc::now(),
+            })
+            .expect("started");
+        storage
+            .apply_event(&BuildEvent::BuildFinished {
+                build_id: build.id,
+                status: BuildStatus::Passed,
+                timestamp: Utc::now(),
+            })
+            .expect("finished");
+
+        let result = storage.prune_artifacts(u64::MAX).expect("prune");
+        assert_eq!(result.removed_entries, 1);
+        assert!(
+            storage
+                .artifact_file(artifact.id)
+                .expect("lookup")
+                .is_none()
         );
     }
 
