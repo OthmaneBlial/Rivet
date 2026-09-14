@@ -13,6 +13,7 @@ import type {
   QueueStats,
   RepositoryPollResponse,
   ScheduleRecord,
+  ScheduleTrigger,
 } from "./types";
 import type { ExtensionManifest, ExtensionRuntimeStatus } from "./extensionModel";
 import { invoke } from "@tauri-apps/api/core";
@@ -316,7 +317,7 @@ export function schedules(project: string): Promise<ScheduleRecord[]> {
 
 export function createSchedule(
   project: string,
-  input: { name: string; expression: string; enabled?: boolean },
+  input: { name: string; expression: string; trigger?: ScheduleTrigger; enabled?: boolean },
 ): Promise<ScheduleRecord> {
   return request<ScheduleRecord>(
     `/api/v1/projects/${encodeURIComponent(project)}/schedules`,

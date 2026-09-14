@@ -97,7 +97,7 @@
       "feature": "Manual/API builds and persistent UTC cron schedules",
       "status": "partial",
       "evidence": ["crates/rivet-core/src/schedule.rs", "crates/rivet-storage/migrations/006_schedules.sql", "crates/rivet-server/src/lib.rs", "crates/rivet-cli/src/main.rs"],
-      "notes": "Five-field cron expressions are validated, persisted, atomically claimed, dispatched into real builds, and exposed through API, CLI, and desktop controls; signed provider PR/MR actions are normalized into real builds, while broader repository-event and upstream trigger mapping remain planned."
+      "notes": "Five-field cron expressions are validated, persisted, atomically claimed, and exposed through API, CLI, and desktop controls. Schedules can either admit a build every occurrence or run the authenticated repository poller and admit only an unrecorded exact Git revision; signed provider PR/MR actions are normalized into real builds, while broader repository-event and upstream trigger mapping remain planned."
     },
     {
       "category": "Triggers",

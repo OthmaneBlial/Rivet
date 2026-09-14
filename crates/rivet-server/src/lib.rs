@@ -40,7 +40,7 @@ use rivet_scm::{
 };
 use rivet_storage::{
     AnnotationRecord, ArtifactRecord, AuditEventRecord, BuildDetails, BuildRecord, LogRecord,
-    RemoteAttemptRecord, ScheduleRecord, Storage, StorageError,
+    RemoteAttemptRecord, ScheduleRecord, ScheduleTrigger, Storage, StorageError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -484,6 +484,8 @@ pub struct CreateAnnotationRequest {
 pub struct CreateScheduleRequest {
     pub name: String,
     pub expression: String,
+    #[serde(default)]
+    pub trigger: ScheduleTrigger,
     #[serde(default = "default_schedule_enabled")]
     pub enabled: bool,
 }
@@ -2558,10 +2560,11 @@ async fn create_schedule(
     let next_run_at = expression
         .next_after(now)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let schedule = state.storage.create_schedule(
+    let schedule = state.storage.create_schedule_with_trigger(
         project.id,
         schedule_name,
         expression.expression(),
+        request.trigger,
         request.enabled,
         next_run_at,
     )?;
@@ -3369,13 +3372,29 @@ async fn dispatch_due_schedules(state: &AppState, now: DateTime<Utc>) -> Result<
             tracing::error!(schedule = %schedule.id, "schedule project disappeared");
             continue;
         };
-        if let Err(error) =
-            enqueue_project_build(state, project, QueueBuildRequest::default()).await
-        {
-            tracing::error!(schedule = %schedule.id, ?error, "scheduled build could not be queued");
-            continue;
+        let queued = match schedule.trigger {
+            ScheduleTrigger::Build => {
+                enqueue_project_build(state, project, QueueBuildRequest::default())
+                    .await
+                    .map(|_| true)
+            }
+            ScheduleTrigger::RepositoryPoll => poll_repository_changes_for_project(
+                state,
+                project,
+                RepositoryPollRequest::default(),
+            )
+            .await
+            .map(|response| response.status == "queued"),
+        };
+        match queued {
+            Ok(true) => dispatched += 1,
+            Ok(false) => {
+                tracing::debug!(schedule = %schedule.id, "repository poll found no new revision")
+            }
+            Err(error) => {
+                tracing::error!(schedule = %schedule.id, ?error, "scheduled trigger could not be dispatched");
+            }
         }
-        dispatched += 1;
     }
     Ok(dispatched)
 }
@@ -3555,6 +3574,20 @@ async fn poll_repository_changes(
     require_project(&principal, Permission::Build, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     let request = request.map(|Json(request)| request).unwrap_or_default();
+    let response = poll_repository_changes_for_project(&state, project, request).await?;
+    let status = if response.status == "queued" {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(response)))
+}
+
+async fn poll_repository_changes_for_project(
+    state: &AppState,
+    project: Project,
+    request: RepositoryPollRequest,
+) -> Result<RepositoryPollResponse, ApiError> {
     if request.credential_id.is_some() && !request.fetch {
         return Err(ApiError::BadRequest(
             "a repository poll credential requires fetch=true".into(),
@@ -3592,17 +3625,14 @@ async fn poll_repository_changes(
             known.provider == source.provider && known.revision == source.revision
         });
     if unchanged {
-        return Ok((
-            StatusCode::OK,
-            Json(RepositoryPollResponse {
-                status: "unchanged",
-                changed: false,
-                deduplicated: false,
-                revision: source.revision,
-                reference: source.reference,
-                build: None,
-            }),
-        ));
+        return Ok(RepositoryPollResponse {
+            status: "unchanged",
+            changed: false,
+            deduplicated: false,
+            revision: source.revision,
+            reference: source.reference,
+            build: None,
+        });
     }
 
     let event_id = repository_poll_event_id(project.id, &source, latest.as_ref());
@@ -3624,21 +3654,18 @@ async fn poll_repository_changes(
                 .into_iter()
                 .find(|build| build.id == build_id)
         });
-        return Ok((
-            StatusCode::OK,
-            Json(RepositoryPollResponse {
-                status: if build.is_some() {
-                    "already_queued"
-                } else {
-                    "already_checking"
-                },
-                changed: true,
-                deduplicated: true,
-                revision: source.revision,
-                reference: source.reference,
-                build,
-            }),
-        ));
+        return Ok(RepositoryPollResponse {
+            status: if build.is_some() {
+                "already_queued"
+            } else {
+                "already_checking"
+            },
+            changed: true,
+            deduplicated: true,
+            revision: source.revision,
+            reference: source.reference,
+            build,
+        });
     }
 
     // Build the exact revision observed by this poll. The initial fetch has
@@ -3673,17 +3700,14 @@ async fn poll_repository_changes(
         queued.build.id,
         queued.build.number,
     )?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(RepositoryPollResponse {
-            status: "queued",
-            changed: true,
-            deduplicated: false,
-            revision: source.revision,
-            reference: source.reference,
-            build: Some(queued.build),
-        }),
-    ))
+    Ok(RepositoryPollResponse {
+        status: "queued",
+        changed: true,
+        deduplicated: false,
+        revision: source.revision,
+        reference: source.reference,
+        build: Some(queued.build),
+    })
 }
 
 async fn retry_build(
@@ -8336,7 +8360,7 @@ program = "true"
                     .uri("/api/v1/projects/demo/schedules")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"name":"every-five","expression":"*/5 * * * *"}"#,
+                        r#"{"name":"every-five","expression":"*/5 * * * *","trigger":"repository_poll"}"#,
                     ))
                     .expect("request"),
             )
@@ -8345,6 +8369,7 @@ program = "true"
         assert_eq!(response.status(), StatusCode::CREATED);
         let body = to_bytes(response.into_body(), 8192).await.expect("body");
         let schedule: ScheduleRecord = serde_json::from_slice(&body).expect("schedule");
+        assert_eq!(schedule.trigger, ScheduleTrigger::RepositoryPoll);
 
         let response = router(state.clone())
             .oneshot(
@@ -8460,5 +8485,130 @@ program = "true"
             .expect("schedule exists");
         assert_eq!(persisted_schedule.last_run_at, Some(due_at));
         assert!(persisted_schedule.next_run_at > due_at);
+    }
+
+    #[tokio::test]
+    async fn repository_poll_schedule_skips_an_unchanged_revision() {
+        let directory = tempdir().expect("tempdir");
+        let repository = directory.path().join("repository");
+        fs::create_dir_all(&repository).expect("repository");
+        let pipeline_path = repository.join("Rivetfile.toml");
+        fs::write(
+            &pipeline_path,
+            r#"
+version = 1
+name = "scheduled-poll"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline file");
+        let pipeline = Pipeline::load(&pipeline_path).expect("pipeline");
+        let project = Project::new(
+            "scheduled-poll",
+            repository.to_string_lossy().into_owned(),
+            pipeline_path.to_string_lossy().into_owned(),
+        )
+        .expect("project");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repository)
+                .output()
+                .expect("git available");
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "rivet@example.test"]);
+        git(&["config", "user.name", "Rivet Tests"]);
+        git(&["add", "Rivetfile.toml"]);
+        git(&["commit", "-qm", "scheduled poll fixture"]);
+
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let due_at = Utc
+            .with_ymd_and_hms(2026, 9, 13, 12, 0, 0)
+            .single()
+            .expect("due timestamp");
+        let schedule = storage
+            .create_schedule_with_trigger(
+                project.id,
+                "poll-every-minute",
+                "* * * * *",
+                ScheduleTrigger::RepositoryPoll,
+                true,
+                due_at,
+            )
+            .expect("schedule");
+        let state = AppState::new(storage.clone());
+
+        assert_eq!(
+            dispatch_due_schedules(&state, due_at)
+                .await
+                .expect("first dispatch"),
+            1
+        );
+        assert_eq!(
+            storage.list_builds(project.id).expect("first build").len(),
+            1
+        );
+        let first_schedule = storage
+            .get_schedule(project.id, schedule.id)
+            .expect("first schedule")
+            .expect("schedule exists");
+        assert!(
+            storage
+                .claim_schedule(schedule.id, first_schedule.next_run_at, due_at, due_at)
+                .expect("rearm unchanged poll")
+        );
+        assert_eq!(
+            dispatch_due_schedules(&state, due_at)
+                .await
+                .expect("unchanged dispatch"),
+            0
+        );
+        assert_eq!(
+            storage
+                .list_builds(project.id)
+                .expect("unchanged builds")
+                .len(),
+            1
+        );
+
+        fs::write(repository.join("change.txt"), "revision two\n").expect("change");
+        git(&["add", "change.txt"]);
+        git(&["commit", "-qm", "second scheduled poll fixture"]);
+        let armed_schedule = storage
+            .get_schedule(project.id, schedule.id)
+            .expect("armed schedule")
+            .expect("schedule exists");
+        assert!(
+            storage
+                .claim_schedule(schedule.id, armed_schedule.next_run_at, due_at, due_at)
+                .expect("rearm changed poll")
+        );
+        assert_eq!(
+            dispatch_due_schedules(&state, due_at)
+                .await
+                .expect("changed dispatch"),
+            1
+        );
+        assert_eq!(
+            storage
+                .list_builds(project.id)
+                .expect("changed builds")
+                .len(),
+            2
+        );
     }
 }

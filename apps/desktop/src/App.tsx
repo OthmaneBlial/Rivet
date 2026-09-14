@@ -609,6 +609,7 @@ function App() {
       await createSchedule(projectName, {
         name: String(form.get("schedule_name") ?? ""),
         expression: String(form.get("schedule_expression") ?? ""),
+        trigger: String(form.get("schedule_trigger") ?? "build") as "build" | "repository_poll",
       });
       await loadScheduleList();
       setShowScheduleCreate(false);
@@ -1209,6 +1210,7 @@ function SchedulePanel({
       {showCreate && (
         <form className="schedule-form" onSubmit={onSubmit}>
           <label>Schedule name<input name="schedule_name" required placeholder="nightly" /></label>
+          <label>Trigger<select name="schedule_trigger" defaultValue="build"><option value="build">Run pipeline</option><option value="repository_poll">Poll repository changes</option></select><small>Polling queues only a new Git revision.</small></label>
           <label>Cron expression<input name="schedule_expression" required placeholder="0 2 * * *" /><small>UTC · 5 fields: minute hour day month weekday</small></label>
           <button className="button button-primary" type="submit" disabled={busy}>{busy ? "Saving…" : "Save schedule"}</button>
         </form>
@@ -1220,7 +1222,7 @@ function SchedulePanel({
           {scheduleRecords.map((schedule) => (
             <div className={`schedule-row ${schedule.enabled ? "" : "schedule-disabled"}`} key={schedule.id}>
               <span className={`schedule-indicator ${schedule.enabled ? "enabled" : "disabled"}`} aria-hidden="true" />
-              <div className="schedule-copy"><strong>{schedule.name}</strong><small><code>{schedule.expression}</code> · next {formatTime(schedule.next_run_at)}</small></div>
+              <div className="schedule-copy"><strong>{schedule.name}</strong><small><code>{schedule.expression}</code> · {schedule.trigger === "repository_poll" ? "poll changes" : "run pipeline"} · next {formatTime(schedule.next_run_at)}</small></div>
               <span className="schedule-status">{schedule.enabled ? "active" : "paused"}</span>
               <button className="button button-quiet schedule-action" type="button" disabled={busy} onClick={() => onToggle(schedule)}>{schedule.enabled ? "Pause" : "Resume"}</button>
               <button className="schedule-delete" type="button" disabled={busy} aria-label={`Delete schedule ${schedule.name}`} onClick={() => onDelete(schedule)}>×</button>

@@ -624,8 +624,16 @@ the familiar five-field form:
 ```sh
 cargo run -p rivet -- schedule create rivet \
   --name nightly --expression "0 2 * * *"
+cargo run -p rivet -- schedule create rivet \
+  --name poll-main --expression "*/5 * * * *" --trigger repository-poll
 cargo run -p rivet -- schedule list rivet
 ```
+
+Schedules default to `build`, which admits one pipeline run at each due UTC
+occurrence. `--trigger repository-poll` instead inspects the project's local
+Git checkout at each occurrence and admits a build only for a revision not yet
+recorded for that project; the API and desktop schedule form expose the same
+two trigger modes.
 
 The first executable pipeline format is deliberately explicit:
 

@@ -105,6 +105,8 @@ pub enum StorageError {
     InvalidArtifactSize(i64),
     #[error("invalid schedule enabled flag in database: {0}")]
     InvalidScheduleEnabled(i64),
+    #[error("invalid schedule trigger in database: {0}")]
+    InvalidScheduleTrigger(String),
     #[error("webhook delivery {0} does not exist")]
     MissingWebhookDelivery(String),
     #[error("repository poll event {0} does not exist")]
@@ -213,11 +215,34 @@ pub struct ArtifactPruneResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleTrigger {
+    Build,
+    RepositoryPoll,
+}
+
+impl Default for ScheduleTrigger {
+    fn default() -> Self {
+        Self::Build
+    }
+}
+
+impl ScheduleTrigger {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::RepositoryPoll => "repository_poll",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScheduleRecord {
     pub id: ScheduleId,
     pub project_id: ProjectId,
     pub name: String,
     pub expression: String,
+    pub trigger: ScheduleTrigger,
     pub enabled: bool,
     pub next_run_at: DateTime<Utc>,
     pub last_run_at: Option<DateTime<Utc>>,
@@ -397,6 +422,11 @@ impl Storage {
             16,
             Some(include_str!("../migrations/016_repository_poll_events.sql")),
         )?;
+        apply_migration(
+            &connection,
+            17,
+            Some(include_str!("../migrations/017_schedule_triggers.sql")),
+        )?;
         backfill_event_hashes(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -514,11 +544,31 @@ impl Storage {
         enabled: bool,
         next_run_at: DateTime<Utc>,
     ) -> Result<ScheduleRecord, StorageError> {
+        self.create_schedule_with_trigger(
+            project_id,
+            name,
+            expression,
+            ScheduleTrigger::Build,
+            enabled,
+            next_run_at,
+        )
+    }
+
+    pub fn create_schedule_with_trigger(
+        &self,
+        project_id: ProjectId,
+        name: impl Into<String>,
+        expression: impl Into<String>,
+        trigger: ScheduleTrigger,
+        enabled: bool,
+        next_run_at: DateTime<Utc>,
+    ) -> Result<ScheduleRecord, StorageError> {
         let schedule = ScheduleRecord {
             id: Uuid::new_v4(),
             project_id,
             name: name.into(),
             expression: expression.into(),
+            trigger,
             enabled,
             next_run_at,
             last_run_at: None,
@@ -527,13 +577,14 @@ impl Storage {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         connection.execute(
             "INSERT INTO schedules(
-                id, project_id, name, expression, enabled, next_run_at, last_run_at, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                id, project_id, name, expression, trigger, enabled, next_run_at, last_run_at, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 schedule.id.to_string(),
                 schedule.project_id.to_string(),
                 schedule.name,
                 schedule.expression,
+                schedule.trigger.as_str(),
                 i64::from(schedule.enabled),
                 schedule.next_run_at.to_rfc3339(),
                 Option::<String>::None,
@@ -549,7 +600,7 @@ impl Storage {
     ) -> Result<Vec<ScheduleRecord>, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
-            "SELECT id, project_id, name, expression, enabled, next_run_at, last_run_at, created_at
+            "SELECT id, project_id, name, expression, trigger, enabled, next_run_at, last_run_at, created_at
              FROM schedules WHERE project_id = ?1 ORDER BY name ASC",
         )?;
         let rows = statement.query_map(params![project_id.to_string()], raw_schedule)?;
@@ -565,7 +616,7 @@ impl Storage {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let row = connection
             .query_row(
-                "SELECT id, project_id, name, expression, enabled, next_run_at, last_run_at, created_at
+                "SELECT id, project_id, name, expression, trigger, enabled, next_run_at, last_run_at, created_at
                  FROM schedules WHERE project_id = ?1 AND id = ?2",
                 params![project_id.to_string(), schedule_id.to_string()],
                 raw_schedule,
@@ -577,7 +628,7 @@ impl Storage {
     pub fn due_schedules(&self, now: DateTime<Utc>) -> Result<Vec<ScheduleRecord>, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
-            "SELECT id, project_id, name, expression, enabled, next_run_at, last_run_at, created_at
+            "SELECT id, project_id, name, expression, trigger, enabled, next_run_at, last_run_at, created_at
              FROM schedules
              WHERE enabled = 1 AND next_run_at <= ?1
              ORDER BY next_run_at ASC, created_at ASC, id ASC",
@@ -630,7 +681,7 @@ impl Storage {
             return Ok(None);
         }
         let row = connection.query_row(
-            "SELECT id, project_id, name, expression, enabled, next_run_at, last_run_at, created_at
+            "SELECT id, project_id, name, expression, trigger, enabled, next_run_at, last_run_at, created_at
              FROM schedules WHERE project_id = ?1 AND id = ?2",
             params![project_id.to_string(), schedule_id.to_string()],
             raw_schedule,
@@ -1883,6 +1934,7 @@ type RawSchedule = (
     String,
     String,
     String,
+    String,
     i64,
     String,
     Option<String>,
@@ -2243,11 +2295,17 @@ fn raw_schedule(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSchedule> {
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
+        row.get(8)?,
     ))
 }
 
 fn parse_schedule(raw: RawSchedule) -> Result<ScheduleRecord, StorageError> {
-    let enabled = match raw.4 {
+    let trigger = match raw.4.as_str() {
+        "build" => ScheduleTrigger::Build,
+        "repository_poll" => ScheduleTrigger::RepositoryPoll,
+        value => return Err(StorageError::InvalidScheduleTrigger(value.to_owned())),
+    };
+    let enabled = match raw.5 {
         0 => false,
         1 => true,
         value => return Err(StorageError::InvalidScheduleEnabled(value)),
@@ -2257,10 +2315,11 @@ fn parse_schedule(raw: RawSchedule) -> Result<ScheduleRecord, StorageError> {
         project_id: parse_uuid(&raw.1)?,
         name: raw.2,
         expression: raw.3,
+        trigger,
         enabled,
-        next_run_at: parse_timestamp(&raw.5)?,
-        last_run_at: raw.6.as_deref().map(parse_timestamp).transpose()?,
-        created_at: parse_timestamp(&raw.7)?,
+        next_run_at: parse_timestamp(&raw.6)?,
+        last_run_at: raw.7.as_deref().map(parse_timestamp).transpose()?,
+        created_at: parse_timestamp(&raw.8)?,
     })
 }
 
@@ -2864,6 +2923,7 @@ program = "true"
         let schedule = storage
             .create_schedule(project.id, "nightly", "*/5 * * * *", true, due_at)
             .expect("schedule");
+        assert_eq!(schedule.trigger, ScheduleTrigger::Build);
 
         assert_eq!(
             storage.list_schedules(project.id).expect("list"),
@@ -2889,6 +2949,7 @@ program = "true"
             .expect("persisted")
             .pop()
             .expect("schedule exists");
+        assert_eq!(persisted.trigger, ScheduleTrigger::Build);
         assert_eq!(persisted.next_run_at, next_at);
         assert_eq!(persisted.last_run_at, Some(due_at));
     }

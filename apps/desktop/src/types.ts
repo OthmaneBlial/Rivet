@@ -98,11 +98,14 @@ export interface ScheduleRecord {
   project_id: string;
   name: string;
   expression: string;
+  trigger: ScheduleTrigger;
   enabled: boolean;
   next_run_at: string;
   last_run_at: string | null;
   created_at: string;
 }
+
+export type ScheduleTrigger = "build" | "repository_poll";
 
 export interface QueueResponse {
   build: BuildRecord;

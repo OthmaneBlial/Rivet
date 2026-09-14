@@ -26,7 +26,7 @@ use rivet_runner::{CacheStore, MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHand
 use rivet_scm::{
     GitCredential, GitHttpCredential, GitPrepareOptions, GitRepository, GitSshCredential, ScmError,
 };
-use rivet_storage::Storage;
+use rivet_storage::{ScheduleTrigger, Storage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -393,6 +393,9 @@ enum ScheduleCommand {
         name: String,
         #[arg(long)]
         expression: String,
+        /// Trigger mode: build or repository-poll.
+        #[arg(long, default_value = "build", value_parser = parse_schedule_trigger)]
+        trigger: ScheduleTrigger,
         #[arg(long)]
         disabled: bool,
     },
@@ -2434,6 +2437,7 @@ fn manage_schedule(
             project,
             name,
             expression,
+            trigger,
             disabled,
         } => {
             let project_record = storage
@@ -2442,10 +2446,11 @@ fn manage_schedule(
             let name = validate_schedule_name(name)?;
             let expression = CronExpression::parse(&expression)?;
             let next_run_at = expression.next_after(Utc::now())?;
-            let schedule = storage.create_schedule(
+            let schedule = storage.create_schedule_with_trigger(
                 project_record.id,
                 name,
                 expression.expression(),
+                trigger,
                 !disabled,
                 next_run_at,
             )?;
@@ -2462,7 +2467,7 @@ fn manage_schedule(
                 .ok_or_else(|| format!("project not found: {project}"))?;
             for schedule in storage.list_schedules(project_record.id)? {
                 println!(
-                    "{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}",
                     schedule.id,
                     if schedule.enabled {
                         "enabled"
@@ -2471,6 +2476,7 @@ fn manage_schedule(
                     },
                     schedule.name,
                     schedule.expression,
+                    schedule.trigger.as_str(),
                     schedule.next_run_at.to_rfc3339()
                 );
             }
@@ -2492,6 +2498,16 @@ fn manage_schedule(
         }
     }
     Ok(())
+}
+
+fn parse_schedule_trigger(value: &str) -> Result<ScheduleTrigger, String> {
+    match value.trim() {
+        "build" => Ok(ScheduleTrigger::Build),
+        "repository_poll" | "repository-poll" => Ok(ScheduleTrigger::RepositoryPoll),
+        other => Err(format!(
+            "invalid schedule trigger {other:?}; expected build or repository_poll"
+        )),
+    }
 }
 
 fn set_schedule_enabled(

@@ -17,7 +17,7 @@
     {"id": "cli", "weight": 3, "completion": 1.0, "status": "verified"},
     {"id": "desktop", "weight": 10, "completion": 0.99, "status": "partial"},
     {"id": "scm", "weight": 8, "completion": 0.998, "status": "partial"},
-    {"id": "triggers", "weight": 5, "completion": 0.998, "status": "partial"},
+    {"id": "triggers", "weight": 5, "completion": 0.999, "status": "partial"},
     {"id": "agents", "weight": 10, "completion": 1.0, "status": "verified"},
     {"id": "containers", "weight": 4, "completion": 0.35, "status": "partial"},
     {"id": "artifacts", "weight": 4, "completion": 0.95, "status": "partial"},
