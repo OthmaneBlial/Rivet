@@ -315,6 +315,12 @@ deployment hardening. It writes a versioned SHA-256 manifest to a temporary
 release directory. The gate is local by design; this repository intentionally
 has no GitHub Actions workflow.
 
+If the release gate reports `no Tauri window (-2700)`, the bundle and engine
+may already be healthy but macOS has denied the automation probe. Grant
+Accessibility access to the terminal running the check under **System Settings
+→ Privacy & Security → Accessibility**, then rerun the gate. The window check
+is intentionally strict and is never skipped.
+
 ## Roadmap
 
 The next meaningful gates are:

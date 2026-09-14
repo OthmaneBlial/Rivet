@@ -52,7 +52,7 @@ fi
 
 # A loopback listener alone can be provided by a headless process. Confirm
 # that the packaged Tauri host also created the operator-facing window.
-window_name=$(osascript <<'APPLESCRIPT'
+if ! window_name=$(osascript 2>"$launch_root/window-error.log" <<'APPLESCRIPT'
 tell application "System Events"
     tell process "rivet-desktop"
         if (count of windows) = 0 then error "no Tauri window"
@@ -60,7 +60,12 @@ tell application "System Events"
     end tell
 end tell
 APPLESCRIPT
-)
+); then
+    printf '%s\n' "Tauri macOS bundle smoke refused: macOS could not inspect the application window." >&2
+    printf '%s\n' "Grant Accessibility access to the shell/terminal running this check in System Settings > Privacy & Security > Accessibility, then retry." >&2
+    sed -n '1,20p' "$launch_root/window-error.log" >&2 || true
+    exit 1
+fi
 case "$window_name" in
     *Rivet*) ;;
     *)
