@@ -108,18 +108,17 @@ function initialTheme(): Theme {
 
 function RivetMark({ className = "" }: { className?: string }) {
   return (
-    <svg className={`rivet-mark ${className}`} viewBox="0 0 80 80" aria-hidden="true" focusable="false">
-      <path className="rivet-mark-shadow" d="M22 8h30l18 18v30L55 73H22L7 58V23z" />
-      <path className="rivet-mark-shell" d="M19 5h30l18 18v30L52 70H19L4 55V20z" />
-      <path className="rivet-mark-edge" d="M19 5v12M49 5v18h18M67 53l-15 17M19 70V55H4" />
-      <circle className="rivet-mark-core" cx="37" cy="39" r="22" />
-      <circle className="rivet-mark-fastener" cx="18" cy="19" r="2.5" />
-      <circle className="rivet-mark-fastener" cx="57" cy="58" r="2.5" />
-      <path className="rivet-mark-r" d="M26 54V24h12.3c9.8 0 15 3.6 15 10 0 4.2-2.1 7.2-6.3 8.8L54 54h-8.5l-6.8-9H33v9zm7-15.2h5c3.3 0 5.1-1.3 5.1-4s-1.8-3.8-5.1-3.8H33z" />
-      <path className="rivet-mark-rail" d="M9 45 20 56h9M53 20 65 8" />
-      <circle className="rivet-mark-node" cx="68" cy="6" r="6" />
-      <circle className="rivet-mark-node-core" cx="68" cy="6" r="2" />
-      <path className="rivet-mark-notch" d="m64.5 2.5 7 7" />
+    <svg className={`rivet-mark ${className}`} viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+      <path className="rivet-mark-shadow" d="m32 6 21 12v24L32 54 11 42V18z" />
+      <path className="rivet-mark-bracket" d="M24 7H18L7 18v6M40 7h6l11 11v6M57 40v6L46 57h-6M24 57h-6L7 46v-6" />
+      <path className="rivet-mark-rail" d="m14 14 11 11m25-11L39 25m11 25L39 39M14 50l11-11" />
+      <circle className="rivet-mark-node" cx="14" cy="14" r="3" />
+      <circle className="rivet-mark-node" cx="50" cy="14" r="3" />
+      <circle className="rivet-mark-node rivet-mark-node-warm" cx="50" cy="50" r="3" />
+      <circle className="rivet-mark-node rivet-mark-node-warm" cx="14" cy="50" r="3" />
+      <path className="rivet-mark-core-shell" d="m32 18 12 7v14l-12 7-12-7V25z" />
+      <path className="rivet-mark-core" d="m32 24 6 3.5v9L32 40l-6-3.5v-9z" />
+      <circle className="rivet-mark-pin" cx="32" cy="32" r="2.25" />
     </svg>
   );
 }
