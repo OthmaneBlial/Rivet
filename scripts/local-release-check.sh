@@ -14,25 +14,25 @@ desktop_archive="$release_output/Rivet-$release_version-macos-$release_arch.app.
 
 cd "$repo_root"
 
-echo "[1/14] checking local progress and repository boundaries"
+echo "[1/15] checking local progress and repository boundaries"
 ./scripts/local-progress-check.sh
 
-echo "[2/14] checking Rust formatting"
+echo "[2/15] checking Rust formatting"
 cargo fmt --all -- --check
 
-echo "[3/14] running the local Rust workspace tests"
+echo "[3/15] running the local Rust workspace tests"
 cargo test --workspace
 
-echo "[4/14] building the release CLI"
+echo "[4/15] building the release CLI"
 cargo build --release -p rivet
 
-echo "[5/14] building the desktop client"
+echo "[5/15] building the desktop client"
 (cd apps/desktop && npm run build)
 
-echo "[6/14] checking the native Tauri host"
+echo "[6/15] checking the native Tauri host"
 cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
 
-echo "[7/14] building the local Tauri macOS bundle"
+echo "[7/15] building the local Tauri macOS bundle"
 ./scripts/local-tauri-bundle-smoke.sh
 
 mkdir -p "$release_output"
@@ -53,19 +53,19 @@ else
     desktop_checksum=$(sha256sum "$desktop_archive" | awk '{print $1}')
 fi
 
-echo "[8/14] exercising the real local CLI workflow"
+echo "[8/15] exercising the real local CLI workflow"
 ./scripts/local-e2e-smoke.sh
 
-echo "[9/14] exercising the real server queue workflow"
+echo "[9/15] exercising the real server queue workflow"
 ./scripts/local-queue-smoke.sh
 
-echo "[10/14] exercising local backup and restore"
+echo "[10/15] exercising local backup and restore"
 ./scripts/local-backup-restore-smoke.sh
 
-echo "[11/14] exercising local user authentication"
+echo "[11/15] exercising local user authentication"
 ./scripts/local-auth-smoke.sh
 
-echo "[12/14] exercising live compatibility capture adapters"
+echo "[12/15] exercising live compatibility capture adapters"
 ./scripts/local-compat-capture-smoke.sh
 
 echo "[13/15] exercising the permanent compatibility corpus"
