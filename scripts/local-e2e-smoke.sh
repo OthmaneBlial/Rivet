@@ -41,4 +41,67 @@ printf '%s\n' "$builds_output" | rg -q '^#1[[:space:]]+passed[[:space:]]'
 
 "$release_binary" --data-dir "$data_dir" inspect "$project_name" --build 1
 "$release_binary" --data-dir "$data_dir" logs "$project_name" --build 1
+
+# Exercise the complete local containerized-artifact path without installing
+# or starting Docker/Podman. The shim preserves the runtime argument boundary,
+# executes inside the mounted workspace, and lets the real server projector
+# collect and expose the produced artifact.
+container_runtime_dir="$e2e_data_dir/container-runtime"
+container_repository="$e2e_data_dir/container-repository"
+mkdir -p "$container_runtime_dir" "$container_repository"
+cat > "$container_runtime_dir/podman" <<'SHIM'
+#!/bin/sh
+set -eu
+workspace=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    run) shift ;;
+    --volume)
+      [ -n "$workspace" ] || workspace=${2%%:/rivet/workspace:rw}
+      shift 2
+      ;;
+    --env|--network|--pull|--workdir) shift 2 ;;
+    --rm|--init|--sig-proxy=true) shift ;;
+    *)
+      shift
+      break
+      ;;
+  esac
+done
+test -n "$workspace"
+cd "$workspace"
+exec "$@"
+SHIM
+chmod 700 "$container_runtime_dir/podman"
+cat > "$container_repository/Rivetfile.toml" <<'PIPELINE'
+version = 1
+name = "container-artifact"
+
+[[artifacts]]
+name = "container-bundle"
+paths = ["dist/container.txt"]
+stage = "Build"
+
+[[stages]]
+name = "Build"
+[[stages.steps]]
+name = "package"
+program = "sh"
+args = ["-c", "mkdir -p dist && printf 'container artifact\\n' > dist/container.txt"]
+timeout_seconds = 30
+[stages.steps.container]
+runtime = "podman"
+image = "fixture/runtime:1"
+pull = "never"
+network = "none"
+PIPELINE
+PATH="$container_runtime_dir:$PATH" "$release_binary" --data-dir "$data_dir" project create container-e2e --repository "$container_repository"
+PATH="$container_runtime_dir:$PATH" "$release_binary" --data-dir "$data_dir" run container-e2e
+container_builds=$("$release_binary" --data-dir "$data_dir" builds container-e2e)
+printf '%s\n' "$container_builds"
+printf '%s\n' "$container_builds" | rg -q '^#1[[:space:]]+passed[[:space:]]'
+container_artifacts=$("$release_binary" --data-dir "$data_dir" artifacts container-e2e --build 1)
+printf '%s\n' "$container_artifacts"
+printf '%s\n' "$container_artifacts" | rg -q '^container-bundle[[:space:]]+dist/container\.txt[[:space:]]'
+
 printf '%s\n' "local end-to-end smoke passed"

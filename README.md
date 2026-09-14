@@ -37,8 +37,8 @@ and full Jenkins parity are not claimed.
   <img src="https://img.shields.io/badge/validation-local%20only-0f766e?style=flat-square" alt="Validation runs locally" />
 </p>
 
-**97% verified** · `███████████████████▍`<br>
-Weighted evidence score: **97.55 / 100** · displayed conservatively as the
+**98% verified** · `███████████████████▌`<br>
+Weighted evidence score: **98.15 / 100** · displayed conservatively as the
 whole-number floor. This measures the weighted product scope in
 [ROADMAP.md](ROADMAP.md), not Jenkins parity.
 
@@ -303,8 +303,8 @@ boundaries in mind:
 
 ## Current status
 
-The repository currently reports **97.55 / 100 weighted evidence points** and
-displays **97% verified**. This is an engineering progress measure, not a
+The repository currently reports **98.15 / 100 weighted evidence points** and
+displays **98% verified**. This is an engineering progress measure, not a
 promise of complete platform coverage.
 
 | Boundary | Status |
