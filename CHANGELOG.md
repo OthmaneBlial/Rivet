@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- owner-guarded credential removal across the CLI, API, and desktop control
+  room;
+- GitHub issue, pull request, support, and community guidance templates for
+  evidence-led contributions.
+
 ## 0.1.0-alpha — 2026-09-14
 
 First public preview of Rivet, a Rust-native CI/CD control room for explicit
