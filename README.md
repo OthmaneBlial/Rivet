@@ -211,6 +211,21 @@ The command refuses to overwrite an existing file unless `--force` is passed.
 The output is a draft: inspect its status and warnings before using it in a
 real CI/CD workflow.
 
+### Restrict container image registries (optional)
+
+Container steps can be restricted to a deployment-owned comma-separated
+allow-list. Unqualified images such as `rust:1.85` are evaluated as
+`docker.io`; an image from any other registry is refused before the runtime is
+invoked.
+
+```sh
+export RIVET_ALLOWED_CONTAINER_REGISTRIES=ghcr.io,docker.io
+```
+
+The policy does not install or start Docker/Podman. The repository verifies the
+policy and process controls through a local runtime shim; behavior against a
+real container daemon remains an explicit release gate.
+
 ### Run the desktop control room
 
 ```sh
@@ -299,7 +314,7 @@ promise of complete platform coverage.
 | Tauri control room, light default, dark mode, offline recovery, packaged loopback engine | **Working and locally tested, including packaged window QA** |
 | Remote-agent protocol and shared-runner execution | **Working local vertical slice** |
 | GitHub/GitLab/Bitbucket signed completion mappings | **Working locally; provider deployment evidence remains** |
-| Docker/Podman runtime behavior, external identity providers, signed installers, Windows/Linux packages | **Planned or unverified** |
+| Docker/Podman daemon behavior and artifact extraction, external identity providers, signed installers, Windows/Linux packages | **Planned or unverified** |
 | Jenkinsfile migration | **Experimental analyzer; review every finding and draft** |
 
 See the [weighted roadmap](ROADMAP.md) for the exact gates and denominator.

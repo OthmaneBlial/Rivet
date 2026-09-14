@@ -5,7 +5,7 @@
   "verified_points": 95,
   "weighted_evidence_points": 96.95,
   "total_points": 100,
-  "last_verified": "2026-09-14",
+  "last_verified": "2026-09-15",
   "policy": "Only tested or exercised behavior counts; partial work receives only its evidenced portion.",
   "workstreams": [
     {"id": "foundation", "weight": 4, "completion": 1.0, "status": "verified"},

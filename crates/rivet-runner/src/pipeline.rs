@@ -28,6 +28,10 @@ pub enum RunnerError {
         "container runtime {runtime:?} is unavailable on PATH; Rivet never installs or starts container runtimes"
     )]
     ContainerRuntimeUnavailable { runtime: ContainerRuntime },
+    #[error("container image policy is invalid: {0}")]
+    InvalidContainerImagePolicy(String),
+    #[error("container image {image:?} is denied by the configured registry policy ({registry:?})")]
+    ContainerImageDenied { image: String, registry: String },
     #[error("validated execution graph could not make progress")]
     GraphBlocked,
     #[error("stage execution task failed: {0}")]
@@ -410,6 +414,12 @@ async fn execute_step_attempt(
     env.insert("RIVET_BUILD_ID".into(), plan.build_id.to_string());
     env.insert("RIVET_PROJECT_ID".into(), plan.project_id.to_string());
     if let Some(container) = step.definition.container.as_ref() {
+        enforce_container_image_policy(
+            &container.image,
+            std::env::var("RIVET_ALLOWED_CONTAINER_REGISTRIES")
+                .ok()
+                .as_deref(),
+        )?;
         ensure_container_runtime(container.runtime)?;
     }
     let spec = build_process_spec(step, workspace, working_dir, env);
@@ -554,6 +564,48 @@ fn build_process_spec(
 
 fn ensure_container_runtime(runtime: ContainerRuntime) -> Result<(), RunnerError> {
     ensure_container_runtime_on_path(runtime, std::env::var_os("PATH").as_deref())
+}
+
+/// Enforce an optional deployment-owned registry allow-list. Unqualified OCI
+/// images are treated as Docker Hub (`docker.io`); an unset policy preserves
+/// the declarative pipeline default, while a configured policy fails closed.
+fn enforce_container_image_policy(image: &str, policy: Option<&str>) -> Result<(), RunnerError> {
+    let Some(policy) = policy.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    let registry = container_image_registry(image);
+    let mut found = false;
+    for entry in policy.split(',') {
+        let entry = entry.trim().to_ascii_lowercase();
+        if entry.is_empty()
+            || entry
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace())
+            || entry.contains('/')
+        {
+            return Err(RunnerError::InvalidContainerImagePolicy(entry));
+        }
+        if entry == registry {
+            found = true;
+        }
+    }
+    if found {
+        Ok(())
+    } else {
+        Err(RunnerError::ContainerImageDenied {
+            image: image.to_owned(),
+            registry,
+        })
+    }
+}
+
+fn container_image_registry(image: &str) -> String {
+    let first = image.split('/').next().unwrap_or(image);
+    if image.contains('/') && (first.contains('.') || first.contains(':') || first == "localhost") {
+        first.to_ascii_lowercase()
+    } else {
+        "docker.io".to_owned()
+    }
 }
 
 fn ensure_container_runtime_on_path(
@@ -1277,6 +1329,22 @@ pull = "never"
                 runtime: ContainerRuntime::Docker
             })
         ));
+    }
+
+    #[test]
+    fn container_image_policy_is_explicit_and_fail_closed() {
+        assert_eq!(container_image_registry("rust:1.85"), "docker.io");
+        assert_eq!(container_image_registry("ghcr.io/acme/build:r1"), "ghcr.io");
+        assert!(enforce_container_image_policy("rust:1.85", Some("docker.io")).is_ok());
+        assert!(matches!(
+            enforce_container_image_policy("ghcr.io/acme/build:r1", Some("docker.io")),
+            Err(RunnerError::ContainerImageDenied { registry, .. }) if registry == "ghcr.io"
+        ));
+        assert!(matches!(
+            enforce_container_image_policy("rust:1.85", Some("docker.io, ")),
+            Err(RunnerError::InvalidContainerImagePolicy(_))
+        ));
+        assert!(enforce_container_image_policy("rust:1.85", None).is_ok());
     }
 
     #[cfg(unix)]
