@@ -298,6 +298,7 @@ Format, test, and build the core locally:
 cargo fmt --all -- --check
 cargo test --workspace
 (cd apps/desktop && npm install && npm run build)
+./scripts/local-documentation-check.sh
 ```
 
 Run the full macOS release gate:
