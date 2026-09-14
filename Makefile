@@ -1,6 +1,6 @@
 .PHONY: check format-check test docs desktop-build release
 
-check: format-check test docs
+check: format-check test docs desktop-build
 
 format-check:
 	cargo fmt --all -- --check
