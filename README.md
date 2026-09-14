@@ -38,7 +38,7 @@ and full Jenkins parity are not claimed.
 </p>
 
 **98% verified** · `███████████████████▌`<br>
-Weighted evidence score: **98.15 / 100** · displayed conservatively as the
+Weighted evidence score: **98.21 / 100** · displayed conservatively as the
 whole-number floor. This measures the weighted product scope in
 [ROADMAP.md](ROADMAP.md), not Jenkins parity.
 
@@ -313,7 +313,7 @@ boundaries in mind:
 
 ## Current status
 
-The repository currently reports **98.15 / 100 weighted evidence points** and
+The repository currently reports **98.21 / 100 weighted evidence points** and
 displays **98% verified**. This is an engineering progress measure, not a
 promise of complete platform coverage.
 
