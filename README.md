@@ -5,8 +5,8 @@ from Jenkins.
 
 ## Delivery progress
 
-**93% verified** · `███████████████████░`<br>
-Weighted evidence score: **93.98 / 100** · displayed conservatively as the
+**94% verified** · `███████████████████░`<br>
+Weighted evidence score: **94.18 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -78,10 +78,11 @@ identity providers remain future gates.
 
 The repository includes a local-only release gate. It runs the workspace tests,
 builds the optimized CLI, builds the desktop web client, checks the native
-Tauri host, exercises a real create-project/run/history/inspect/logs workflow
-against temporary SQLite data, captures live compatibility snapshots, exercises
-authenticated local deployment hardening, copies the CLI into a temporary
-release directory, and writes a versioned SHA-256 manifest:
+Tauri host, produces a non-signed macOS `Rivet.app` bundle, exercises a real
+create-project/run/history/inspect/logs workflow against temporary SQLite data,
+captures live compatibility snapshots, exercises authenticated local deployment
+hardening, copies the CLI into a temporary release directory, and writes a
+versioned SHA-256 manifest:
 
 ```sh
 ./scripts/local-release-check.sh
