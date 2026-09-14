@@ -4,14 +4,14 @@
 //! arbitrary Jenkins plugins. It recognizes common declarative constructs and
 //! reports the exact line and migration boundary for each one.
 
-use rivet_core::{Pipeline, Stage, Step};
+use rivet_core::{ArtifactSpec, ParameterSpec, Pipeline, Stage, Step};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const ANALYZER_VERSION: u32 = 1;
+pub const ANALYZER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -451,9 +451,11 @@ pub fn analyze_jenkinsfile_file(path: &Path) -> Result<JenkinsfileAnalysis, Migr
 /// complete migration.
 pub fn generate_rivetfile_draft(source: &str) -> Result<RivetfileDraft, MigrationError> {
     let analysis = analyze_jenkinsfile(source);
+    let metadata = parse_declarative_metadata(source);
     let mut stage_drafts: Vec<StageDraft> = Vec::new();
     let mut current_stage = None;
-    let mut warnings = Vec::new();
+    let mut warnings = metadata.warnings;
+    let mut artifacts = metadata.artifacts;
     let mut in_block_comment = false;
 
     for (index, raw_line) in source.lines().enumerate() {
@@ -483,6 +485,14 @@ pub fn generate_rivetfile_draft(source: &str) -> Result<RivetfileDraft, Migratio
                     steps: Vec::new(),
                 });
                 current_stage = Some(stage_drafts.len() - 1);
+            }
+            continue;
+        }
+
+        if starts_with_construct(trimmed, "archiveArtifacts") {
+            match parse_archive_artifact(line, trimmed) {
+                Ok(artifact) => artifacts.push(artifact),
+                Err(warning) => warnings.push(warning),
             }
             continue;
         }
@@ -563,9 +573,9 @@ pub fn generate_rivetfile_draft(source: &str) -> Result<RivetfileDraft, Migratio
             version: 1,
             name: "migrated-jenkinsfile".to_owned(),
             workspace: None,
-            environment: BTreeMap::new(),
-            parameters: Vec::new(),
-            artifacts: Vec::new(),
+            environment: metadata.environment,
+            parameters: metadata.parameters,
+            artifacts,
             caches: Vec::new(),
             stages,
         };
@@ -602,6 +612,275 @@ pub fn generate_rivetfile_draft_file(path: &Path) -> Result<RivetfileDraft, Migr
 struct StageDraft {
     name: String,
     steps: Vec<Step>,
+}
+
+#[derive(Debug, Default)]
+struct DeclarativeMetadata {
+    environment: BTreeMap<String, String>,
+    parameters: Vec<ParameterSpec>,
+    artifacts: Vec<ArtifactSpec>,
+    warnings: Vec<String>,
+}
+
+fn parse_declarative_metadata(source: &str) -> DeclarativeMetadata {
+    let mut metadata = DeclarativeMetadata::default();
+
+    for (line, statement) in declaration_block_lines(source, "environment") {
+        let statement = statement.trim().trim_end_matches(';').trim();
+        let Some((name, raw_value)) = statement.split_once('=') else {
+            metadata.warnings.push(format!(
+                "line {line}: environment assignment is not a simple NAME = quoted value"
+            ));
+            continue;
+        };
+        let name = name.trim();
+        let Some(value) = quoted_literal(raw_value.trim()) else {
+            metadata.warnings.push(format!(
+                "line {line}: environment value for {name:?} is dynamic or not a single quoted string"
+            ));
+            continue;
+        };
+        if value.contains('$') {
+            metadata.warnings.push(format!(
+                "line {line}: environment value for {name:?} is dynamic and needs manual review"
+            ));
+            continue;
+        }
+        if !valid_declarative_name(name) {
+            metadata.warnings.push(format!(
+                "line {line}: environment variable name {name:?} is invalid for Rivet"
+            ));
+            continue;
+        }
+        if metadata
+            .environment
+            .insert(name.to_owned(), value)
+            .is_some()
+        {
+            metadata.warnings.push(format!(
+                "line {line}: duplicate environment variable {name:?} was not converted"
+            ));
+            metadata.environment.remove(name);
+        }
+    }
+
+    let mut parameter_names = std::collections::HashSet::new();
+    for (line, statement) in declaration_block_lines(source, "parameters") {
+        let statement = statement.trim().trim_end_matches(';').trim();
+        let (kind, secret) = if starts_with_construct(statement, "string") {
+            ("string", false)
+        } else if starts_with_construct(statement, "password") {
+            ("password", true)
+        } else {
+            metadata.warnings.push(format!(
+                "line {line}: parameter declaration is not a deterministic string/password mapping"
+            ));
+            continue;
+        };
+
+        let Some(name) = named_quoted_argument(statement, "name") else {
+            metadata.warnings.push(format!(
+                "line {line}: {kind} parameter has no simple quoted name"
+            ));
+            continue;
+        };
+        if !valid_declarative_name(&name) {
+            metadata.warnings.push(format!(
+                "line {line}: {kind} parameter name {name:?} is invalid for Rivet"
+            ));
+            continue;
+        }
+        if !parameter_names.insert(name.clone()) {
+            metadata.warnings.push(format!(
+                "line {line}: duplicate parameter {name:?} was not converted"
+            ));
+            continue;
+        }
+
+        let mut default = named_quoted_argument(statement, "defaultValue");
+        if default.as_deref().is_some_and(|value| value.contains('$')) {
+            metadata.warnings.push(format!(
+                "line {line}: default for parameter {name:?} is dynamic and was omitted"
+            ));
+            default = None;
+        }
+        if secret && default.is_some() {
+            metadata.warnings.push(format!(
+                "line {line}: secret password default for {name:?} was omitted"
+            ));
+            default = None;
+        }
+        metadata.parameters.push(ParameterSpec {
+            name,
+            default,
+            secret,
+        });
+    }
+
+    metadata
+}
+
+fn parse_archive_artifact(line: usize, statement: &str) -> Result<ArtifactSpec, String> {
+    let Some(patterns) = named_quoted_argument(statement, "artifacts") else {
+        return Err(format!(
+            "line {line}: archiveArtifacts patterns are not a single quoted value"
+        ));
+    };
+    let paths = patterns
+        .split(',')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if paths.is_empty() || paths.iter().any(|path| !valid_artifact_path(path)) {
+        return Err(format!(
+            "line {line}: archiveArtifacts contains an empty or unsafe path"
+        ));
+    }
+
+    let allow_empty = named_boolean_argument(statement, "allowEmpty").unwrap_or(false);
+    Ok(ArtifactSpec {
+        name: format!("jenkins-archive-{line}"),
+        paths,
+        allow_empty,
+    })
+}
+
+fn declaration_block_lines(source: &str, construct: &str) -> Vec<(usize, String)> {
+    let mut lines = Vec::new();
+    let mut in_block = false;
+    let mut depth = 0i32;
+    let mut in_block_comment = false;
+
+    for (index, raw_line) in source.lines().enumerate() {
+        let code_line = strip_comments(raw_line, &mut in_block_comment);
+        let trimmed = code_line.trim();
+        if !in_block {
+            if starts_with_construct(trimmed, construct) {
+                let delta = brace_balance(&code_line);
+                if delta > 0 {
+                    in_block = true;
+                    depth = delta;
+                }
+            }
+            continue;
+        }
+
+        if !trimmed.is_empty() && trimmed != "}" {
+            lines.push((index + 1, trimmed.to_owned()));
+        }
+        depth += brace_balance(&code_line);
+        if depth <= 0 {
+            in_block = false;
+            depth = 0;
+        }
+    }
+    lines
+}
+
+fn brace_balance(line: &str) -> i32 {
+    let mut balance = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    for character in line.chars() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if character == '\'' || character == '"' {
+            quote = Some(character);
+        } else if character == '{' {
+            balance += 1;
+        } else if character == '}' {
+            balance -= 1;
+        }
+    }
+    balance
+}
+
+fn named_quoted_argument(line: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}:");
+    let start = line.find(&needle)?;
+    if start > 0
+        && line[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    quoted_prefix(line[start + needle.len()..].trim_start()).map(|(value, _)| value)
+}
+
+fn named_boolean_argument(line: &str, name: &str) -> Option<bool> {
+    let needle = format!("{name}:");
+    let start = line.find(&needle)?;
+    let value = line[start + needle.len()..].trim_start();
+    if value.starts_with("true") {
+        Some(true)
+    } else if value.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn quoted_literal(value: &str) -> Option<String> {
+    let (value, trailing) = quoted_prefix(value.trim())?;
+    if trailing.trim().is_empty() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn quoted_prefix(value: &str) -> Option<(String, &str)> {
+    let mut characters = value.chars();
+    let quote = characters.next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let mut result = String::new();
+    let mut escaped = false;
+    for character in characters.by_ref() {
+        if escaped {
+            result.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == quote {
+            return Some((result, characters.as_str()));
+        } else {
+            result.push(character);
+        }
+    }
+    None
+}
+
+fn valid_declarative_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    match characters.next() {
+        Some(character) if character == '_' || character.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn valid_artifact_path(path: &str) -> bool {
+    let value = Path::new(path);
+    !path.is_empty()
+        && !path.contains('\0')
+        && !path.chars().any(char::is_control)
+        && !value.is_absolute()
+        && !value
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
 fn add_finding(
@@ -804,7 +1083,7 @@ mod tests {
 }"#,
         );
 
-        assert_eq!(analysis.analyzer_version, 1);
+        assert_eq!(analysis.analyzer_version, 2);
         assert_eq!(analysis.status, SupportLevel::Partial);
         assert_eq!(analysis.summary.supported, 4);
         assert_eq!(analysis.summary.partial, 3);
@@ -953,6 +1232,95 @@ pipeline {
         assert!(pipeline.stages[0].depends_on.is_empty());
         assert_eq!(pipeline.stages[1].depends_on, ["Build"]);
         assert_eq!(pipeline.stages[1].steps[0].args, ["-c", "cargo test"]);
+    }
+
+    #[test]
+    fn fixture_conversion_maps_static_metadata_and_archive_patterns() {
+        let source = include_str!("../fixtures/declarative-metadata-pipeline.Jenkinsfile");
+        let draft = generate_rivetfile_draft(source).expect("metadata fixture draft");
+
+        assert_eq!(draft.status, SupportLevel::Partial);
+        assert_eq!(draft.converted_steps, 1);
+        assert!(draft.warnings.is_empty());
+
+        let rivetfile = draft.rivetfile_toml.expect("metadata Rivetfile");
+        let pipeline = rivet_core::Pipeline::from_toml_str(&rivetfile).expect("valid Rivetfile");
+        assert_eq!(pipeline.environment["BUILD_CHANNEL"], "nightly");
+        assert_eq!(pipeline.environment["RELEASE_TARGET"], "staging");
+        assert_eq!(pipeline.parameters[0].name, "TARGET");
+        assert_eq!(pipeline.parameters[0].default.as_deref(), Some("release"));
+        assert!(!pipeline.parameters[0].secret);
+        assert_eq!(pipeline.parameters[1].name, "DEPLOY_TOKEN");
+        assert!(pipeline.parameters[1].default.is_none());
+        assert!(pipeline.parameters[1].secret);
+        assert_eq!(pipeline.artifacts[0].name, "jenkins-archive-15");
+        assert_eq!(
+            pipeline.artifacts[0].paths,
+            ["target/release/**", "manifest.json"]
+        );
+        assert!(pipeline.artifacts[0].allow_empty);
+        assert_eq!(
+            pipeline.stages[0].steps[0].args,
+            ["-c", "cargo build --release"]
+        );
+    }
+
+    #[test]
+    fn dynamic_metadata_and_unsafe_archives_remain_outside_the_generated_draft() {
+        let draft = generate_rivetfile_draft(
+            r#"pipeline {
+  environment {
+    RELEASE = "${params.RELEASE}"
+  }
+  parameters {
+    booleanParam(name: 'PUBLISH', defaultValue: true)
+    password(name: 'TOKEN', defaultValue: 'do-not-copy')
+  }
+  stages {
+    stage('Build') {
+      steps {
+        sh 'cargo build'
+        archiveArtifacts artifacts: '../outside/**'
+      }
+    }
+  }
+}"#,
+        )
+        .expect("bounded metadata draft");
+
+        assert!(
+            draft
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("dynamic"))
+        );
+        assert!(
+            draft
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("string/password"))
+        );
+        assert!(
+            draft
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("secret password default"))
+        );
+        assert!(
+            draft
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unsafe path"))
+        );
+
+        let rivetfile = draft.rivetfile_toml.expect("bounded Rivetfile");
+        let pipeline = rivet_core::Pipeline::from_toml_str(&rivetfile).expect("valid Rivetfile");
+        assert!(pipeline.environment.is_empty());
+        assert_eq!(pipeline.parameters.len(), 1);
+        assert_eq!(pipeline.parameters[0].name, "TOKEN");
+        assert!(pipeline.parameters[0].secret);
+        assert!(pipeline.parameters[0].default.is_none());
+        assert!(pipeline.artifacts.is_empty());
     }
 
     #[test]

@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **94% verified** · `███████████████████░`<br>
-Weighted evidence score: **94.28 / 100** · displayed conservatively as the
+Weighted evidence score: **94.33 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -713,12 +713,14 @@ cargo run -p rivet -- analyze jenkinsfile --draft ./Jenkinsfile
 
 The analyzer emits versioned JSON with supported, partial, and unsupported
 constructs, source line numbers, and Rivet mapping guidance. The optional
-draft emits a valid Rivetfile for simple, explicitly quoted `sh`/`bat` steps
-and leaves ambiguous commands, credentials, plugins, and lifecycle behavior in
-warnings. It never executes Groovy or plugin code; complex migration semantics
-still need manual review. Generated declarative stages retain Jenkins'
-sequential order through explicit Rivet dependencies, and the fixture suite
-keeps unsupported approval stages visible instead of silently dropping them.
+draft emits a valid Rivetfile for simple, explicitly quoted `sh`/`bat` steps,
+static environment assignments, `string`/`password` parameters, and safe
+`archiveArtifacts` patterns. Ambiguous commands, dynamic values, unsupported
+parameter types, credentials, plugins, and lifecycle behavior stay in warnings.
+It never executes Groovy or plugin code; complex migration semantics still
+need manual review. Generated declarative stages retain Jenkins' sequential
+order through explicit Rivet dependencies, and the fixture suite keeps
+unsupported approval stages visible instead of silently dropping them.
 
 Shell parsing is not implicit. A later pipeline feature may add an explicit
 shell step with a documented threat boundary; direct process execution is the
