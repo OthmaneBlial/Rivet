@@ -38,7 +38,11 @@ impl CacheStore {
     /// bounded local files; arbitrary shell interpolation is never allowed.
     pub fn resolve_spec(&self, spec: &CacheSpec, workspace: &Path) -> CacheSpec {
         let lockfile_hash = lockfile_hash(workspace);
-        let source_hash = std::env::var("RIVET_SOURCE_HASH").unwrap_or_else(|_| "unknown".into());
+        let source_hash = std::env::var("RIVET_SOURCE_HASH")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| git_source_hash(workspace))
+            .unwrap_or_else(|| "unknown".into());
         let branch = std::env::var("RIVET_BRANCH").unwrap_or_else(|_| "unknown".into());
         let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
         let expand = |value: &str| {
@@ -388,6 +392,22 @@ fn lockfile_hash(workspace: &Path) -> String {
     .unwrap_or_else(|| "none".into())
 }
 
+fn git_source_hash(workspace: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let revision = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (revision.len() <= 128
+        && revision.len() >= 7
+        && revision.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then_some(revision)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +496,44 @@ program = "true"
         assert_eq!(resolved.fallback_keys.len(), 1);
         assert!(!resolved.fallback_keys[0].contains("${branch}"));
         assert!(resolved.key.contains("unknown"));
+    }
+
+    #[test]
+    fn resolves_source_hash_from_a_local_git_head() {
+        let directory = tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory.path())
+                .output()
+                .expect("git")
+        };
+        fs::create_dir_all(directory.path()).expect("workspace");
+        assert!(run(&["init", "-q"]).status.success());
+        assert!(
+            run(&["config", "user.email", "rivet@example.test"])
+                .status
+                .success()
+        );
+        assert!(
+            run(&["config", "user.name", "Rivet Tests"])
+                .status
+                .success()
+        );
+        fs::write(directory.path().join("Rivetfile.toml"), "version = 1\n").expect("file");
+        assert!(run(&["add", "Rivetfile.toml"]).status.success());
+        assert!(run(&["commit", "-qm", "cache context"]).status.success());
+        assert!(git_source_hash(directory.path()).is_some());
+        let spec = CacheSpec {
+            name: "deps".into(),
+            key: "source-${source_hash}".into(),
+            paths: vec!["target".into()],
+            fallback_keys: vec![],
+        };
+        let resolved =
+            CacheStore::new(directory.path().join("cache")).resolve_spec(&spec, directory.path());
+        assert!(resolved.key.starts_with("source-"));
+        assert!(resolved.key.len() > "source-unknown".len());
     }
 
     #[test]

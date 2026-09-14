@@ -38,7 +38,7 @@ and full Jenkins parity are not claimed.
 </p>
 
 **95% verified** · `███████████████████░`<br>
-Weighted evidence score: **95.89 / 100** · displayed conservatively as the
+Weighted evidence score: **95.95 / 100** · displayed conservatively as the
 whole-number floor. This measures the weighted product scope in
 [ROADMAP.md](ROADMAP.md), not Jenkins parity.
 
@@ -91,7 +91,8 @@ capacity, pause/resume, queue telemetry, and pre-execution cancellation.
 
 Build details, stage movement, live output, retry actions, checksummed artifact
 downloads, retention pruning, and project-scoped local CI cache operations are
-available through the CLI, API, and desktop control room.
+available through the CLI, API, and desktop control room. Cache keys can include
+branch, platform, local Git revision, and lockfile-hash context.
 
 ### Connect repositories and triggers
 
@@ -269,7 +270,7 @@ boundaries in mind:
 
 ## Current status
 
-The repository currently reports **95.89 / 100 weighted evidence points** and
+The repository currently reports **95.95 / 100 weighted evidence points** and
 displays **95% verified**. This is an engineering progress measure, not a
 promise of complete platform coverage.
 
