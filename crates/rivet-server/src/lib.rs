@@ -35,8 +35,8 @@ use rivet_extension_protocol::{
 };
 use rivet_runner::{MAX_QUEUE_PRIORITY, MIN_QUEUE_PRIORITY, QueueHandle, QueueStats, Scheduler};
 use rivet_scm::{
-    GitCredential, GitHttpCredential, GitPrepareOptions, GitRepository, GitSnapshot,
-    GitSshCredential, ScmError, validate_known_hosts_file,
+    GitCloneOptions, GitCredential, GitHttpCredential, GitPrepareOptions, GitRepository,
+    GitSnapshot, GitSshCredential, ScmError, validate_known_hosts_file,
 };
 use rivet_storage::{
     AnnotationRecord, ArtifactRecord, AuditEventRecord, BuildDetails, BuildRecord, LogRecord,
@@ -446,8 +446,27 @@ const AUTH_SESSION_TTL_SECONDS: i64 = 12 * 60 * 60;
 #[derive(Debug, Deserialize)]
 pub struct CreateProjectRequest {
     pub name: String,
+    #[serde(default)]
     pub repository_path: PathBuf,
     pub pipeline_path: Option<PathBuf>,
+    /// Optional remote repository to clone before registering the project.
+    /// The clone destination must be supplied explicitly; Rivet never chooses
+    /// a server-side path implicitly.
+    #[serde(default)]
+    pub repository_url: Option<String>,
+    #[serde(default)]
+    pub clone_destination: Option<PathBuf>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub depth: Option<u32>,
+    #[serde(default)]
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub submodules: bool,
+    /// Non-secret vault reference resolved only for the duration of Git.
+    #[serde(default)]
+    pub credential_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -3492,15 +3511,65 @@ async fn create_project(
     Json(request): Json<CreateProjectRequest>,
 ) -> Result<(StatusCode, Json<Project>), ApiError> {
     require_global(&principal, Permission::Administer)?;
-    let repository = canonical_directory(&request.repository_path)?;
+    let has_repository_path = !request.repository_path.as_os_str().is_empty();
+    let repository_url = request
+        .repository_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty());
+    if has_repository_path == repository_url.is_some() {
+        return Err(ApiError::BadRequest(
+            "provide exactly one of repository_path or repository_url".into(),
+        ));
+    }
+
+    let repository = if let Some(repository_url) = repository_url {
+        let destination = request.clone_destination.clone().ok_or_else(|| {
+            ApiError::BadRequest("repository_url requires an explicit clone_destination".into())
+        })?;
+        let credential = resolve_git_credential(
+            state.credentials.as_ref(),
+            request.credential_id.as_deref(),
+            &request.name,
+        )
+        .await?;
+        let snapshot = GitRepository::clone_repository_with_auth(
+            &GitCloneOptions {
+                remote: repository_url.to_owned(),
+                destination,
+                branch: request.branch.clone(),
+                depth: request.depth,
+                revision: request.revision.clone(),
+                submodules: request.submodules,
+                credential_id: request.credential_id.clone(),
+                known_hosts_file: state.ssh_known_hosts_file.clone(),
+            },
+            credential.as_ref(),
+        )
+        .await?;
+        snapshot.root
+    } else {
+        if request.clone_destination.is_some()
+            || request.branch.is_some()
+            || request.depth.is_some()
+            || request.revision.is_some()
+            || request.submodules
+            || request.credential_id.is_some()
+        {
+            return Err(ApiError::BadRequest(
+                "clone options require repository_url".into(),
+            ));
+        }
+        canonical_directory(&request.repository_path)?
+    };
     let pipeline_path = request
         .pipeline_path
         .unwrap_or_else(|| repository.join("Rivetfile.toml"));
     if !pipeline_path.is_file() {
         return Err(ApiError::InvalidPipeline(pipeline_path));
     }
-    let pipeline_path = std::fs::canonicalize(pipeline_path)
-        .map_err(|_| ApiError::InvalidPipeline(request.repository_path.clone()))?;
+    let pipeline_path = std::fs::canonicalize(&pipeline_path)
+        .map_err(|_| ApiError::InvalidPipeline(pipeline_path.clone()))?;
     let pipeline = Pipeline::load(&pipeline_path)?;
     let project = Project::new(
         request.name,
@@ -5324,6 +5393,106 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn create_project_can_clone_a_remote_repository_to_an_explicit_destination() {
+        let directory = tempdir().expect("tempdir");
+        let source = directory.path().join("source");
+        let destination = directory.path().join("checkout");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(
+            source.join("Rivetfile.toml"),
+            "version = 1\nname = \"remote-project\"\n[[stages]]\nname = \"Test\"\n[[stages.steps]]\nname = \"noop\"\nprogram = \"true\"\n",
+        )
+        .expect("pipeline");
+
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&source)
+                .output()
+                .expect("git available");
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "rivet@example.test"]);
+        git(&["config", "user.name", "Rivet Tests"]);
+        git(&["add", "Rivetfile.toml"]);
+        git(&["commit", "-qm", "remote fixture"]);
+
+        let storage = Storage::open_in_memory().expect("storage");
+        let app = router(AppState::new(storage.clone()));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "name": "remote-project",
+            "repository_url": source,
+            "clone_destination": destination,
+        }))
+        .expect("request body");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let project: Project = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("response body"),
+        )
+        .expect("project JSON");
+        assert_eq!(project.name, "remote-project");
+        assert_eq!(
+            PathBuf::from(&project.repository_path),
+            fs::canonicalize(&destination).expect("canonical destination")
+        );
+        assert!(Path::new(&project.pipeline_path).is_file());
+        assert!(
+            storage
+                .get_project_by_name("remote-project")
+                .expect("project lookup")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_project_requires_an_explicit_destination_for_remote_clone() {
+        let directory = tempdir().expect("tempdir");
+        let source = directory.path().join("source");
+        let destination = directory.path().join("checkout");
+        fs::create_dir_all(&source).expect("source");
+
+        let storage = Storage::open_in_memory().expect("storage");
+        let app = router(AppState::new(storage));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "name": "remote-project",
+            "repository_url": source,
+        }))
+        .expect("request body");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!destination.exists());
     }
 
     #[tokio::test]

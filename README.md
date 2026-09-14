@@ -16,7 +16,8 @@ and unverified work remains at zero until it passes its gate.
 Last verified update: **2026-09-14** · native pipeline execution, priority-aware
 FIFO queue with pause/resume controls,
 SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
-clone/inspection, persisted build-source identity, recursive Git submodule preparation,
+clone/inspection, server-side project bootstrap cloning into explicit destinations,
+persisted build-source identity, recursive Git submodule preparation,
 live queue telemetry, durable
 event replay, quiet engine offline recovery, explicit Git preparation at build
 admission, parameterized builds, local artifact storage and retention pruning,
@@ -365,7 +366,11 @@ and a per-build WebSocket event stream under `/api/v1/`. It also exposes
 persisted UTC cron schedules with create/list/pause/resume/delete operations,
 automatic server dispatch, Git repository inspection, and an explicit prepare
 operation for fetch/checkout/clean workflows. The CLI also supports explicit
-repository cloning into a new or empty destination. The server returns
+repository cloning into a new or empty destination. Project creation can also
+clone a remote repository when the request supplies `repository_url` and an
+explicit empty `clone_destination`; optional `branch`, `depth`, `revision`,
+`submodules`, and non-secret `credential_id` fields use the same bounded Git
+adapter and deployment SSH host-key policy. The server returns
 `202 Accepted` when a build is queued. A build request may opt into Git
 fetching, revision checkout, workspace cleaning, and explicit recursive
 submodule initialization; the default remains inspection-only. Clients read
