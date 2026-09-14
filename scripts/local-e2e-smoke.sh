@@ -17,6 +17,12 @@ trap cleanup EXIT HUP INT TERM
 
 data_dir="$e2e_data_dir/.rivet"
 project_name=rivet-e2e
+clone_dir="$e2e_data_dir/cloned-repository"
+
+"$release_binary" scm clone "$repo_root" "$clone_dir" \
+    --branch main --depth 1
+test -f "$clone_dir/Rivetfile.toml"
+test "$(git -C "$clone_dir" rev-parse --abbrev-ref HEAD)" = "main"
 
 "$release_binary" --data-dir "$data_dir" project create "$project_name" --repository "$repo_root"
 "$release_binary" --data-dir "$data_dir" run "$project_name"

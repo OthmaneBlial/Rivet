@@ -5,7 +5,7 @@ README. It is a weighted product plan for a complete Rivet platform; it is not
 a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
-The current verified total is **94 / 100 points** (**94.39 weighted evidence
+The current verified total is **94 / 100 points** (**94.41 weighted evidence
 points**, displayed conservatively as 94%).
 
 | Workstream | Weight | Current state | Gate for completion |
@@ -29,7 +29,7 @@ points**, displayed conservatively as 94%).
 | Extension protocol | 4 | verified | versioned manifest, WASM/subprocess kind model, declared permission vocabulary, bounded length-prefixed JSON framing, direct-argument subprocess host, bounded local catalog discovery/API, desktop extension model, root-confined subprocess lifecycle manager with per-request permission enforcement, administrator-only server/desktop subprocess lifecycle controls, capability-free WASM runtime with explicit JSON ABI, denied imports, bounded module/memory/output sizes, fuel metering, bounded read-only build/log/artifact host methods, persisted stage-scoped annotations with permission-checked host writes, and permission-checked real build triggering pass |
 | Jenkins migration analyzer | 3 | partial | bounded Jenkinsfile analysis, headless API delivery, rendered desktop report, valid drafts for deterministic quoted shell steps, static environment and string/password parameters, safe archive patterns, sequential stage dependencies, and fixture-backed unsupported-review regressions; full Groovy parsing, plugin semantics, typed parameter behavior, and broad generated Rivetfile conversion remain |
 | Differential compatibility harness | 2 | partial | bounded JSON snapshots, explicit semantic normalization/comparison, mismatch exit status, checked-in regression fixture, live Rivet/Jenkins HTTP capture adapters with private token-file auth and bounded responses, and a local capture smoke pass; a permanent corpus captured from deployed Jenkins remains |
-| Release and operations | 2 | partial | local release gate, optimized CLI artifact, desktop web/native checks, non-signed macOS Tauri bundle build and packaged loopback-engine launch smoke, real temporary-data CLI smoke workflow, authenticated local deployment smoke with bind safety, health/readiness, security headers, graceful signal shutdown, secret-log/state checks, and versioned SHA-256 manifest pass; signed installers, observability, upgrades, recovery, and load gates remain |
+| Release and operations | 2 | partial | local release gate, optimized CLI artifact, desktop web/native checks, non-signed macOS Tauri bundle build and packaged loopback-engine launch smoke, real temporary-data SCM clone and CLI workflow smoke, authenticated local deployment smoke with bind safety, health/readiness, security headers, graceful signal shutdown, secret-log/state checks, and versioned SHA-256 manifest pass; signed installers, observability, upgrades, recovery, and load gates remain |
 
 ## Progress policy
 
