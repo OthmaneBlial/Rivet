@@ -33,6 +33,29 @@ impl CacheStore {
         Self { root: root.into() }
     }
 
+    /// Expand the small, explicit set of context values supported in cache
+    /// keys. Values are intentionally supplied by the build environment or
+    /// bounded local files; arbitrary shell interpolation is never allowed.
+    pub fn resolve_spec(&self, spec: &CacheSpec, workspace: &Path) -> CacheSpec {
+        let lockfile_hash = lockfile_hash(workspace);
+        let source_hash = std::env::var("RIVET_SOURCE_HASH").unwrap_or_else(|_| "unknown".into());
+        let branch = std::env::var("RIVET_BRANCH").unwrap_or_else(|_| "unknown".into());
+        let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        let expand = |value: &str| {
+            value
+                .replace("${branch}", &branch)
+                .replace("${platform}", &platform)
+                .replace("${source_hash}", &source_hash)
+                .replace("${lockfile_hash}", &lockfile_hash)
+        };
+        CacheSpec {
+            name: spec.name.clone(),
+            key: expand(&spec.key),
+            paths: spec.paths.clone(),
+            fallback_keys: spec.fallback_keys.iter().map(|key| expand(key)).collect(),
+        }
+    }
+
     /// Restore an exact cache key into the workspace.
     ///
     /// A missing entry is a normal cache miss. Corrupt entries are removed so
@@ -347,6 +370,24 @@ fn read_digest(path: &Path) -> Result<Option<String>, CacheError> {
     Ok(Some(digest.to_ascii_lowercase()))
 }
 
+fn lockfile_hash(workspace: &Path) -> String {
+    [
+        "Cargo.lock",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "poetry.lock",
+        "go.sum",
+        "Gemfile.lock",
+        "gradle.lockfile",
+    ]
+    .iter()
+    .map(|name| workspace.join(name))
+    .find(|path| path.is_file())
+    .and_then(|path| sha256_file(&path).ok())
+    .unwrap_or_else(|| "none".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +457,25 @@ program = "true"
         )
         .expect("pipeline with cache");
         assert_eq!(pipeline.caches, vec![spec]);
+    }
+
+    #[test]
+    fn resolves_bounded_context_values_in_primary_and_fallback_keys() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(directory.path().join("Cargo.lock"), "lock-v1").expect("lockfile");
+        let store = CacheStore::new(directory.path().join("cache"));
+        let spec = CacheSpec {
+            name: "deps".into(),
+            key: "${platform}-${source_hash}-${lockfile_hash}".into(),
+            paths: vec!["target".into()],
+            fallback_keys: vec!["${branch}-fallback".into()],
+        };
+        let resolved = store.resolve_spec(&spec, directory.path());
+        assert!(!resolved.key.contains("${platform}"));
+        assert!(!resolved.key.contains("${lockfile_hash}"));
+        assert_eq!(resolved.fallback_keys.len(), 1);
+        assert!(!resolved.fallback_keys[0].contains("${branch}"));
+        assert!(resolved.key.contains("unknown"));
     }
 
     #[test]

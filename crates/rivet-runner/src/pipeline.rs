@@ -93,12 +93,13 @@ pub async fn execute_pipeline_with_parameters_and_cache(
     if let Some(cache_root) = cache_root {
         let cache_store = CacheStore::new(cache_root);
         for cache in &pipeline.caches {
-            match cache_store.restore(plan.project_id, cache, &workspace) {
+            let resolved_cache = cache_store.resolve_spec(cache, &workspace);
+            match cache_store.restore(plan.project_id, &resolved_cache, &workspace) {
                 Ok(true) => {
-                    tracing::debug!(cache = %cache.name, key = %cache.key, "restored CI cache")
+                    tracing::debug!(cache = %cache.name, key = %resolved_cache.key, "restored CI cache")
                 }
                 Ok(false) => {
-                    tracing::debug!(cache = %cache.name, key = %cache.key, "CI cache miss")
+                    tracing::debug!(cache = %cache.name, key = %resolved_cache.key, "CI cache miss")
                 }
                 Err(error) => {
                     tracing::warn!(cache = %cache.name, ?error, "could not restore CI cache")
@@ -238,12 +239,13 @@ pub async fn execute_pipeline_with_parameters_and_cache(
     if let Some(cache_root) = cache_root {
         let cache_store = CacheStore::new(cache_root);
         for cache in &pipeline.caches {
-            match cache_store.save(plan.project_id, cache, &workspace) {
+            let resolved_cache = cache_store.resolve_spec(cache, &workspace);
+            match cache_store.save(plan.project_id, &resolved_cache, &workspace) {
                 Ok(true) => {
-                    tracing::debug!(cache = %cache.name, key = %cache.key, "saved CI cache")
+                    tracing::debug!(cache = %cache.name, key = %resolved_cache.key, "saved CI cache")
                 }
                 Ok(false) => {
-                    tracing::debug!(cache = %cache.name, key = %cache.key, "CI cache already exists")
+                    tracing::debug!(cache = %cache.name, key = %resolved_cache.key, "CI cache already exists")
                 }
                 Err(error) => {
                     tracing::warn!(cache = %cache.name, ?error, "could not save CI cache")

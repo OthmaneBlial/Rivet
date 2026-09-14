@@ -86,6 +86,10 @@ pub struct ArtifactSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheSpec {
     pub name: String,
+    /// Cache key. The runner expands `${branch}`, `${platform}`,
+    /// `${source_hash}`, and `${lockfile_hash}` immediately before restore or
+    /// save. Unknown placeholders remain literal so a typo cannot silently
+    /// select a different cache entry.
     pub key: String,
     pub paths: Vec<String>,
     #[serde(default)]
