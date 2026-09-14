@@ -79,6 +79,9 @@ pub const REDACTED_PARAMETER_VALUE: &str = "[redacted]";
 pub struct ArtifactSpec {
     pub name: String,
     pub paths: Vec<String>,
+    /// Optional build stage that owns this artifact.
+    #[serde(default)]
+    pub stage: Option<String>,
     #[serde(default)]
     pub allow_empty: bool,
     /// Optional retention period for completed-build artifacts.
@@ -395,6 +398,8 @@ pub enum PipelineError {
     InvalidArtifactPath { artifact: String, path: String },
     #[error("duplicate artifact name {0:?}")]
     DuplicateArtifact(String),
+    #[error("artifact {artifact:?} references unknown stage {stage:?}")]
+    UnknownArtifactStage { artifact: String, stage: String },
     #[error("artifact {0:?} retention cannot exceed 3650 days")]
     ArtifactRetentionTooLong(String),
     #[error("cache name cannot be empty")]
@@ -887,6 +892,17 @@ impl Pipeline {
                         });
                     }
                 }
+            }
+        }
+
+        for artifact in &self.artifacts {
+            if let Some(stage) = &artifact.stage
+                && !stage_names.contains(stage.as_str())
+            {
+                return Err(PipelineError::UnknownArtifactStage {
+                    artifact: artifact.name.clone(),
+                    stage: stage.clone(),
+                });
             }
         }
 
@@ -1816,6 +1832,27 @@ program = "true"
         )
         .expect("pipeline");
         assert_eq!(pipeline.artifacts[0].paths, ["dist/**", "manifest.json"]);
+
+        let unknown_stage = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "unknown-artifact-stage"
+[[artifacts]]
+name = "bundle"
+paths = ["dist/**"]
+stage = "Missing"
+[[stages]]
+name = "Build"
+[[stages.steps]]
+name = "compile"
+program = "true"
+"#,
+        );
+        assert!(matches!(
+            unknown_stage,
+            Err(PipelineError::UnknownArtifactStage { artifact, stage })
+                if artifact == "bundle" && stage == "Missing"
+        ));
 
         let invalid = Pipeline::from_toml_str(
             r#"

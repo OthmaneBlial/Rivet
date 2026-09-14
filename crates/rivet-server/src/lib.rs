@@ -6549,6 +6549,7 @@ mod tests {
         let artifact = ArtifactRecord {
             id: Uuid::new_v4(),
             build_id: Uuid::new_v4(),
+            stage_id: None,
             name: "bundle".into(),
             relative_path: "dist/app.bin".into(),
             size_bytes: original.len() as u64,

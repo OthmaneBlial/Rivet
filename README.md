@@ -38,7 +38,7 @@ and full Jenkins parity are not claimed.
 </p>
 
 **95% verified** · `███████████████████░`<br>
-Weighted evidence score: **95.87 / 100** · displayed conservatively as the
+Weighted evidence score: **95.89 / 100** · displayed conservatively as the
 whole-number floor. This measures the weighted product scope in
 [ROADMAP.md](ROADMAP.md), not Jenkins parity.
 
@@ -79,7 +79,8 @@ not as a promise that every Jenkins plugin already works in Rivet.
 `Rivetfile.toml` uses explicit executable and argument arrays. Pipelines support
 validated stage dependencies, stable topological ordering, parallel independent
 stages, parameters, deterministic conditional stages with explicit `skipped`
-outcomes, timeouts, declared artifacts, and per-artifact retention windows.
+outcomes, timeouts, declared artifacts, optional stage ownership, and
+per-artifact retention windows.
 
 ### Run and observe every build
 
@@ -268,7 +269,7 @@ boundaries in mind:
 
 ## Current status
 
-The repository currently reports **95.87 / 100 weighted evidence points** and
+The repository currently reports **95.89 / 100 weighted evidence points** and
 displays **95% verified**. This is an engineering progress measure, not a
 promise of complete platform coverage.
 

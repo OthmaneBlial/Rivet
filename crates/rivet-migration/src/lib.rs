@@ -876,6 +876,7 @@ fn parse_archive_artifact(line: usize, statement: &str) -> Result<ArtifactSpec, 
     Ok(ArtifactSpec {
         name: format!("jenkins-archive-{line}"),
         paths,
+        stage: None,
         allow_empty,
         retention_days: None,
     })

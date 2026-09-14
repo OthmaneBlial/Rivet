@@ -230,6 +230,7 @@ pub struct LogRecord {
 pub struct ArtifactRecord {
     pub id: Uuid,
     pub build_id: BuildId,
+    pub stage_id: Option<StageId>,
     pub name: String,
     pub relative_path: String,
     pub size_bytes: u64,
@@ -534,6 +535,11 @@ impl Storage {
             &connection,
             22,
             Some(include_str!("../migrations/022_artifact_expiration.sql")),
+        )?;
+        apply_migration(
+            &connection,
+            23,
+            Some(include_str!("../migrations/023_artifact_stage.sql")),
         )?;
         backfill_event_hashes(&connection)?;
         Ok(Self {
@@ -2256,6 +2262,12 @@ impl Storage {
         let mut collected = Vec::new();
 
         for specification in &pipeline.artifacts {
+            let stage_id = specification
+                .stage
+                .as_deref()
+                .map(|stage| self.stage_id_by_name(build_id, stage))
+                .transpose()?
+                .flatten();
             let mut builder = GlobSetBuilder::new();
             for path in &specification.paths {
                 let glob = Glob::new(path).map_err(|error| StorageError::ArtifactPattern {
@@ -2315,6 +2327,7 @@ impl Storage {
                 collected.push(ArtifactRecord {
                     id: artifact_id,
                     build_id,
+                    stage_id,
                     name: specification.name.clone(),
                     relative_path,
                     size_bytes,
@@ -2334,8 +2347,8 @@ impl Storage {
                     .map_err(|_| StorageError::ArtifactTooLarge(artifact.size_bytes))?;
                 transaction.execute(
                     "INSERT INTO build_artifacts(
-                        id, build_id, name, relative_path, size_bytes, checksum, mime_type, expires_at, created_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        id, build_id, name, relative_path, size_bytes, checksum, mime_type, expires_at, created_at, stage_id
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         artifact.id.to_string(),
                         artifact.build_id.to_string(),
@@ -2346,6 +2359,7 @@ impl Storage {
                         artifact.mime_type,
                         artifact.expires_at.map(|value| value.to_rfc3339()),
                         artifact.created_at.to_rfc3339(),
+                        artifact.stage_id.map(|id| id.to_string()),
                     ],
                 )?;
             }
@@ -2355,10 +2369,26 @@ impl Storage {
         self.artifacts(build_id)
     }
 
+    fn stage_id_by_name(
+        &self,
+        build_id: BuildId,
+        stage_name: &str,
+    ) -> Result<Option<StageId>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let stage = connection
+            .query_row(
+                "SELECT id FROM build_stages WHERE build_id = ?1 AND name = ?2",
+                params![build_id.to_string(), stage_name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        stage.map(|value| parse_uuid(&value)).transpose()
+    }
+
     pub fn artifacts(&self, build_id: BuildId) -> Result<Vec<ArtifactRecord>, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
-            "SELECT id, build_id, name, relative_path, size_bytes, checksum, mime_type, expires_at, created_at
+            "SELECT id, build_id, name, relative_path, size_bytes, checksum, mime_type, expires_at, created_at, stage_id
              FROM build_artifacts
              WHERE build_id = ?1 ORDER BY name ASC, relative_path ASC",
         )?;
@@ -2373,6 +2403,7 @@ impl Storage {
                 row.get::<_, String>(6)?,
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         rows.map(|row| row.map_err(StorageError::from).and_then(parse_artifact))
@@ -2466,7 +2497,7 @@ impl Storage {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let row = connection
             .query_row(
-                "SELECT id, build_id, name, relative_path, size_bytes, checksum, mime_type, expires_at, created_at
+                "SELECT id, build_id, name, relative_path, size_bytes, checksum, mime_type, expires_at, created_at, stage_id
                  FROM build_artifacts WHERE id = ?1",
                 params![artifact_id.to_string()],
                 |row| {
@@ -2480,6 +2511,7 @@ impl Storage {
                         row.get::<_, String>(6)?,
                         row.get::<_, Option<String>>(7)?,
                         row.get::<_, String>(8)?,
+                        row.get::<_, Option<String>>(9)?,
                     ))
                 },
             )
@@ -2503,7 +2535,7 @@ impl Storage {
             let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
             let mut statement = connection.prepare(
                 "SELECT a.id, a.build_id, a.name, a.relative_path, a.size_bytes,
-                        a.checksum, a.mime_type, a.expires_at, a.created_at
+                        a.checksum, a.mime_type, a.expires_at, a.created_at, a.stage_id
                  FROM build_artifacts a
                  JOIN builds b ON b.id = a.build_id
                  WHERE b.status IN ('passed', 'failed', 'cancelled')
@@ -2520,6 +2552,7 @@ impl Storage {
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             })?;
             rows.map(|row| {
@@ -2660,6 +2693,7 @@ type RawArtifact = (
     String,
     Option<String>,
     String,
+    Option<String>,
 );
 type RawAnnotation = (String, String, Option<String>, String, String, String);
 type RawSchedule = (
@@ -3047,6 +3081,7 @@ fn parse_artifact(raw: RawArtifact) -> Result<ArtifactRecord, StorageError> {
         mime_type: raw.6,
         expires_at: raw.7.as_deref().map(parse_timestamp).transpose()?,
         created_at: parse_timestamp(&raw.8)?,
+        stage_id: raw.9.as_deref().map(parse_uuid).transpose()?,
     })
 }
 
@@ -3674,6 +3709,7 @@ name = "artifacts"
 [[artifacts]]
 name = "bundle"
 paths = ["dist/**"]
+stage = "Build"
 
 [[stages]]
 name = "Build"
@@ -3698,6 +3734,7 @@ program = "true"
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].relative_path, "dist/app.js");
         assert_eq!(collected[0].name, "bundle");
+        assert_eq!(collected[0].stage_id, Some(plan.stages[0].id));
         assert_eq!(collected[0].mime_type, "text/javascript");
         assert!(collected[0].checksum.starts_with("sha256:"));
 

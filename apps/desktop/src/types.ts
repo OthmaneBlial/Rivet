@@ -86,6 +86,7 @@ export interface LogRecord {
 export interface ArtifactRecord {
   id: string;
   build_id: string;
+  stage_id: string | null;
   name: string;
   relative_path: string;
   size_bytes: number;
