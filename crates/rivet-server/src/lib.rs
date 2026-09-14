@@ -93,8 +93,10 @@ pub struct AppState {
     webhook_secret: Option<Vec<u8>>,
     github_webhook_secret: Option<Vec<u8>>,
     gitlab_webhook_secret: Option<Vec<u8>>,
+    bitbucket_webhook_secret: Option<Vec<u8>>,
     github_webhook_credential_id: Option<String>,
     gitlab_webhook_credential_id: Option<String>,
+    bitbucket_webhook_credential_id: Option<String>,
     credentials: Option<Arc<Mutex<CredentialVault>>>,
     ssh_known_hosts_file: Option<PathBuf>,
     extensions: Arc<ExtensionCatalog>,
@@ -223,8 +225,10 @@ pub struct ServerConfig {
     pub webhook_secret: Option<String>,
     pub github_webhook_secret: Option<String>,
     pub gitlab_webhook_secret: Option<String>,
+    pub bitbucket_webhook_secret: Option<String>,
     pub github_webhook_credential_id: Option<String>,
     pub gitlab_webhook_credential_id: Option<String>,
+    pub bitbucket_webhook_credential_id: Option<String>,
     pub credentials_file: Option<PathBuf>,
     pub credentials_passphrase: Option<String>,
     pub credentials_keychain_account: Option<String>,
@@ -319,6 +323,8 @@ enum ApiError {
     GitHubWebhookNotConfigured,
     #[error("GitLab webhook delivery signatures are not configured")]
     GitLabWebhookNotConfigured,
+    #[error("Bitbucket webhook delivery signatures are not configured")]
+    BitbucketWebhookNotConfigured,
     #[error("invalid webhook signature")]
     InvalidWebhookSignature,
     #[error("webhook event ID cannot be empty")]
@@ -357,7 +363,8 @@ impl IntoResponse for ApiError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::WebhookNotConfigured
             | Self::GitHubWebhookNotConfigured
-            | Self::GitLabWebhookNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
+            | Self::GitLabWebhookNotConfigured
+            | Self::BitbucketWebhookNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
             Self::InvalidWebhookSignature => StatusCode::UNAUTHORIZED,
             Self::EmptyWebhookEventId
             | Self::WebhookEventIdTooLong
@@ -719,6 +726,10 @@ fn router_with_origins(state: AppState, allowed_origins: &[String]) -> Result<Ro
         .route("/api/v1/webhooks/generic", post(webhook_build))
         .route("/api/v1/webhooks/github/{project}", post(github_webhook))
         .route("/api/v1/webhooks/gitlab/{project}", post(gitlab_webhook))
+        .route(
+            "/api/v1/webhooks/bitbucket/{project}",
+            post(bitbucket_webhook),
+        )
         .route("/api/v1/queue", get(queue_status))
         .route("/api/v1/queue/items", get(queue_items))
         .route("/api/v1/queue/pause", post(pause_queue))
@@ -923,8 +934,10 @@ pub async fn serve(storage_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(
             webhook_secret: None,
             github_webhook_secret: None,
             gitlab_webhook_secret: None,
+            bitbucket_webhook_secret: None,
             github_webhook_credential_id: None,
             gitlab_webhook_credential_id: None,
+            bitbucket_webhook_credential_id: None,
             credentials_file: None,
             credentials_passphrase: None,
             credentials_keychain_account: None,
@@ -1051,8 +1064,14 @@ pub async fn serve_with_listener(
         .as_deref()
         .map(str::as_bytes)
         .map(ToOwned::to_owned);
+    state.bitbucket_webhook_secret = config
+        .bitbucket_webhook_secret
+        .as_deref()
+        .map(str::as_bytes)
+        .map(ToOwned::to_owned);
     state.github_webhook_credential_id = config.github_webhook_credential_id;
     state.gitlab_webhook_credential_id = config.gitlab_webhook_credential_id;
+    state.bitbucket_webhook_credential_id = config.bitbucket_webhook_credential_id;
     state.ssh_known_hosts_file = config.ssh_known_hosts_file;
     let allowed_origins = if config.allowed_origins.is_empty() {
         default_allowed_origins()
@@ -1107,6 +1126,15 @@ fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
         return Err(ServerError::EmptyProviderWebhookSecret { provider: "GitLab" });
     }
     if config
+        .bitbucket_webhook_secret
+        .as_deref()
+        .is_some_and(|secret| secret.trim().is_empty())
+    {
+        return Err(ServerError::EmptyProviderWebhookSecret {
+            provider: "Bitbucket",
+        });
+    }
+    if config
         .github_webhook_credential_id
         .as_deref()
         .is_some_and(|credential| credential.trim().is_empty())
@@ -1119,6 +1147,15 @@ fn validate_config(config: &ServerConfig) -> Result<(), ServerError> {
         .is_some_and(|credential| credential.trim().is_empty())
     {
         return Err(ServerError::EmptyProviderWebhookCredential { provider: "GitLab" });
+    }
+    if config
+        .bitbucket_webhook_credential_id
+        .as_deref()
+        .is_some_and(|credential| credential.trim().is_empty())
+    {
+        return Err(ServerError::EmptyProviderWebhookCredential {
+            provider: "Bitbucket",
+        });
     }
     match (
         config.credentials_file.is_some(),
@@ -1249,8 +1286,10 @@ impl AppState {
             webhook_secret: None,
             github_webhook_secret: None,
             gitlab_webhook_secret: None,
+            bitbucket_webhook_secret: None,
             github_webhook_credential_id: None,
             gitlab_webhook_credential_id: None,
+            bitbucket_webhook_credential_id: None,
             credentials: None,
             ssh_known_hosts_file: None,
             extensions: Arc::new(ExtensionCatalog::empty()),
@@ -2826,6 +2865,37 @@ async fn gitlab_webhook(
     enqueue_webhook_build(&state, &principal, request).await
 }
 
+async fn bitbucket_webhook(
+    State(state): State<AppState>,
+    AxumPath(project): AxumPath<String>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<WebhookBuildResponse>), ApiError> {
+    let secret = state
+        .bitbucket_webhook_secret
+        .as_deref()
+        .ok_or(ApiError::BitbucketWebhookNotConfigured)?;
+    let Some(request) = normalize_bitbucket_webhook(
+        secret,
+        &headers,
+        &body,
+        project,
+        state.bitbucket_webhook_credential_id.clone(),
+    )?
+    else {
+        return Ok((
+            StatusCode::OK,
+            Json(WebhookBuildResponse {
+                status: "ignored",
+                deduplicated: false,
+                build: None,
+            }),
+        ));
+    };
+    enqueue_webhook_build(&state, &principal, request).await
+}
+
 async fn enqueue_webhook_build(
     state: &AppState,
     principal: &Principal,
@@ -3159,6 +3229,102 @@ fn normalize_gitlab_webhook(
     }
 }
 
+fn normalize_bitbucket_webhook(
+    secret: &[u8],
+    headers: &HeaderMap,
+    body: &[u8],
+    project: String,
+    credential_id: Option<String>,
+) -> Result<Option<WebhookBuildRequest>, ApiError> {
+    verify_hmac_hex_signature(secret, headers, "x-hub-signature", body)?;
+    let event = required_header(headers, "x-event-key")?;
+    let event_id = required_header(headers, "x-request-uuid")?;
+    let payload: serde_json::Value = serde_json::from_slice(body).map_err(|error| {
+        ApiError::BadRequest(format!("invalid Bitbucket webhook JSON: {error}"))
+    })?;
+
+    match event.as_str() {
+        "repo:push" => {
+            let changes = payload
+                .get("push")
+                .and_then(|value| value.get("changes"))
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| ApiError::BadRequest("Bitbucket push changes are missing".into()))?;
+            let active_changes = changes
+                .iter()
+                .filter(|change| change.get("new").is_some_and(|value| !value.is_null()))
+                .collect::<Vec<_>>();
+            if active_changes.is_empty() {
+                return Ok(None);
+            }
+            if active_changes.len() > 1 {
+                return Err(ApiError::BadRequest(
+                    "Bitbucket push contains multiple updated refs; use one webhook delivery per ref"
+                        .into(),
+                ));
+            }
+            let Some(revision) = normalize_commit_revision(
+                active_changes[0]
+                    .get("new")
+                    .and_then(|value| value.get("target"))
+                    .and_then(|value| value.get("hash")),
+                "Bitbucket push new.target.hash",
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(WebhookBuildRequest {
+                event_id,
+                project,
+                revision: Some(revision),
+                fetch_ref: None,
+                remote: Some("origin".into()),
+                fetch: true,
+                credential_id,
+                submodules: false,
+                parameters: BTreeMap::new(),
+                upstream: None,
+            }))
+        }
+        "pullrequest:created" | "pullrequest:updated" => {
+            let pull_request = payload.get("pullrequest").ok_or_else(|| {
+                ApiError::BadRequest("Bitbucket pullrequest payload is missing".into())
+            })?;
+            let number = pull_request
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    ApiError::BadRequest("Bitbucket pullrequest id is missing".into())
+                })?;
+            let Some(revision) = normalize_commit_revision(
+                pull_request
+                    .get("source")
+                    .and_then(|value| value.get("commit"))
+                    .and_then(|value| value.get("hash")),
+                "Bitbucket pullrequest source.commit.hash",
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(WebhookBuildRequest {
+                event_id,
+                project,
+                revision: Some(revision),
+                fetch_ref: Some(bitbucket_pull_request_refspec(number)?),
+                remote: Some("origin".into()),
+                fetch: true,
+                credential_id,
+                submodules: false,
+                parameters: BTreeMap::new(),
+                upstream: None,
+            }))
+        }
+        _ => Err(ApiError::BadRequest(format!(
+            "unsupported Bitbucket webhook event: {event}"
+        ))),
+    }
+}
+
 fn github_pull_request_refspec(number: u64) -> Result<String, ApiError> {
     provider_pull_request_refspec("refs/pull", number)
 }
@@ -3167,16 +3333,28 @@ fn gitlab_merge_request_refspec(iid: u64) -> Result<String, ApiError> {
     provider_pull_request_refspec("refs/merge-requests", iid)
 }
 
+fn bitbucket_pull_request_refspec(number: u64) -> Result<String, ApiError> {
+    validate_pull_request_number(number)?;
+    Ok(format!(
+        "+refs/pull-requests/{number}/from:refs/remotes/origin/pull-requests/{number}"
+    ))
+}
+
 fn provider_pull_request_refspec(prefix: &str, number: u64) -> Result<String, ApiError> {
+    validate_pull_request_number(number)?;
+    let destination = prefix.strip_prefix("refs/").unwrap_or(prefix);
+    Ok(format!(
+        "+{prefix}/{number}/head:refs/remotes/origin/{destination}/{number}"
+    ))
+}
+
+fn validate_pull_request_number(number: u64) -> Result<(), ApiError> {
     if number == 0 || number > 9_999_999_999 {
         return Err(ApiError::BadRequest(
             "pull request number is outside the supported range".into(),
         ));
     }
-    let destination = prefix.strip_prefix("refs/").unwrap_or(prefix);
-    Ok(format!(
-        "+{prefix}/{number}/head:refs/remotes/origin/{destination}/{number}"
-    ))
+    Ok(())
 }
 
 fn normalize_commit_revision(
@@ -6047,8 +6225,10 @@ mod tests {
             webhook_secret: None,
             github_webhook_secret: None,
             gitlab_webhook_secret: None,
+            bitbucket_webhook_secret: None,
             github_webhook_credential_id: None,
             gitlab_webhook_credential_id: None,
+            bitbucket_webhook_credential_id: None,
             credentials_file: None,
             credentials_passphrase: None,
             credentials_keychain_account: None,
@@ -6074,8 +6254,10 @@ mod tests {
             webhook_secret: None,
             github_webhook_secret: None,
             gitlab_webhook_secret: None,
+            bitbucket_webhook_secret: None,
             github_webhook_credential_id: None,
             gitlab_webhook_credential_id: None,
+            bitbucket_webhook_credential_id: None,
             credentials_file: Some(PathBuf::from("credentials.vault")),
             credentials_passphrase: None,
             credentials_keychain_account: Some("rivet-production".into()),
@@ -9065,6 +9247,120 @@ program = "true"
                 .expect("push request");
         assert_eq!(request.event_id, "gitlab-legacy-delivery-1");
         assert_eq!(request.project, "demo");
+    }
+
+    #[test]
+    fn bitbucket_signed_push_webhook_normalizes_the_updated_revision() {
+        let body = br#"{"push":{"changes":[{"new":{"name":"main","target":{"hash":"c783c3523482029c449dcdff1209ed06409b83bc"}}}]}}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-event-key", HeaderValue::from_static("repo:push"));
+        headers.insert(
+            "x-request-uuid",
+            HeaderValue::from_static("bitbucket-request-1"),
+        );
+        headers.insert(
+            "x-hub-signature",
+            HeaderValue::from_str(&sign_webhook("bitbucket-fixture-secret", body))
+                .expect("signature"),
+        );
+
+        let request = normalize_bitbucket_webhook(
+            b"bitbucket-fixture-secret",
+            &headers,
+            body,
+            "demo".into(),
+            Some("bitbucket".into()),
+        )
+        .expect("normalize")
+        .expect("push request");
+        assert_eq!(request.event_id, "bitbucket-request-1");
+        assert_eq!(request.project, "demo");
+        assert_eq!(
+            request.revision.as_deref(),
+            Some("c783c3523482029c449dcdff1209ed06409b83bc")
+        );
+        assert!(request.fetch);
+        assert_eq!(request.credential_id.as_deref(), Some("bitbucket"));
+    }
+
+    #[test]
+    fn bitbucket_pullrequest_webhook_fetches_the_provider_ref() {
+        let body = br#"{"pullrequest":{"id":17,"source":{"commit":{"hash":"c783c3523482029c449dcdff1209ed06409b83bc"}}}}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-event-key",
+            HeaderValue::from_static("pullrequest:updated"),
+        );
+        headers.insert(
+            "x-request-uuid",
+            HeaderValue::from_static("bitbucket-request-2"),
+        );
+        headers.insert(
+            "x-hub-signature",
+            HeaderValue::from_str(&sign_webhook("bitbucket-fixture-secret", body))
+                .expect("signature"),
+        );
+
+        let request = normalize_bitbucket_webhook(
+            b"bitbucket-fixture-secret",
+            &headers,
+            body,
+            "demo".into(),
+            None,
+        )
+        .expect("normalize")
+        .expect("pullrequest request");
+        assert_eq!(request.event_id, "bitbucket-request-2");
+        assert_eq!(
+            request.fetch_ref.as_deref(),
+            Some("+refs/pull-requests/17/from:refs/remotes/origin/pull-requests/17")
+        );
+        assert!(request.fetch);
+    }
+
+    #[test]
+    fn bitbucket_deleted_pushes_are_ignored_and_multiple_refs_are_rejected() {
+        let deleted = br#"{"push":{"changes":[{"old":{"name":"gone"},"new":null}]}}"#;
+        let mut deleted_headers = HeaderMap::new();
+        deleted_headers.insert("x-event-key", HeaderValue::from_static("repo:push"));
+        deleted_headers.insert(
+            "x-request-uuid",
+            HeaderValue::from_static("bitbucket-delete-1"),
+        );
+        deleted_headers.insert(
+            "x-hub-signature",
+            HeaderValue::from_str(&sign_webhook("bitbucket-fixture-secret", deleted))
+                .expect("signature"),
+        );
+        assert!(
+            normalize_bitbucket_webhook(
+                b"bitbucket-fixture-secret",
+                &deleted_headers,
+                deleted,
+                "demo".into(),
+                None,
+            )
+            .expect("deleted normalize")
+            .is_none()
+        );
+
+        let multiple = br#"{"push":{"changes":[{"new":{"target":{"hash":"c783c3523482029c449dcdff1209ed06409b83bc"}}},{"new":{"target":{"hash":"d783c3523482029c449dcdff1209ed06409b83bc"}}}]}}"#;
+        let mut multiple_headers = deleted_headers;
+        multiple_headers.insert(
+            "x-hub-signature",
+            HeaderValue::from_str(&sign_webhook("bitbucket-fixture-secret", multiple))
+                .expect("signature"),
+        );
+        assert!(matches!(
+            normalize_bitbucket_webhook(
+                b"bitbucket-fixture-secret",
+                &multiple_headers,
+                multiple,
+                "demo".into(),
+                None,
+            ),
+            Err(ApiError::BadRequest(message)) if message.contains("multiple updated refs")
+        ));
     }
 
     #[test]

@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **95% verified** · `███████████████████░`<br>
-Weighted evidence score: **95.03 / 100** · displayed conservatively as the
+Weighted evidence score: **95.04 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -30,7 +30,7 @@ and a light-default desktop theme with an accessible dark-mode
 toggle, persistent UTC cron schedules with repository-poll remote/fetch
 configuration, server dispatch, desktop schedule controls, signed generic
 webhook delivery with idempotent redelivery, GitHub repository-dispatch
-revision triggers,
+revision triggers, and signed Bitbucket push/pull-request revision triggers,
 policy-backed API identities with role/project authorization,
 secret-parameter redaction/masking, a passphrase-encrypted SCM credential vault
 with typed HTTP/SSH credentials, non-secret credential references, project allow-lists,
@@ -448,6 +448,7 @@ project from an untrusted repository name:
 ```text
 POST /api/v1/webhooks/github/<rivet-project>
 POST /api/v1/webhooks/gitlab/<rivet-project>
+POST /api/v1/webhooks/bitbucket/<rivet-project>
 ```
 
 GitHub accepts signed `push` and `pull_request` deliveries (and acknowledges
@@ -460,7 +461,11 @@ the newer signing headers. Push adapters validate the commit SHA; PR/MR
 adapters accept only opened, reopened, or updated/synchronized actions, fetch
 the provider head ref through a bounded refspec, and then normalize to the same
 idempotent build admission path. All adapters can attach a default non-secret
-Rivet credential ID for the fetch.
+Rivet credential ID for the fetch. Bitbucket Cloud accepts signed `repo:push`,
+`pullrequest:created`, and `pullrequest:updated` deliveries using
+`X-Hub-Signature`, `X-Event-Key`, and the per-delivery `X-Request-UUID` header.
+Deleted pushes are ignored, multi-ref pushes are rejected as ambiguous, and
+pull-request source refs are fetched through a bounded Bitbucket refspec.
 
 Configure the provider keys through private files and, when needed, point each
 adapter at its vault credential ID:
@@ -468,11 +473,14 @@ adapter at its vault credential ID:
 ```sh
 chmod 600 /secure/path/rivet.github-webhook.secret
 chmod 600 /secure/path/rivet.gitlab-webhook.secret
+chmod 600 /secure/path/rivet.bitbucket-webhook.secret
 cargo run -p rivet -- --data-dir .rivet server \
   --github-webhook-secret-file /secure/path/rivet.github-webhook.secret \
   --gitlab-webhook-secret-file /secure/path/rivet.gitlab-webhook.secret \
+  --bitbucket-webhook-secret-file /secure/path/rivet.bitbucket-webhook.secret \
   --github-webhook-credential-id github \
   --gitlab-webhook-credential-id gitlab \
+  --bitbucket-webhook-credential-id bitbucket \
   --credentials-file /secure/path/rivet.credentials.vault \
   --credentials-passphrase-file /secure/path/rivet.credentials.passphrase
 ```
@@ -480,6 +488,9 @@ cargo run -p rivet -- --data-dir .rivet server \
 The provider contracts are documented by [GitHub's webhook signature
 validation guide](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)
 and [GitLab's webhook integration documentation](https://docs.gitlab.com/user/project/integrations/webhooks/).
+Bitbucket's [event payload reference](https://support.atlassian.com/bitbucket-cloud/docs/event-payloads/)
+and [webhook security documentation](https://support.atlassian.com/bitbucket-cloud/docs/manage-webhooks/)
+define the event headers and HMAC contract used by this adapter.
 Broader provider event coverage and provider-side upstream-trigger mapping
 remain future gates.
 

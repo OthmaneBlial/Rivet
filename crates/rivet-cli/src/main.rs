@@ -312,12 +312,18 @@ enum Command {
         /// Read the GitLab webhook signing/secret token from a private file.
         #[arg(long)]
         gitlab_webhook_secret_file: Option<PathBuf>,
+        /// Read the Bitbucket Cloud webhook HMAC secret from a private file.
+        #[arg(long)]
+        bitbucket_webhook_secret_file: Option<PathBuf>,
         /// Default Rivet credential ID for GitHub push fetches.
         #[arg(long)]
         github_webhook_credential_id: Option<String>,
         /// Default Rivet credential ID for GitLab push fetches.
         #[arg(long)]
         gitlab_webhook_credential_id: Option<String>,
+        /// Default Rivet credential ID for Bitbucket push fetches.
+        #[arg(long)]
+        bitbucket_webhook_credential_id: Option<String>,
         /// Open the passphrase-encrypted SCM credential vault.
         #[arg(long)]
         credentials_file: Option<PathBuf>,
@@ -940,8 +946,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             webhook_secret_file,
             github_webhook_secret_file,
             gitlab_webhook_secret_file,
+            bitbucket_webhook_secret_file,
             github_webhook_credential_id,
             gitlab_webhook_credential_id,
+            bitbucket_webhook_credential_id,
             credentials_file,
             credentials_passphrase_file,
             credentials_keychain_account,
@@ -963,6 +971,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .as_deref()
                 .map(|path| read_private_value(path, "GitLab webhook secret"))
                 .transpose()?;
+            let bitbucket_webhook_secret = bitbucket_webhook_secret_file
+                .as_deref()
+                .map(|path| read_private_value(path, "Bitbucket webhook secret"))
+                .transpose()?;
             let credentials_passphrase = credentials_passphrase_file
                 .as_deref()
                 .map(|path| read_private_value(path, "credential vault passphrase"))
@@ -977,8 +989,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     webhook_secret,
                     github_webhook_secret,
                     gitlab_webhook_secret,
+                    bitbucket_webhook_secret,
                     github_webhook_credential_id,
                     gitlab_webhook_credential_id,
+                    bitbucket_webhook_credential_id,
                     credentials_file,
                     credentials_passphrase,
                     credentials_keychain_account,
