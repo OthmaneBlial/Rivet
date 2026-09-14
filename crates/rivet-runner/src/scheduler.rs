@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -13,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 pub const MIN_QUEUE_PRIORITY: i32 = -100;
 pub const MAX_QUEUE_PRIORITY: i32 = 100;
+const STARVATION_AFTER: Duration = Duration::from_secs(30);
 
 struct QueueRequest {
     plan: ExecutionPlan,
@@ -28,15 +30,23 @@ struct QueueRequest {
 
 struct PendingRequest {
     priority: i32,
+    effective_priority: i32,
     sequence: u64,
+    enqueued_at: Instant,
     request: QueueRequest,
 }
 
 impl PendingRequest {
     fn new(request: QueueRequest) -> Self {
+        Self::from_request(request, Instant::now())
+    }
+
+    fn from_request(request: QueueRequest, enqueued_at: Instant) -> Self {
         Self {
             priority: request.priority,
+            effective_priority: request.priority,
             sequence: request.sequence,
+            enqueued_at,
             request,
         }
     }
@@ -44,7 +54,7 @@ impl PendingRequest {
 
 impl PartialEq for PendingRequest {
     fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority && self.sequence == other.sequence
+        self.effective_priority == other.effective_priority && self.sequence == other.sequence
     }
 }
 
@@ -52,8 +62,8 @@ impl Eq for PendingRequest {}
 
 impl Ord for PendingRequest {
     fn cmp(&self, other: &Self) -> Comparison {
-        self.priority
-            .cmp(&other.priority)
+        self.effective_priority
+            .cmp(&other.effective_priority)
             // BinaryHeap is a max-heap; an earlier sequence must therefore
             // compare greater when priorities are equal.
             .then_with(|| other.sequence.cmp(&self.sequence))
@@ -64,6 +74,30 @@ impl PartialOrd for PendingRequest {
     fn partial_cmp(&self, other: &Self) -> Option<Comparison> {
         Some(self.cmp(other))
     }
+}
+
+fn effective_priority(priority: i32, enqueued_at: Instant, now: Instant) -> i32 {
+    if now
+        .checked_duration_since(enqueued_at)
+        .is_some_and(|waited| waited >= STARVATION_AFTER)
+    {
+        MAX_QUEUE_PRIORITY.saturating_add(1)
+    } else {
+        priority
+    }
+}
+
+fn refresh_pending_priorities(pending: &mut BinaryHeap<PendingRequest>) {
+    if pending.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let mut refreshed = Vec::with_capacity(pending.len());
+    while let Some(mut entry) = pending.pop() {
+        entry.effective_priority = effective_priority(entry.priority, entry.enqueued_at, now);
+        refreshed.push(entry);
+    }
+    pending.extend(refreshed);
 }
 
 #[derive(Debug, Error)]
@@ -194,16 +228,18 @@ impl Scheduler {
                     continue;
                 }
 
+                refresh_pending_priorities(&mut pending);
+
                 if worker_metrics.paused.load(Ordering::Relaxed) {
                     let mut retained = Vec::with_capacity(pending.len());
                     while let Some(entry) = pending.pop() {
-                        let request = entry.request;
-                        if request.cancellation.is_cancelled() {
+                        if entry.request.cancellation.is_cancelled() {
+                            let request = entry.request;
                             worker_entries.lock().await.remove(&request.plan.build_id);
                             worker_metrics.queued.fetch_sub(1, Ordering::Relaxed);
                             tokio::spawn(finish_queued_cancellation(request));
                         } else {
-                            retained.push(PendingRequest::new(request));
+                            retained.push(entry);
                         }
                     }
                     pending.extend(retained);
@@ -229,6 +265,7 @@ impl Scheduler {
                 let mut blocked = Vec::with_capacity(pending.len());
                 let mut admitted = false;
                 while let Some(entry) = pending.pop() {
+                    let enqueued_at = entry.enqueued_at;
                     let request = entry.request;
                     if request.cancellation.is_cancelled() {
                         worker_entries.lock().await.remove(&request.plan.build_id);
@@ -240,7 +277,7 @@ impl Scheduler {
                     let global_permit = match global.clone().try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(tokio::sync::TryAcquireError::NoPermits) => {
-                            blocked.push(PendingRequest::new(request));
+                            blocked.push(PendingRequest::from_request(request, enqueued_at));
                             continue;
                         }
                         Err(tokio::sync::TryAcquireError::Closed) => {
@@ -263,7 +300,7 @@ impl Scheduler {
                         Ok(permit) => permit,
                         Err(tokio::sync::TryAcquireError::NoPermits) => {
                             drop(global_permit);
-                            blocked.push(PendingRequest::new(request));
+                            blocked.push(PendingRequest::from_request(request, enqueued_at));
                             continue;
                         }
                         Err(tokio::sync::TryAcquireError::Closed) => {
@@ -594,6 +631,23 @@ program = "true"
         assert!(entries[0].sequence < entries[1].sequence);
         assert_eq!(entries[2].sequence, 0);
         drop(handles);
+    }
+
+    #[test]
+    fn queued_work_is_promoted_after_a_bounded_wait() {
+        let now = Instant::now();
+        assert_eq!(
+            effective_priority(MIN_QUEUE_PRIORITY, now - STARVATION_AFTER, now,),
+            MAX_QUEUE_PRIORITY + 1
+        );
+        assert_eq!(
+            effective_priority(
+                MIN_QUEUE_PRIORITY,
+                now - (STARVATION_AFTER - Duration::from_secs(1)),
+                now,
+            ),
+            MIN_QUEUE_PRIORITY
+        );
     }
 
     #[tokio::test]
