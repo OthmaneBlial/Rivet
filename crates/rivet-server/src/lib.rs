@@ -8704,6 +8704,141 @@ program = "true"
     }
 
     #[tokio::test]
+    async fn bitbucket_provider_route_queues_and_deduplicates_pushes() {
+        let directory = tempdir().expect("tempdir");
+        let repository = directory.path().join("repository");
+        fs::create_dir_all(&repository).expect("repository");
+        let pipeline_path = repository.join("Rivetfile.toml");
+        fs::write(
+            &pipeline_path,
+            r#"
+version = 1
+name = "bitbucket-webhook"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline file");
+        let pipeline = Pipeline::load(&pipeline_path).expect("pipeline");
+        let project = Project::new(
+            "bitbucket-demo",
+            repository.to_string_lossy().into_owned(),
+            pipeline_path.to_string_lossy().into_owned(),
+        )
+        .expect("project");
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let mut state = AppState::new(storage.clone());
+        state.bitbucket_webhook_secret = Some(b"bitbucket-route-secret".to_vec());
+
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repository)
+                .output()
+                .expect("git available");
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "rivet@example.test"]);
+        git(&["config", "user.name", "Rivet Tests"]);
+        git(&["add", "Rivetfile.toml"]);
+        git(&["commit", "-qm", "bitbucket fixture"]);
+        let revision = git(&["rev-parse", "HEAD"]);
+        let repository_string = repository.to_string_lossy().into_owned();
+        let output = std::process::Command::new("git")
+            .args(["remote", "add", "origin"])
+            .arg(&repository_string)
+            .current_dir(&repository)
+            .output()
+            .expect("git available");
+        assert!(
+            output.status.success(),
+            "git remote add: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let body = serde_json::json!({
+            "push": {
+                "changes": [{
+                    "new": {
+                        "name": "main",
+                        "target": { "hash": revision }
+                    }
+                }]
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let signature = sign_webhook("bitbucket-route-secret", &body);
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/webhooks/bitbucket/bitbucket-demo")
+                .header("content-type", "application/json")
+                .header("x-event-key", "repo:push")
+                .header("x-request-uuid", "bitbucket-route-delivery-1")
+                .header("x-hub-signature", &signature)
+                .body(Body::from(body.clone()))
+                .expect("request")
+        };
+
+        let response = router(state.clone())
+            .oneshot(request())
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let queued: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("body"),
+        )
+        .expect("queued response");
+        assert_eq!(queued["status"], "queued");
+        assert_eq!(queued["deduplicated"], false);
+
+        let response = router(state.clone())
+            .oneshot(request())
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let duplicate: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("duplicate body"),
+        )
+        .expect("duplicate response");
+        assert_eq!(duplicate["status"], "already_queued");
+        assert_eq!(duplicate["deduplicated"], true);
+
+        for _ in 0..100 {
+            if storage
+                .list_builds(project.id)
+                .expect("builds")
+                .first()
+                .is_some_and(|build| build.status.is_terminal())
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let builds = storage.list_builds(project.id).expect("builds");
+        assert_eq!(builds.len(), 1);
+        assert_eq!(builds[0].status, BuildStatus::Passed);
+    }
+
+    #[tokio::test]
     async fn repository_poll_queues_only_when_the_head_revision_changes() {
         let directory = tempdir().expect("tempdir");
         let repository = directory.path().join("repository");
