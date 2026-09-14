@@ -379,11 +379,20 @@ export function cancelBuild(project: string, number: number): Promise<void> {
   );
 }
 
-export function createProject(input: {
+export interface CreateProjectInput {
   name: string;
-  repository_path: string;
+  repository_path?: string;
+  repository_url?: string;
+  clone_destination?: string;
+  branch?: string;
+  depth?: number;
+  revision?: string;
+  submodules?: boolean;
+  credential_id?: string;
   pipeline_path?: string;
-}): Promise<Project> {
+}
+
+export function createProject(input: CreateProjectInput): Promise<Project> {
   return request<Project>("/api/v1/projects", {
     method: "POST",
     body: JSON.stringify(input),

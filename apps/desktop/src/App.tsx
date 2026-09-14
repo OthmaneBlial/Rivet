@@ -568,6 +568,11 @@ function App() {
     });
   }
 
+  function openCreateProject() {
+    setShowCreate(true);
+    if (engineOnline && credentialList.length === 0) void loadCredentialList(false);
+  }
+
   async function toggleQueue() {
     if (!queueStatus) return;
     setBusy(true);
@@ -584,13 +589,54 @@ function App() {
   async function submitProject(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
+    const name = String(form.get("name") ?? "").trim();
+    const sourceMode = String(form.get("source_mode") ?? "local");
+    const localRepositoryPath = String(form.get("repository_path") ?? "").trim();
+    const pipelinePath = String(form.get("pipeline_path") ?? "").trim() || undefined;
+    if (!name) {
+      setError("Project name is required.");
+      return;
+    }
+    if (sourceMode === "local" && !localRepositoryPath) {
+      setError("A local repository path is required.");
+      return;
+    }
+
+    const input = sourceMode === "remote"
+      ? (() => {
+          const repositoryUrl = String(form.get("repository_url") ?? "").trim();
+          const cloneDestination = String(form.get("clone_destination") ?? "").trim();
+          const depthText = String(form.get("depth") ?? "").trim();
+          const depth = depthText ? Number(depthText) : undefined;
+          if (!repositoryUrl || !cloneDestination) {
+            setError("A repository URL and an empty clone destination are required.");
+            return null;
+          }
+          if (depth !== undefined && (!Number.isInteger(depth) || depth < 1 || depth > 10_000)) {
+            setError("Clone depth must be a whole number between 1 and 10000.");
+            return null;
+          }
+          return {
+            name,
+            repository_url: repositoryUrl,
+            clone_destination: cloneDestination,
+            branch: String(form.get("branch") ?? "").trim() || undefined,
+            depth,
+            revision: String(form.get("revision") ?? "").trim() || undefined,
+            submodules: form.get("submodules") === "on",
+            credential_id: String(form.get("credential_id") ?? "").trim() || undefined,
+            pipeline_path: pipelinePath,
+          };
+        })()
+      : {
+          name,
+          repository_path: localRepositoryPath,
+          pipeline_path: pipelinePath,
+        };
+    if (!input) return;
     setBusy(true);
     try {
-      const project = await createProject({
-        name: String(form.get("name") ?? ""),
-        repository_path: String(form.get("repository_path") ?? ""),
-        pipeline_path: String(form.get("pipeline_path") ?? "") || undefined,
-      });
+      const project = await createProject(input);
       setProjectsList((current) => [...current, project]);
       setProjectName(project.name);
       setShowCreate(false);
@@ -824,7 +870,7 @@ function App() {
               <span className="theme-toggle-icon" aria-hidden="true">{theme === "light" ? "☾" : "☀"}</span>
               <span className="theme-toggle-label">{theme === "light" ? "Dark" : "Light"}</span>
             </button>
-            <button className="button button-quiet" onClick={() => setShowCreate(true)}>
+            <button className="button button-quiet" onClick={openCreateProject}>
               <span>＋</span> New project
             </button>
           </div>
@@ -888,7 +934,7 @@ function App() {
             onReset={resetCredentialForm}
           />
         ) : projectsList.length === 0 ? (
-          <Onboarding onCreate={() => setShowCreate(true)} online={engineOnline} />
+          <Onboarding onCreate={openCreateProject} online={engineOnline} />
         ) : (
           <div className="content-wrap">
             <section className="page-heading">
@@ -1013,7 +1059,7 @@ function App() {
         )}
       </main>
 
-      {showCreate && <CreateProjectModal busy={busy} onClose={() => setShowCreate(false)} onSubmit={submitProject} />}
+      {showCreate && <CreateProjectModal busy={busy} credentials={credentialList} onClose={() => setShowCreate(false)} onSubmit={submitProject} />}
     </div>
   );
 }
@@ -1726,8 +1772,9 @@ function migrationStatusLabel(status: "supported" | "partial" | "unsupported"): 
   return status === "supported" ? "Supported" : status === "partial" ? "Partial" : "Unsupported";
 }
 
-function CreateProjectModal({ busy, onClose, onSubmit }: { busy: boolean; onClose: () => void; onSubmit: (event: React.FormEvent<HTMLFormElement>) => void }) {
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><div className="modal-card" role="dialog" aria-modal="true" aria-labelledby="create-project-title"><div className="modal-header"><div><span className="overline">Project registry</span><h2 id="create-project-title">Connect a repository</h2></div><button className="close-button" onClick={onClose} aria-label="Close">×</button></div><p className="modal-intro">Point Rivet at a local checkout and its pipeline definition. Paths are resolved by the engine.</p><form onSubmit={onSubmit}><label>Project name<input name="name" required placeholder="payments-api" autoFocus /></label><label>Repository path<input name="repository_path" required placeholder="/Users/you/Code/payments-api" /></label><label>Pipeline path <span className="optional">optional</span><input name="pipeline_path" placeholder="/Users/you/Code/payments-api/Rivetfile.toml" /></label><div className="modal-actions"><button type="button" className="button button-quiet" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary" disabled={busy}>{busy ? "Connecting…" : "Connect project"}</button></div></form></div></div>;
+function CreateProjectModal({ busy, credentials, onClose, onSubmit }: { busy: boolean; credentials: CredentialSummary[]; onClose: () => void; onSubmit: (event: React.FormEvent<HTMLFormElement>) => void }) {
+  const [sourceMode, setSourceMode] = useState<"local" | "remote">("local");
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><div className="modal-card" role="dialog" aria-modal="true" aria-labelledby="create-project-title"><div className="modal-header"><div><span className="overline">Project registry</span><h2 id="create-project-title">Connect a repository</h2></div><button type="button" className="close-button" onClick={onClose} aria-label="Close">×</button></div><p className="modal-intro">Choose a local checkout or bootstrap a fresh Git clone. The engine validates the pipeline before it registers the project.</p><form onSubmit={onSubmit}><label>Project name<input name="name" required placeholder="payments-api" autoFocus /></label><fieldset className="source-mode" aria-label="Repository source"><legend className="overline">Source type</legend><label className={`source-choice ${sourceMode === "local" ? "selected" : ""}`}><input type="radio" name="source_mode" value="local" checked={sourceMode === "local"} onChange={() => setSourceMode("local")} /><span>Local checkout</span><small>Use a repository already on this machine.</small></label><label className={`source-choice ${sourceMode === "remote" ? "selected" : ""}`}><input type="radio" name="source_mode" value="remote" checked={sourceMode === "remote"} onChange={() => setSourceMode("remote")} /><span>Remote clone</span><small>Clone into an explicit new or empty directory.</small></label></fieldset>{sourceMode === "local" ? <label>Repository path<input name="repository_path" required placeholder="/Users/you/Code/payments-api" /></label> : <><label>Repository URL<input name="repository_url" required placeholder="https://github.com/org/payments-api.git" autoComplete="off" /></label><label>Clone destination<input name="clone_destination" required placeholder="/Users/you/Code/payments-api" /><small className="modal-field-note">Rivet will not choose or overwrite a destination implicitly.</small></label><div className="remote-grid"><label>Branch <span className="optional">optional</span><input name="branch" placeholder="main" autoComplete="off" /></label><label>Depth <span className="optional">optional</span><input name="depth" type="number" min="1" max="10000" step="1" placeholder="full history" /></label></div><label>Revision <span className="optional">optional</span><input name="revision" placeholder="commit SHA or tag" autoComplete="off" /></label><label>Vault credential ID <span className="optional">optional</span><input name="credential_id" list="create-project-credential-ids" placeholder="github-ci" autoComplete="off" /><datalist id="create-project-credential-ids">{credentials.map((credential) => <option key={credential.id} value={credential.id}>{credential.username}</option>)}</datalist><small className="modal-field-note">Only the opaque ID is sent; the secret stays in the encrypted server vault.</small></label><label className="modal-check"><input name="submodules" type="checkbox" /><span>Initialize recursive submodules after cloning.</span></label></>}<label>Pipeline path <span className="optional">optional</span><input name="pipeline_path" placeholder={sourceMode === "local" ? "/Users/you/Code/payments-api/Rivetfile.toml" : "defaults to Rivetfile.toml in the clone"} /></label><div className="modal-actions"><button type="button" className="button button-quiet" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary" disabled={busy}>{busy ? sourceMode === "remote" ? "Cloning…" : "Connecting…" : "Connect project"}</button></div></form></div></div>;
 }
 
 export default App;
