@@ -7,6 +7,10 @@ if [ -n "${RIVET_RELEASE_OUTPUT:-}" ]; then
 else
     release_output=$(mktemp -d "${TMPDIR:-/tmp}/rivet-release.XXXXXX")
 fi
+release_version=${RIVET_RELEASE_VERSION:-0.1.0-alpha}
+release_arch=$(uname -m)
+bundle_path="$repo_root/apps/desktop/src-tauri/target/release/bundle/macos/Rivet.app"
+desktop_archive="$release_output/Rivet-$release_version-macos-$release_arch.app.zip"
 
 cd "$repo_root"
 
@@ -33,6 +37,7 @@ echo "[7/14] building the local Tauri macOS bundle"
 
 mkdir -p "$release_output"
 cp target/release/rivet "$release_output/rivet"
+ditto -c -k --sequesterRsrc --keepParent "$bundle_path" "$desktop_archive"
 
 if command -v shasum >/dev/null 2>&1; then
     binary_checksum=$(shasum -a 256 "$release_output/rivet" | awk '{print $1}')
@@ -41,6 +46,11 @@ elif command -v sha256sum >/dev/null 2>&1; then
 else
     echo "release check refused: no SHA-256 utility is available" >&2
     exit 1
+fi
+if command -v shasum >/dev/null 2>&1; then
+    desktop_checksum=$(shasum -a 256 "$desktop_archive" | awk '{print $1}')
+else
+    desktop_checksum=$(sha256sum "$desktop_archive" | awk '{print $1}')
 fi
 
 echo "[8/14] exercising the real local CLI workflow"
@@ -67,16 +77,22 @@ jq -n \
     --arg generated_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
     --arg binary "rivet" \
     --arg sha256 "$binary_checksum" \
+    --arg desktop "$(basename "$desktop_archive")" \
+    --arg desktop_sha256 "$desktop_checksum" \
     '{schema_version: 1, source_commit: $commit, generated_at: $generated_at,
       github_actions: false, checks: {format: true, workspace_tests: true,
       cli_release_build: true, desktop_web_build: true, tauri_host_check: true,
       tauri_bundle_smoke: true, local_e2e_smoke: true, local_queue_smoke: true, local_backup_restore_smoke: true, local_auth_smoke: true, compat_capture_smoke: true,
       local_deployment_smoke: true},
-      artifacts: [{name: $binary, path: $binary, sha256: $sha256}]}' \
+      artifacts: [{name: $binary, path: $binary, sha256: $sha256},
+        {name: $desktop, path: $desktop, sha256: $desktop_sha256}]}' \
     > "$release_output/manifest.json"
 test -x "$release_output/rivet"
+test -f "$desktop_archive"
 test "$(jq -r '.artifacts[0].sha256' "$release_output/manifest.json")" = "$binary_checksum"
+test "$(jq -r '.artifacts[1].sha256' "$release_output/manifest.json")" = "$desktop_checksum"
 
 echo "release check passed"
 echo "artifact: $release_output/rivet"
+echo "artifact: $desktop_archive"
 echo "manifest: $release_output/manifest.json"
