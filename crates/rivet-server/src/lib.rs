@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -291,6 +292,8 @@ enum ApiError {
     ArtifactNotFound(uuid::Uuid),
     #[error("could not read artifact: {0}")]
     ArtifactRead(#[source] std::io::Error),
+    #[error("artifact contents failed integrity verification")]
+    ArtifactIntegrity,
     #[error("credential vault is not configured")]
     CredentialsUnavailable,
     #[error("local user authentication is not configured")]
@@ -358,7 +361,7 @@ impl IntoResponse for ApiError {
             | Self::InvalidWebhookEventId => StatusCode::BAD_REQUEST,
             Self::WebhookEventConflict => StatusCode::CONFLICT,
             Self::ArtifactNotFound(_) => StatusCode::NOT_FOUND,
-            Self::ArtifactRead(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ArtifactRead(_) | Self::ArtifactIntegrity => StatusCode::INTERNAL_SERVER_ERROR,
             Self::CredentialsUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::AuthUsersUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::InvalidCredentials => StatusCode::UNAUTHORIZED,
@@ -3737,7 +3740,7 @@ async fn download_artifact(
     if artifact.build_id != build.id {
         return Err(ApiError::ArtifactNotFound(artifact_id));
     }
-    let bytes = std::fs::read(path).map_err(ApiError::ArtifactRead)?;
+    let (file, content_length) = verified_artifact_file(&path, &artifact)?;
     let filename = artifact
         .relative_path
         .rsplit('/')
@@ -3745,17 +3748,57 @@ async fn download_artifact(
         .filter(|value| !value.is_empty())
         .unwrap_or("artifact")
         .replace(['"', '\r', '\n'], "_");
-    let mut response = Response::new(Body::from(bytes));
+    let file = tokio::fs::File::from_std(file);
+    let mut response = Response::new(Body::from_stream(tokio_util::io::ReaderStream::new(file)));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
+    if let Ok(value) = HeaderValue::from_str(&content_length.to_string()) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&format!("\"{}\"", artifact.checksum)) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&artifact.checksum) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-rivet-artifact-sha256"), value);
+    }
     if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
         response
             .headers_mut()
             .insert(header::CONTENT_DISPOSITION, value);
     }
     Ok(response)
+}
+
+fn verified_artifact_file(
+    path: &Path,
+    artifact: &ArtifactRecord,
+) -> Result<(std::fs::File, u64), ApiError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(ApiError::ArtifactRead)?;
+    if !metadata.file_type().is_file() || metadata.len() != artifact.size_bytes {
+        return Err(ApiError::ArtifactIntegrity);
+    }
+
+    let mut file = std::fs::File::open(path).map_err(ApiError::ArtifactRead)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(ApiError::ArtifactRead)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let checksum = format!("sha256:{:x}", hasher.finalize());
+    if checksum != artifact.checksum {
+        return Err(ApiError::ArtifactIntegrity);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(ApiError::ArtifactRead)?;
+    Ok((file, metadata.len()))
 }
 
 async fn queue_build(
@@ -5444,6 +5487,43 @@ mod tests {
     use tokio::time::sleep;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
     use tower::ServiceExt;
+
+    #[test]
+    fn artifact_download_verification_rejects_tampering_and_non_files() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("artifact.bin");
+        let original = b"verified artifact\n";
+        fs::write(&path, original).expect("artifact");
+        let artifact = ArtifactRecord {
+            id: Uuid::new_v4(),
+            build_id: Uuid::new_v4(),
+            name: "bundle".into(),
+            relative_path: "dist/app.bin".into(),
+            size_bytes: original.len() as u64,
+            checksum: format!("sha256:{:x}", Sha256::digest(original)),
+            created_at: Utc::now(),
+        };
+
+        let (mut verified, size) = verified_artifact_file(&path, &artifact).expect("verified");
+        let mut bytes = Vec::new();
+        verified
+            .read_to_end(&mut bytes)
+            .expect("read verified file");
+        assert_eq!(size, original.len() as u64);
+        assert_eq!(bytes, original);
+
+        fs::write(&path, b"tampered").expect("tamper artifact");
+        assert!(matches!(
+            verified_artifact_file(&path, &artifact),
+            Err(ApiError::ArtifactIntegrity)
+        ));
+        fs::remove_file(&path).expect("remove artifact");
+        fs::create_dir(&path).expect("directory artifact");
+        assert!(matches!(
+            verified_artifact_file(&path, &artifact),
+            Err(ApiError::ArtifactIntegrity)
+        ));
+    }
 
     #[tokio::test]
     async fn health_route_is_available_without_a_project() {

@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **94% verified** · `███████████████████░`<br>
-Weighted evidence score: **94.82 / 100** · displayed conservatively as the
+Weighted evidence score: **94.92 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -25,7 +25,7 @@ admission, parameterized builds, local artifact storage and retention pruning,
 protected server
 transport with safe request IDs and structured method/route/status tracing,
 build retry, pre-execution queue cancellation, build artifact
-downloads, a priority-ordered queue snapshot and rendered queue control room,
+downloads with checksum-verified streaming and integrity headers, a priority-ordered queue snapshot and rendered queue control room,
 and a light-default desktop theme with an accessible dark-mode
 toggle, persistent UTC cron schedules with repository-poll remote/fetch
 configuration, server dispatch, desktop schedule controls, signed generic
