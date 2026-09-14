@@ -17,7 +17,7 @@ Last verified update: **2026-09-14** · native pipeline execution, priority-awar
 FIFO queue with pause/resume controls,
 SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
 clone/inspection, local/remote project onboarding, server-side project bootstrap
-cloning into explicit destinations,
+cloning into explicit destinations, and CLI project bootstrap cloning,
 persisted build-source identity, recursive Git submodule preparation,
 live queue telemetry, durable
 event replay, quiet engine offline recovery, explicit Git preparation at build
@@ -176,6 +176,9 @@ From a repository containing `Rivetfile.toml`:
 ```sh
 cargo run -p rivet -- init .
 cargo run -p rivet -- project create rivet --repository .
+cargo run -p rivet -- project create release \
+  --repository-url https://github.com/example/project.git \
+  --clone-destination /secure/workspaces/project --branch main --depth 20
 cargo run -p rivet -- run rivet
 cargo run -p rivet -- run rivet --priority 20
 cargo run -p rivet -- builds rivet
@@ -366,10 +369,12 @@ builds, build details, persisted logs, cancellation, a live queue snapshot, dura
 and a per-build WebSocket event stream under `/api/v1/`. It also exposes
 persisted UTC cron schedules with create/list/pause/resume/delete operations,
 automatic server dispatch, Git repository inspection, and an explicit prepare
-operation for fetch/checkout/clean workflows. The CLI also supports explicit
-repository cloning into a new or empty destination. Project creation can also
-clone a remote repository when the request supplies `repository_url` and an
-explicit empty `clone_destination`; optional `branch`, `depth`, `revision`,
+operation for fetch/checkout/clean workflows. The CLI supports explicit
+repository cloning into a new or empty destination, and `project create` can
+register a project from a remote repository in one command when
+`--repository-url` and an explicit `--clone-destination` are supplied. The API
+can also clone a remote repository when the request supplies `repository_url`
+and an explicit empty `clone_destination`; optional `branch`, `depth`, `revision`,
 `submodules`, and non-secret `credential_id` fields use the same bounded Git
 adapter and deployment SSH host-key policy. The server returns
 `202 Accepted` when a build is queued. A build request may opt into Git
