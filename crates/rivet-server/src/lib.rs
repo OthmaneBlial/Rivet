@@ -2971,9 +2971,9 @@ async fn delete_provider_trigger(
 
 fn normalize_provider_trigger_provider(provider: String) -> Result<String, ApiError> {
     let provider = provider.trim().to_ascii_lowercase();
-    if !matches!(provider.as_str(), "github" | "gitlab") {
+    if !matches!(provider.as_str(), "github" | "gitlab" | "bitbucket") {
         return Err(ApiError::BadRequest(
-            "provider must be github or gitlab".into(),
+            "provider must be github, gitlab, or bitbucket".into(),
         ));
     }
     Ok(provider)
@@ -3215,6 +3215,15 @@ async fn bitbucket_webhook(
         .bitbucket_webhook_secret
         .as_deref()
         .ok_or(ApiError::BitbucketWebhookNotConfigured)?;
+    if let Some(event) = normalize_bitbucket_provider_trigger(
+        secret,
+        &headers,
+        &body,
+        project.clone(),
+        state.bitbucket_webhook_credential_id.clone(),
+    )? {
+        return enqueue_provider_trigger(&state, &principal, event).await;
+    }
     let Some(request) = normalize_bitbucket_webhook(
         secret,
         &headers,
@@ -3473,6 +3482,68 @@ fn normalize_gitlab_provider_trigger(
     };
     Ok(Some(ProviderTriggerEvent {
         provider: "gitlab",
+        event_id,
+        project,
+        source_repository,
+        source_pipeline,
+        revision,
+        credential_id,
+        successful,
+    }))
+}
+
+fn normalize_bitbucket_provider_trigger(
+    secret: &[u8],
+    headers: &HeaderMap,
+    body: &[u8],
+    project: String,
+    credential_id: Option<String>,
+) -> Result<Option<ProviderTriggerEvent>, ApiError> {
+    verify_hmac_hex_signature(secret, headers, "x-hub-signature", body)?;
+    let event = required_header(headers, "x-event-key")?;
+    if !matches!(
+        event.as_str(),
+        "repo:commit_status_created" | "repo:commit_status_updated"
+    ) {
+        return Ok(None);
+    }
+    let event_id = required_header(headers, "x-request-uuid")?;
+    let payload: serde_json::Value = serde_json::from_slice(body).map_err(|error| {
+        ApiError::BadRequest(format!("invalid Bitbucket webhook JSON: {error}"))
+    })?;
+    let commit_status = payload
+        .get("commit_status")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| ApiError::BadRequest("Bitbucket commit_status payload is missing".into()))?;
+    let source_repository = payload
+        .get("repository")
+        .and_then(|repository| repository.get("full_name"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::BadRequest("Bitbucket repository.full_name is missing".into()))?
+        .to_owned();
+    let source_pipeline = commit_status
+        .get("name")
+        .or_else(|| commit_status.get("key"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    let successful = commit_status
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|state| state.eq_ignore_ascii_case("SUCCESSFUL"));
+    let revision = if successful {
+        normalize_commit_revision(
+            commit_status
+                .get("commit")
+                .and_then(|commit| commit.get("hash")),
+            "Bitbucket commit_status commit.hash",
+        )?
+    } else {
+        None
+    };
+    Ok(Some(ProviderTriggerEvent {
+        provider: "bitbucket",
         event_id,
         project,
         source_repository,
@@ -9738,6 +9809,91 @@ program = "true"
         let builds = storage.list_builds(project.id).expect("builds");
         assert_eq!(builds.len(), 1);
         assert_eq!(builds[0].status, BuildStatus::Passed);
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/bitbucket-demo/provider-triggers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"provider":"bitbucket","source_repository":"acme/widgets","source_pipeline":"Build"}"#,
+                    ))
+                    .expect("create Bitbucket provider trigger request"),
+            )
+            .await
+            .expect("create Bitbucket provider trigger response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let status_body = serde_json::json!({
+            "repository": { "full_name": "acme/widgets" },
+            "commit_status": {
+                "key": "build",
+                "name": "Build",
+                "state": "SUCCESSFUL",
+                "commit": { "hash": revision }
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let status_signature = sign_webhook("bitbucket-route-secret", &status_body);
+        let status_request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/webhooks/bitbucket/bitbucket-demo")
+                .header("content-type", "application/json")
+                .header("x-event-key", "repo:commit_status_created")
+                .header("x-request-uuid", "bitbucket-status-delivery-1")
+                .header("x-hub-signature", &status_signature)
+                .body(Body::from(status_body.clone()))
+                .expect("commit status request")
+        };
+        let response = router(state.clone())
+            .oneshot(status_request())
+            .await
+            .expect("commit status response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let queued: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("queued commit status body"),
+        )
+        .expect("queued commit status JSON");
+        assert_eq!(queued["status"], "queued");
+
+        let response = router(state.clone())
+            .oneshot(status_request())
+            .await
+            .expect("duplicate commit status response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let duplicate: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("duplicate commit status body"),
+        )
+        .expect("duplicate commit status JSON");
+        assert_eq!(duplicate["status"], "already_received");
+        assert_eq!(duplicate["deduplicated"], true);
+
+        for _ in 0..100 {
+            if storage.list_builds(project.id).expect("builds").len() == 2
+                && storage
+                    .list_builds(project.id)
+                    .expect("builds")
+                    .iter()
+                    .all(|build| build.status.is_terminal())
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let builds = storage.list_builds(project.id).expect("builds");
+        assert_eq!(builds.len(), 2);
+        assert!(
+            builds
+                .iter()
+                .all(|build| build.status == BuildStatus::Passed)
+        );
     }
 
     #[tokio::test]
@@ -10571,6 +10727,69 @@ program = "true"
                 .expect("push request");
         assert_eq!(request.event_id, "gitlab-legacy-delivery-1");
         assert_eq!(request.project, "demo");
+    }
+
+    #[test]
+    fn bitbucket_commit_status_completion_normalizes_success_and_failure() {
+        let body = br#"{
+            "repository":{"full_name":"acme/widgets"},
+            "commit_status":{"key":"build","name":"Build","state":"SUCCESSFUL","commit":{"hash":"c783c3523482029c449dcdff1209ed06409b83bc"}}
+        }"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-event-key",
+            HeaderValue::from_static("repo:commit_status_updated"),
+        );
+        headers.insert(
+            "x-request-uuid",
+            HeaderValue::from_static("bitbucket-status-1"),
+        );
+        headers.insert(
+            "x-hub-signature",
+            HeaderValue::from_str(&sign_webhook("bitbucket-fixture-secret", body))
+                .expect("signature"),
+        );
+        let event = normalize_bitbucket_provider_trigger(
+            b"bitbucket-fixture-secret",
+            &headers,
+            body,
+            "downstream".into(),
+            Some("bitbucket-credential".into()),
+        )
+        .expect("normalize")
+        .expect("provider event");
+        assert_eq!(event.provider, "bitbucket");
+        assert_eq!(event.event_id, "bitbucket-status-1");
+        assert_eq!(event.source_repository, "acme/widgets");
+        assert_eq!(event.source_pipeline.as_deref(), Some("Build"));
+        assert_eq!(
+            event.revision.as_deref(),
+            Some("c783c3523482029c449dcdff1209ed06409b83bc")
+        );
+        assert_eq!(event.credential_id.as_deref(), Some("bitbucket-credential"));
+        assert!(event.successful);
+
+        let failed_body = br#"{
+            "repository":{"full_name":"acme/widgets"},
+            "commit_status":{"name":"Build","state":"FAILED","commit":{"hash":"c783c3523482029c449dcdff1209ed06409b83bc"}}
+        }"#;
+        let mut failed_headers = headers;
+        failed_headers.insert(
+            "x-hub-signature",
+            HeaderValue::from_str(&sign_webhook("bitbucket-fixture-secret", failed_body))
+                .expect("failure signature"),
+        );
+        let failed = normalize_bitbucket_provider_trigger(
+            b"bitbucket-fixture-secret",
+            &failed_headers,
+            failed_body,
+            "downstream".into(),
+            None,
+        )
+        .expect("normalize failed event")
+        .expect("failed provider event");
+        assert!(!failed.successful);
+        assert_eq!(failed.revision, None);
     }
 
     #[test]

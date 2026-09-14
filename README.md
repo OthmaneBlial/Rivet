@@ -33,8 +33,8 @@ webhook delivery with idempotent redelivery, GitHub repository-dispatch
 revision triggers, and signed Bitbucket push/pull-request revision triggers,
 durable internal upstream-pipeline triggers with passed-build gating,
 cycle rejection, idempotent delivery claims, and restart reconciliation,
-provider-trigger mappings for signed GitHub workflow and GitLab pipeline
-completion events,
+provider-trigger mappings for signed GitHub workflow, GitLab pipeline, and
+Bitbucket commit-status completion events,
 policy-backed API identities with role/project authorization,
 secret-parameter redaction/masking, a passphrase-encrypted SCM credential vault
 with typed HTTP/SSH credentials, non-secret credential references, project allow-lists,
@@ -253,9 +253,10 @@ passed builds are reconciled when the server starts. The downstream build uses
 the common local or remote-agent queue path; it does not install or start
 Docker or Podman.
 
-Provider workflow completion triggers connect an external GitHub Actions or
-GitLab pipeline to one Rivet project. Configure the downstream mapping with a
-provider repository and, optionally, an exact workflow/pipeline name:
+Provider workflow completion triggers connect an external GitHub Actions,
+GitLab pipeline, or Bitbucket commit-status stream to one Rivet project.
+Configure the downstream mapping with a provider repository and, optionally,
+an exact workflow/pipeline name:
 
 ```sh
 curl -X POST http://127.0.0.1:7878/api/v1/projects/release/provider-triggers \
@@ -275,10 +276,11 @@ cargo run -p rivet -- provider-trigger list release
 cargo run -p rivet -- provider-trigger delete release <trigger-id>
 ```
 
-After the signed webhook is received, a successful GitHub `workflow_run`
-completion or GitLab `Pipeline Hook` completion queues the exact provider
-commit through Rivet's normal SCM and queue path. Running, failed, cancelled,
-or unmatched completions are acknowledged without a build. Delivery claims
+After the signed webhook is received, a successful GitHub `workflow_run`,
+GitLab `Pipeline Hook`, or Bitbucket `repo:commit_status_created` /
+`repo:commit_status_updated` completion queues the exact provider commit
+through Rivet's normal SCM and queue path. Running, failed, cancelled, or
+unmatched completions are acknowledged without a build. Delivery claims
 are durable per mapping and provider event ID, so retries do not create a
 second build. The mapping stores only provider identifiers and never webhook
 or SCM secrets.
@@ -568,11 +570,12 @@ Bitbucket's [event payload reference](https://support.atlassian.com/bitbucket-cl
 and [webhook security documentation](https://support.atlassian.com/bitbucket-cloud/docs/manage-webhooks/)
 define the event headers and HMAC contract used by this adapter.
 The current provider-side mapping is deliberately bounded to GitHub workflow
-completion and GitLab pipeline completion, with exact repository/workflow
-selectors and no provider API polling. Broader provider-event mapping and
-additional external pipeline systems remain future gates; event types that do
-not identify a source revision are acknowledged safely, while unknown event
-types remain rejected.
+completion, GitLab pipeline completion, and Bitbucket successful commit-status
+completion, with exact repository/workflow/status-name selectors and no
+provider API polling. Broader provider-event mapping and additional external
+pipeline systems remain future gates; event types that do not identify a
+source revision are acknowledged safely, while unknown event types remain
+rejected.
 
 SCM credentials use a local passphrase-encrypted vault. The CLI reads the
 passphrase and provider secret from private files, so neither value is placed

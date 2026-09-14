@@ -125,7 +125,7 @@ export interface PipelineTriggerRecord {
 export interface ProviderTriggerRecord {
   id: string;
   downstream_project_id: string;
-  provider: "github" | "gitlab";
+  provider: "github" | "gitlab" | "bitbucket";
   source_repository: string;
   source_pipeline: string | null;
   enabled: boolean;

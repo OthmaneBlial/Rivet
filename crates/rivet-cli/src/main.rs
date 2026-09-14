@@ -469,7 +469,7 @@ enum UpstreamCommand {
 
 #[derive(Debug, Subcommand)]
 enum ProviderTriggerCommand {
-    /// Queue a project after a successful GitHub or GitLab pipeline event.
+    /// Queue a project after a successful GitHub, GitLab, or Bitbucket pipeline event.
     Create {
         downstream: String,
         #[arg(long)]
@@ -3050,8 +3050,8 @@ fn manage_provider_trigger(
                 .get_project_by_name(&downstream)?
                 .ok_or_else(|| format!("project not found: {downstream}"))?;
             let provider = provider.trim().to_ascii_lowercase();
-            if !matches!(provider.as_str(), "github" | "gitlab") {
-                return Err("provider must be github or gitlab".into());
+            if !matches!(provider.as_str(), "github" | "gitlab" | "bitbucket") {
+                return Err("provider must be github, gitlab, or bitbucket".into());
             }
             let source_repository = source_repository.trim();
             if source_repository.is_empty()

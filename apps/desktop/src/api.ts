@@ -408,7 +408,7 @@ export function providerTriggers(project: string): Promise<ProviderTriggerRecord
 export function createProviderTrigger(
   project: string,
   input: {
-    provider: "github" | "gitlab";
+    provider: "github" | "gitlab" | "bitbucket";
     source_repository: string;
     source_pipeline?: string;
   },

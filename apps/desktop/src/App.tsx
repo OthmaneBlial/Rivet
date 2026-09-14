@@ -800,7 +800,7 @@ function App() {
     event.preventDefault();
     if (!projectName) return;
     const form = new FormData(event.currentTarget);
-    const provider = String(form.get("provider_trigger_provider") ?? "github") as "github" | "gitlab";
+    const provider = String(form.get("provider_trigger_provider") ?? "github") as "github" | "gitlab" | "bitbucket";
     const sourceRepository = String(form.get("provider_trigger_repository") ?? "").trim();
     const sourcePipeline = String(form.get("provider_trigger_pipeline") ?? "").trim();
     if (!sourceRepository) return;
@@ -1577,11 +1577,11 @@ function ProviderTriggerPanel({
       </div>
       <div className="provider-trigger-intro">
         <span className="provider-trigger-signal" aria-hidden="true"><i /><i /><i /></span>
-        <p>Let a signed GitHub Actions or GitLab pipeline completion open this project at its exact commit.</p>
+        <p>Let a signed GitHub Actions, GitLab, or Bitbucket completion open this project at its exact commit.</p>
       </div>
       {showCreate && (
         <form className="provider-trigger-form" onSubmit={onSubmit}>
-          <label>Provider<select name="provider_trigger_provider" defaultValue="github"><option value="github">GitHub Actions</option><option value="gitlab">GitLab CI</option></select></label>
+          <label>Provider<select name="provider_trigger_provider" defaultValue="github"><option value="github">GitHub Actions</option><option value="gitlab">GitLab CI</option><option value="bitbucket">Bitbucket Pipelines</option></select></label>
           <label>Source repository<input name="provider_trigger_repository" required placeholder="acme/widgets" autoComplete="off" /><small>Exact provider identity.</small></label>
           <label>Workflow / pipeline <span className="optional">optional</span><input name="provider_trigger_pipeline" placeholder="Release" autoComplete="off" /><small>Blank matches any completion.</small></label>
           <button className="button button-primary" type="submit" disabled={busy}>{busy ? "Connecting…" : "Connect handoff"}</button>
@@ -1593,7 +1593,7 @@ function ProviderTriggerPanel({
         <div className="provider-trigger-list">
           {triggers.map((trigger) => (
             <div className="provider-trigger-row" key={trigger.id}>
-              <span className={`provider-trigger-badge provider-${trigger.provider}`} aria-hidden="true">{trigger.provider === "github" ? "GH" : "GL"}</span>
+              <span className={`provider-trigger-badge provider-${trigger.provider}`} aria-hidden="true">{trigger.provider === "github" ? "GH" : trigger.provider === "gitlab" ? "GL" : "BB"}</span>
               <div className="provider-trigger-copy"><strong>{trigger.source_repository}</strong><small>{trigger.provider} · {trigger.source_pipeline ?? "any workflow / pipeline"} · signed success → current project</small></div>
               <span className="provider-trigger-status">{trigger.enabled ? "listening" : "paused"}</span>
               <button className="schedule-delete" type="button" disabled={busy} aria-label={`Delete ${trigger.provider} provider trigger`} onClick={() => onDelete(trigger)}>×</button>

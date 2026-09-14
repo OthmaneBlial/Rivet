@@ -272,6 +272,7 @@ select:focus { border-color: var(--amber); }
 .provider-trigger-badge { display: grid; width: 28px; height: 28px; place-items: center; border: 1px solid var(--line-strong); color: var(--muted); font: 9px "Azeret Mono", monospace; letter-spacing: -.05em; transform: rotate(-8deg); }
 .provider-trigger-badge.provider-github { border-color: rgba(166,94,20,.55); color: var(--amber); background: rgba(166,94,20,.06); }
 .provider-trigger-badge.provider-gitlab { border-color: rgba(0,115,111,.55); color: var(--cyan); background: rgba(0,115,111,.06); transform: rotate(8deg); }
+.provider-trigger-badge.provider-bitbucket { border-color: rgba(114,86,171,.55); color: var(--violet); background: rgba(114,86,171,.06); transform: rotate(4deg); }
 .provider-trigger-copy { display: grid; min-width: 0; gap: 5px; }
 .provider-trigger-copy strong { overflow: hidden; color: var(--white); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .provider-trigger-copy small { overflow: hidden; color: var(--faint); font: 9px "Azeret Mono", monospace; text-overflow: ellipsis; white-space: nowrap; }
