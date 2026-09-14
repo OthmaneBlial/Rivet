@@ -551,6 +551,9 @@ enum CredentialCommand {
         passphrase_file: PathBuf,
         #[arg(long)]
         vault_file: Option<PathBuf>,
+        /// Remove only when the credential is owned by this identity.
+        #[arg(long)]
+        owner: Option<String>,
     },
 }
 
@@ -3774,10 +3777,23 @@ fn manage_credentials(
             id,
             passphrase_file,
             vault_file,
+            owner,
         } => {
             let vault_path = vault_file.unwrap_or_else(|| data_dir.join("credentials.vault"));
             let passphrase = read_private_value(&passphrase_file, "credential vault passphrase")?;
             let mut vault = CredentialVault::open(&vault_path, passphrase)?;
+            let owner = owner
+                .map(|owner| validate_owner_filter(&owner).map(|_| owner))
+                .transpose()?;
+            if let Some(owner) = owner.as_deref() {
+                let credential = vault.get(&id)?;
+                if credential.owner() != owner {
+                    return Err(format!(
+                        "credential {id} is owned by a different identity; refusing removal"
+                    )
+                    .into());
+                }
+            }
             vault.remove(&id)?;
             println!("Removed credential {id}");
         }

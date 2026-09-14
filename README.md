@@ -146,11 +146,21 @@ rivet credential list \
   --passphrase-file /private/path/passphrase
 ```
 
+For destructive CLI removal, pass the same `--owner` guard; Rivet refuses the
+operation when the credential belongs to another identity:
+
+```sh
+rivet credential remove github \
+  --owner user:42 \
+  --passphrase-file /private/path/passphrase
+```
+
 The headless API exposes the same inventory boundary with
 `GET /api/v1/credentials?owner=user%3A42`. This endpoint is admin-authenticated
-and returns summaries only; credential secrets are never returned. The desktop
-credential inventory also has an owner filter so operators can review one
-identity's scope without mixing it with the rest of the vault.
+and returns summaries only; credential secrets are never returned. DELETE
+`/api/v1/credentials/{id}?owner=user%3A42` applies the same ownership guard.
+The desktop credential inventory also has an owner filter so operators can
+review one identity's scope without mixing it with the rest of the vault.
 
 ## Screenshots
 

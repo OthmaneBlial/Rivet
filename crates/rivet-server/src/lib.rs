@@ -1562,19 +1562,7 @@ async fn list_credentials(
     Query(query): Query<CredentialListQuery>,
 ) -> Result<Json<Vec<CredentialSummary>>, ApiError> {
     require_global(&principal, Permission::Administer)?;
-    let owner = query
-        .owner
-        .map(|owner| {
-            let owner = owner.trim().to_owned();
-            if owner.is_empty() || owner.len() > 256 || owner.chars().any(char::is_control) {
-                Err(ApiError::BadRequest(
-                    "credential owner filter must be non-empty and bounded".into(),
-                ))
-            } else {
-                Ok(owner)
-            }
-        })
-        .transpose()?;
+    let owner = validate_credential_owner_filter(query.owner)?;
     let vault = configured_credentials(&state)?;
     Ok(Json(
         vault
@@ -1640,12 +1628,36 @@ async fn delete_credential(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
     Extension(principal): Extension<Principal>,
+    Query(query): Query<CredentialListQuery>,
 ) -> Result<StatusCode, ApiError> {
     require_global(&principal, Permission::Administer)?;
     let vault = configured_credentials(&state)?;
-    vault.lock().await.remove(&id)?;
+    let owner = validate_credential_owner_filter(query.owner)?;
+    let mut vault = vault.lock().await;
+    if let Some(owner) = owner.as_deref() {
+        let credential = vault.get(&id)?;
+        if credential.owner() != owner {
+            return Err(CredentialError::CredentialNotFound(id).into());
+        }
+    }
+    vault.remove(&id)?;
     record_credential_audit(&state.storage, principal.id(), &id, "remove");
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn validate_credential_owner_filter(owner: Option<String>) -> Result<Option<String>, ApiError> {
+    owner
+        .map(|owner| {
+            let owner = owner.trim().to_owned();
+            if owner.is_empty() || owner.len() > 256 || owner.chars().any(char::is_control) {
+                Err(ApiError::BadRequest(
+                    "credential owner filter must be non-empty and bounded".into(),
+                ))
+            } else {
+                Ok(owner)
+            }
+        })
+        .transpose()
 }
 
 fn record_credential_audit(
@@ -8926,7 +8938,19 @@ agent = { os = "macos", arch = "aarch64", labels = ["recovery"] }
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/api/v1/credentials/github")
+                    .uri("/api/v1/credentials/github?owner=other")
+                    .body(Body::empty())
+                    .expect("mismatched-owner delete request"),
+            )
+            .await
+            .expect("mismatched-owner delete response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/credentials/github?owner=local")
                     .body(Body::empty())
                     .expect("delete request"),
             )
