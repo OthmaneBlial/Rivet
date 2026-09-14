@@ -3,6 +3,19 @@ set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 app_path="$repo_root/apps/desktop/src-tauri/target/release/bundle/macos/Rivet.app"
+launch_root=$(mktemp -d "${TMPDIR:-/tmp}/rivet-tauri-launch.XXXXXX")
+app_pid=
+cleanup() {
+    if [ -n "${app_pid:-}" ] && kill -0 "$app_pid" 2>/dev/null; then
+        kill -TERM "$app_pid" 2>/dev/null || true
+        sleep 1
+        kill -KILL "$app_pid" 2>/dev/null || true
+        wait "$app_pid" 2>/dev/null || true
+    fi
+    rm -rf -- "$launch_root"
+}
+trap cleanup EXIT HUP INT TERM
+umask 077
 
 if [ "$(uname -s)" != "Darwin" ]; then
     printf '%s\n' "Tauri macOS bundle smoke refused: this check requires macOS" >&2
@@ -16,5 +29,26 @@ test -x "$app_path/Contents/MacOS/rivet-desktop"
 test "$(plutil -extract CFBundleIdentifier raw "$app_path/Contents/Info.plist")" = "com.othmaneblial.rivet"
 test "$(plutil -extract CFBundleShortVersionString raw "$app_path/Contents/Info.plist")" = "0.1.0"
 
-printf '%s\n' "local Tauri macOS bundle smoke passed"
+"$app_path/Contents/MacOS/rivet-desktop" >"$launch_root/rivet.log" 2>&1 &
+app_pid=$!
+engine_ready=0
+attempt=0
+while [ "$attempt" -lt 40 ]; do
+    if lsof -nP -a -p "$app_pid" -iTCP -sTCP:LISTEN 2>/dev/null | rg -q '127\.0\.0\.1:'; then
+        engine_ready=1
+        break
+    fi
+    if ! kill -0 "$app_pid" 2>/dev/null; then
+        break
+    fi
+    sleep 0.25
+    attempt=$((attempt + 1))
+done
+if [ "$engine_ready" -ne 1 ]; then
+    sed -n '1,80p' "$launch_root/rivet.log" >&2 || true
+    printf '%s\n' "Tauri macOS bundle smoke refused: packaged engine did not open a loopback listener" >&2
+    exit 1
+fi
+
+printf '%s\n' "local Tauri macOS bundle and launch smoke passed"
 printf 'bundle: %s\n' "$app_path"

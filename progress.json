@@ -3,7 +3,7 @@
   "scope": "Rivet complete product roadmap",
   "verified_percent": 94,
   "verified_points": 94,
-  "weighted_evidence_points": 94.18,
+  "weighted_evidence_points": 94.28,
   "total_points": 100,
   "last_verified": "2026-09-14",
   "policy": "Only tested or exercised behavior counts; partial work receives only its evidenced portion.",
@@ -27,6 +27,6 @@
     {"id": "extensions", "weight": 4, "completion": 1.0, "status": "verified"},
     {"id": "migration", "weight": 3, "completion": 0.97, "status": "partial"},
     {"id": "differential", "weight": 2, "completion": 0.65, "status": "partial"},
-    {"id": "release", "weight": 2, "completion": 0.6, "status": "partial"}
+    {"id": "release", "weight": 2, "completion": 0.65, "status": "partial"}
   ]
 }
