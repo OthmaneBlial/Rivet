@@ -1,926 +1,307 @@
 # Rivet
 
-Rivet is a Rust-first CI/CD automation platform being built independently
-from Jenkins.
+### A Rust-native CI/CD control room for pipelines you can actually see.
 
-## Delivery progress
+Rivet is a local-first CI/CD automation platform for defining, running, and
+operating build pipelines from one focused workspace. It combines an explicit
+`Rivetfile.toml`, a Rust execution engine, durable SQLite history, a headless
+HTTP/WebSocket API, a CLI, and a Tauri desktop control room.
+
+It is being built as a modern, inspectable Jenkins alternative for teams that
+want clear pipeline behavior without hiding the execution signal behind a
+black box. Rivet is an early alpha: it does not claim feature-for-feature
+Jenkins parity or production readiness on every platform.
+
+<p align="center">
+  <img src="apps/desktop/src-tauri/icons/icon.svg" alt="Rivet logo" width="112" />
+</p>
+
+<p align="center">
+  <a href="https://github.com/OthmaneBlial/Rivet/releases">Download</a> ·
+  <a href="ROADMAP.md">Roadmap</a> ·
+  <a href="https://github.com/OthmaneBlial/Rivet/issues">Issues</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a> ·
+  <a href="SECURITY.md">Security</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/OthmaneBlial/Rivet/releases"><img src="https://img.shields.io/github/v/release/OthmaneBlial/Rivet?include_prereleases&label=latest%20release&style=flat-square" alt="Latest Rivet release" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-2ea44f?style=flat-square&logo=apache&logoColor=white" alt="Apache License 2.0" /></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built%20with-Rust-orange?style=flat-square&logo=rust&logoColor=white" alt="Built with Rust" /></a>
+  <a href="https://tauri.app/"><img src="https://img.shields.io/badge/desktop-Tauri%202-24c8db?style=flat-square" alt="Tauri 2 desktop application" /></a>
+  <img src="https://img.shields.io/badge/validation-local%20only-0f766e?style=flat-square" alt="Validation runs locally" />
+</p>
 
 **95% verified** · `███████████████████░`<br>
 Weighted evidence score: **95.04 / 100** · displayed conservatively as the
-whole-number floor<br>
-Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
-not against a claim of Jenkins feature parity. The percentage only counts
-behavior backed by current tests or an exercised local workflow; incomplete
-and unverified work remains at zero until it passes its gate.
+whole-number floor. This measures the weighted product scope in
+[ROADMAP.md](ROADMAP.md), not Jenkins parity.
 
-Last verified update: **2026-09-14** · native pipeline execution, priority-aware
-FIFO queue with bounded anti-starvation aging and pause/resume controls,
-SQLite history, CLI workflow, headless API, Tauri desktop/logo, and Git/SCM
-clone/inspection, local/remote project onboarding, server-side project bootstrap
-cloning into explicit destinations, and CLI project bootstrap cloning,
-persisted build-source identity, recursive Git submodule preparation,
-live queue telemetry, durable
-event replay, quiet engine offline recovery, explicit Git preparation at build
-admission, parameterized builds, local artifact storage and retention pruning,
-protected server
-transport with safe request IDs and structured method/route/status tracing,
-build retry, pre-execution queue cancellation, build artifact
-downloads with checksum-verified streaming and integrity headers, a priority-ordered queue snapshot and rendered queue control room,
-and a light-default desktop theme with an accessible dark-mode
-toggle, persistent UTC cron schedules with repository-poll remote/fetch
-configuration, server dispatch, desktop schedule and upstream-gate controls, signed generic
-webhook delivery with idempotent redelivery, GitHub repository-dispatch
-revision triggers, and signed Bitbucket push/pull-request revision triggers,
-durable internal upstream-pipeline triggers with passed-build gating,
-cycle rejection, idempotent delivery claims, and restart reconciliation,
-provider-trigger mappings for signed GitHub workflow, GitLab pipeline, and
-Bitbucket commit-status completion events,
-policy-backed API identities with role/project authorization,
-secret-parameter redaction/masking, a passphrase-encrypted SCM credential vault
-with typed HTTP/SSH credentials, non-secret credential references, project allow-lists,
-deployment-specific OS-keychain service/account isolation, and local user accounts
-with Argon2id password verification, opaque sessions, and a packaged desktop launch with an
-ephemeral loopback engine origin plus bridge retry/offline recovery, project-scoped local CI cache restore and
-save, explicit Docker/Podman container command assembly with bounded workspace mounts,
-and a bounded Jenkinsfile migration analyzer with line-level support findings
-plus safe drafts for deterministic shell steps and statically typed primitive
-parameters, exposed through the headless
-API and rendered in the desktop control room. The server also exposes
-administrator-only subprocess extension lifecycle status and start/stop
-controls, reflected in the desktop view. A capability-free WASM runtime now
-supports an explicit JSON ABI with no host imports, bounded linear memory,
-bounded output, and fuel metering. Seven bounded build, detail, log, artifact,
-and annotation host methods are available under explicit extension permissions;
-annotation writes are persisted with optional stage scope.
-The
-server also exposes a
-versioned agent handshake/heartbeat registry with online/stale state, capacity-aware
-matching, a reconnecting heartbeat CLI client, and a rendered fleet view. Pipeline
-steps can declare exact remote requirements, including optional CPU cores and
-memory in MiB; the local runner refuses those steps until assignment exists. A
-matching agent can now reserve executor, CPU, and memory capacity atomically,
-receive a bounded workspace archive, execute the assigned pipeline through the
-shared Rust runner, and relay typed events, output, and cancellation. Remote artifact
-bundles now return through a bounded, checksum-verified channel. Persisted event
-projection also ignores exact redelivery of an already recorded domain event by
-its SHA-256 identity. If the assigned
-agent disconnects, the server makes at most one replacement-agent attempt and
-closes unfinished steps, stages, and builds as failed when recovery is
-unavailable. That replacement budget and the selected replacement agent now
-survive a server restart, so recovery cannot silently reset its retry limit.
-Steps may also use a bounded, cancellation-aware retry policy shared by local
-and assigned-agent execution. On startup, persisted incomplete builds are
-reconciled idempotently so a crashed server cannot leave history stuck forever.
-Non-secret remote attempts additionally retain their plan and redacted
-parameters and are redispatched with the same build identity when a compatible
-agent returns; attempts that require secret values fail closed.
-Bounded session-scoped agent delivery now uses versioned delivery IDs, ACKs,
-duplicate suppression, and timed retransmission. Remote execution events also
-carry a durable attempt identity and monotone sequence; SQLite atomically records
-that identity with the build projection, so replay after a server restart is
-applied at most once and conflicting reuse is rejected. Bounded retry recovery
-is durable locally. Authenticated deployments persist bounded success/failure audit records
-without request bodies or Bearer values and expose them only to administrators.
-Server deployments expose an authenticated Prometheus-compatible `/api/v1/metrics`
-surface with bounded queue, capacity, project, and active-build gauges; health
-and readiness remain the public probes. Server deployments can exchange an
-authenticated API token for a twelve-hour
-opaque session token; only its SHA-256 digest and scoped principal snapshot are
-persisted, and the current session can be revoked. User accounts and external
-identity providers remain future gates.
+## See Rivet in action
 
-The repository includes a local-only release gate. It runs the workspace tests,
-builds the optimized CLI, builds the desktop web client, checks the native
-Tauri host, produces and launches a non-signed macOS `Rivet.app` bundle while
-checking its embedded loopback engine, exercises real SCM clone plus
-create-project/run/history/inspect/logs workflows against temporary data,
-exercises a real server queue with priority ordering and queued cancellation,
-captures live compatibility snapshots, exercises authenticated local deployment
-hardening including an administrator shutdown operation, verifies a checksum-backed local backup/restore of SQLite state and
-stored artifacts with a non-destructive replacement path, copies the CLI into a
-temporary release directory, and writes a
-versioned SHA-256 manifest:
+[![Watch the Rivet desktop demo](assets/demo/rivet-desktop-demo.gif)](https://github.com/OthmaneBlial/Rivet/releases/download/v0.1.0-alpha/rivet-desktop-demo.mp4)
+
+The 50-second preview shows the real macOS control room, a passed local
+pipeline, the Jenkinsfile migration assistant, queue visibility, remote-agent
+status, and the light/dark workspace. [Watch or download the full MP4](https://github.com/OthmaneBlial/Rivet/releases/download/v0.1.0-alpha/rivet-desktop-demo.mp4).
+
+## Why Rivet exists
+
+CI/CD tools are powerful, but the operator often has to reconstruct what is
+happening from scattered logs, opaque configuration, queue state, and provider
+callbacks. Rivet keeps the execution model explicit:
+
+- the pipeline is a versioned TOML file;
+- each build has a durable identity, source snapshot, stage state, logs, and
+  history;
+- queue admission, cancellation, retry, and resource requirements are visible;
+- the same Rust core powers the CLI, headless server, and desktop client.
+
+The result is a small, auditable foundation for local development, self-hosted
+automation, and future distributed runners.
+
+## What Rivet gives you
+
+### Define a pipeline you can review
+
+`Rivetfile.toml` uses explicit executable and argument arrays. Pipelines support
+validated stage dependencies, stable topological ordering, parallel independent
+stages, parameters, deterministic conditional stages with explicit `skipped`
+outcomes, timeouts, and declared artifacts.
+
+### Run and observe the whole build
+
+The native process runner streams stdout and stderr with bounded line
+retention, supports cancellation and cleanup, and records typed build events.
+The scheduler provides FIFO ordering, bounded priorities, per-project/global
+capacity, pause/resume, queue telemetry, and pre-execution cancellation.
+
+Build details, stage movement, live output, retry actions, checksummed artifact
+downloads, retention pruning, and project-scoped local CI cache operations are
+available through the CLI, API, and desktop control room.
+
+### Connect real repositories and triggers
+
+Rivet can inspect Git source at build admission and exercise clone, checkout,
+fetch, clean, submodule, and explicit revision preparation. It supports local
+project onboarding, remote clone onboarding into an explicit destination,
+repository polling, persistent UTC cron schedules, signed generic webhooks,
+internal passed-build gates, and provider completion mappings for GitHub
+Actions, GitLab CI, and Bitbucket Pipelines.
+
+### Add capacity without losing the signal
+
+Remote agents register through a versioned authenticated protocol, advertise
+executor/CPU/memory capabilities, receive compatible assignments, run through
+the shared Rust pipeline runner, and relay typed events, output, cancellation,
+artifacts, and bounded retry/recovery state.
+
+### Operate with deliberate boundaries
+
+The Tauri desktop client embeds a loopback Rust engine and starts in light mode,
+with a persistent dark-mode toggle. The headless server provides health and
+readiness probes, scoped API identities, opaque sessions, audit records,
+authenticated metrics, graceful shutdown, and a bounded extension surface.
+The local credential vault encrypts provider credentials and keeps projects
+scoped to opaque references rather than ordinary pipeline records.
+
+## Screenshots
+
+| Pipeline control room | Migration assistant |
+| --- | --- |
+| ![Rivet pipeline control room in light mode](assets/screenshots/rivet-pipeline-light.png) | ![Rivet Jenkinsfile migration assistant in dark mode](assets/screenshots/rivet-migration-dark.png) |
+
+| Queue control room | Remote-agent fleet |
+| --- | --- |
+| ![Rivet queue control room](assets/screenshots/rivet-queue-dark.png) | ![Rivet remote agent fleet](assets/screenshots/rivet-agents-dark.png) |
+
+The interface is intentionally honest about boundaries: unavailable engine
+state, experimental areas, empty queues, and future work are shown in the UI
+instead of being presented as completed functionality.
+
+## Quick start
+
+The first public release is a source-oriented alpha. The current repository
+does not require Docker or Podman for the local pipeline path.
+
+### Requirements
+
+- Rust stable and Cargo
+- Git
+- Node.js and npm for the desktop client
+- Tauri desktop prerequisites for the operating system where you build the UI
+
+The checked-in local validation and release smoke path is verified on macOS.
+Windows and Linux packaging, clean-install behavior, and target-platform
+interoperability still need their own evidence.
+
+### Run the CLI against a repository
+
+```sh
+git clone https://github.com/OthmaneBlial/Rivet.git
+cd Rivet
+
+cargo run -p rivet -- init .
+cargo run -p rivet -- project create rivet --repository .
+cargo run -p rivet -- run rivet
+cargo run -p rivet -- builds rivet
+cargo run -p rivet -- inspect rivet --build 1
+cargo run -p rivet -- logs rivet --build 1
+```
+
+The sample `Rivetfile.toml` runs the repository formatter and workspace tests.
+For a short, dependency-light walkthrough use
+[`examples/demo/Rivetfile.toml`](examples/demo/Rivetfile.toml), which is also
+the pipeline used for the checked-in desktop demo capture.
+
+### Run the desktop control room
+
+```sh
+cd apps/desktop
+npm install
+npm run tauri dev
+```
+
+Use **New project** to connect a local checkout or bootstrap a remote clone.
+The app starts in light mode; use the top-right theme control to switch to
+dark mode. The theme preference is persisted locally.
+
+## Download
+
+[`v0.1.0-alpha`](https://github.com/OthmaneBlial/Rivet/releases/tag/v0.1.0-alpha)
+contains:
+
+- an optimized macOS arm64 CLI binary;
+- an unsigned macOS `Rivet.app` bundle for local evaluation;
+- SHA-256 checksums and the local validation manifest;
+- the demo MP4 used by this README.
+
+The macOS bundle is unsigned and is not notarized. macOS may ask you to confirm
+the first launch. There are no Windows or Linux installers in this release.
+
+## How it works
+
+```text
+Rivetfile.toml
+      │ parsed and validated by rivet-core
+      ▼
+Queue + scheduler ───────► local Rust process runner
+      │                              │
+      │                              ├── stage events / logs / artifacts
+      │                              ▼
+      ├──────────────────────► SQLite history + local cache
+      │
+      ├── REST + WebSocket API ──► CLI / Tauri control room
+      │
+      └── authenticated agent protocol ──► compatible remote workers
+```
+
+The native boundary owns process execution, filesystem access, Git/SCM
+operations, persistence, credentials, cancellation, and transport. The web
+client is an interaction layer over typed HTTP/WebSocket and Tauri commands.
+
+## Technology
+
+- **Rust 2024 workspace** for domain contracts, execution, storage, SCM,
+  authentication, credentials, extensions, server transport, and CLI behavior.
+- **SQLite** for migrations, build projections, event replay, schedules, cache
+  metadata, audit records, and artifact metadata.
+- **Axum/Tokio HTTP + WebSocket transport** for the headless server and live
+  build events.
+- **React + TypeScript + Vite** for the operator interface.
+- **Tauri 2** for a native desktop bundle with an ephemeral loopback engine
+  origin.
+- **WASM and subprocess extension contracts** with bounded frames and explicit
+  permissions; filesystem, network, process, and clock capabilities are not
+  exposed to WASM modules.
+
+## Security and privacy
+
+Rivet is designed for local-first operation, but it is not a security product
+or a hosted service. Review the [security policy](SECURITY.md) and keep these
+boundaries in mind:
+
+- never commit tokens, private keys, passwords, or real provider payloads;
+- use opaque credential IDs and the encrypted local vault for SCM/provider
+  secrets;
+- use an exact CORS allow-list and authenticated transport for remote binds;
+- treat container declarations, remote agents, extensions, and migration drafts
+  as capabilities that require deliberate review;
+- use disposable repositories and loopback fixtures for protocol testing.
+
+## Current status
+
+The repository currently reports **95.04 / 100 weighted evidence points** and
+displays **95% verified**. This is an engineering progress measure, not a
+promise of complete platform coverage.
+
+| Boundary | Status |
+| --- | --- |
+| Rust pipeline model, local runner, SQLite history, CLI workflow | **Working and locally tested** |
+| Headless API, WebSocket events, queue controls, schedules, triggers, artifacts, cache | **Working slices with local evidence** |
+| Tauri control room, light default, dark mode, offline recovery, packaged loopback engine | **Working slice; final window/release QA remains** |
+| Remote-agent protocol and shared-runner execution | **Working local vertical slice** |
+| GitHub/GitLab/Bitbucket signed completion mappings | **Working locally; provider deployment evidence remains** |
+| Docker/Podman runtime behavior, external identity providers, signed installers, Windows/Linux packages | **Planned or unverified** |
+| Jenkinsfile migration | **Experimental analyzer; review every finding and draft** |
+
+See the [weighted roadmap](ROADMAP.md) for the exact gates and denominator.
+
+## Building and validating from source
+
+Format, test, and build the core locally:
+
+```sh
+cargo fmt --all -- --check
+cargo test --workspace
+(cd apps/desktop && npm install && npm run build)
+```
+
+Run the full macOS release gate:
 
 ```sh
 ./scripts/local-release-check.sh
 ```
 
-The release gate first runs `scripts/local-progress-check.sh`, which verifies
-that the README percentage matches the weighted evidence calculation, that
-repository hygiene checks pass, and that no GitHub Actions workflow has been
-added.
-
-The loopback API allow-list includes the normal Vite origin (`1420`) and its
-local fallback (`1421`) plus the Tauri origins. Remote deployments must provide
-their own exact `--allow-origin` values and authentication.
-
-The deployment smoke checks public health/readiness, token-protected API
-routes, exact security/request-ID headers, rejects an unauthenticated public
-bind, verifies graceful SIGTERM shutdown and an authenticated administrator
-shutdown operation, and checks that the token is absent from server logs and
-persisted data. This produces a locally verifiable artifact, not a signed
-installer, store submission, or hosted CI result.
-
-The headless server handles SIGINT/SIGTERM with a graceful HTTP shutdown and
-stops its schedule and upstream-trigger dispatchers after the listener closes. Authenticated
-administrators can request the same lifecycle operation with
-`POST /api/v1/admin/shutdown`; the server returns `202` only after the global
-`administer` permission check. Rivet's extension surface is intentionally a
-separate, versioned contract.
-`rivet-extension-protocol` validates WASM or direct-subprocess manifests,
-declared permissions, relative entrypoints, and bounded length-prefixed JSON
-frames. An optional local manifest directory is loaded with strict regular
-file checks and duplicate-ID rejection, then exposed through
-`GET /api/v1/extensions`; the desktop control room mirrors that model and
-reports the validated catalog. The extension crate also provides a bounded
-subprocess lifecycle manager: it resolves only regular executables below an
-explicit root, rejects symlink/path escapes, permits one session per ID, and
-checks the declared permission on every host request. The server exposes
-administrator-only runtime status, start/stop actions, and a permission-checked
-`POST /api/v1/extensions/<id>/request` invocation route; the desktop view
-reflects that state. The bounded WASM runtime accepts only the
-documented JSON ABI, denies all module imports, caps module/memory/output
-sizes, and meters execution fuel. Filesystem, network, process, and clock
-capabilities are not exposed to WASM modules. Seven host methods are now
-versioned: `builds.list` (project UUID), `build.details`, `build.logs`,
-`build.annotations`, and `build.artifacts` (build UUID) are bounded reads;
-`build.annotate` persists a bounded annotation with an optional stage UUID; and
-`build.trigger` queues a real project build with validated parameters and
-priority. Each requires its matching declared permission, caps returned records,
-and wraps the original input with a host protocol version; unknown extension
-methods receive their original input unchanged.
-
-The project is being developed as working vertical slices. The current slice
-defines a versioned TOML pipeline model with explicit executable/argument
-arrays, validated repository-scoped workspaces, dependency-checked stage DAGs,
-stable topological execution order, parallel independent stages, deterministic
-parameter-gated stages with explicit `skipped` outcomes, persisted domain-safe
-IDs, and typed build events. Arbitrary expression conditions remain future
-work; this is not Jenkins parity and does not claim production readiness yet.
-
-## Workspace
-
-```text
-crates/
-  rivet-core/        domain model, pipeline format, and event schema
-  rivet-runner/      process execution, queue, and pipeline orchestration
-  rivet-server/      headless REST/WebSocket transport
-  rivet-storage/     SQLite persistence, migrations, and event projection
-  rivet-extension-protocol/ bounded WASM/subprocess extension contract
-  rivet-credentials/ encrypted local provider credentials
-  rivet-scm/         direct Git adapter and SCM boundary
-  rivet-cli/         local operator interface and first runnable slice
-apps/desktop/       Tauri client (next vertical slice)
-compat/             measured Jenkins/Rivet compatibility data
-rivet-compat/       normalized local behavior comparison harness
-```
-
-## Validate the current slice
-
-```sh
-cargo test --workspace
-cargo fmt --all -- --check
-```
-
-Validation is intentionally local for this repository; there is no GitHub
-Actions workflow to consume hosted CI minutes.
-
-## Run a local build
-
-From a repository containing `Rivetfile.toml`:
-
-```sh
-cargo run -p rivet -- init .
-cargo run -p rivet -- project create rivet --repository .
-cargo run -p rivet -- project create release \
-  --repository-url https://github.com/example/project.git \
-  --clone-destination /secure/workspaces/project --branch main --depth 20
-cargo run -p rivet -- run rivet
-cargo run -p rivet -- run rivet --priority 20
-cargo run -p rivet -- builds rivet
-cargo run -p rivet -- inspect rivet --build 1
-cargo run -p rivet -- logs rivet --build 1
-cargo run -p rivet -- cancel rivet --build 1 --server http://127.0.0.1:7878
-cargo run -p rivet -- poll rivet --server http://127.0.0.1:7878 --token-file /secure/path/rivet.token
-```
-
-The build command uses the Rust queue, real child processes, live event
-projection, and SQLite history. For Git repositories, the build record also
-captures the commit, reference, remote, and dirty state observed at admission.
-Use `--priority -100..100` to move urgent builds ahead of older queued work;
-equal priorities retain FIFO order and per-project/global capacity limits still
-apply. The HTTP build body accepts the same `priority` field. Press Ctrl-C
-during a running step to exercise the local cancellation path. The `cancel`
-command sends one authenticated request to a running server; pass
-`--token-file` for a private Bearer token. Mutations are not retried after a
-network interruption, avoiding duplicate operator actions.
-The `poll` command sends one authenticated repository-change request to a
-server, optionally with `--fetch --remote <name> --credential-id <id>`; the
-credential is only an ID and its secret stays in the server-side vault.
-
-The process runner streams stdout and stderr independently while retaining at
-most 64 KiB of any single line. An unterminated line that exceeds the bound is
-emitted with an explicit truncation marker, so a noisy tool cannot grow one
-in-memory buffer without limit.
-
-Administrators can stop new admissions without interrupting running builds with
-`POST /api/v1/queue/pause`, inspect the `paused` field from `GET
-/api/v1/queue`, and reopen admissions with `POST /api/v1/queue/resume`.
-
-Internal upstream triggers connect one Rivet project to another without a
-container runtime. Create a relation with an authenticated build-capable
-request on the downstream project:
-
-```sh
-curl -X POST http://127.0.0.1:7878/api/v1/projects/release/upstream-triggers \
-  -H 'content-type: application/json' \
-  -d '{"upstream_project":"test"}'
-```
-
-For a local data directory, the equivalent operator commands are:
-
-```sh
-cargo run -p rivet -- upstream create release --upstream test
-cargo run -p rivet -- upstream list release
-cargo run -p rivet -- upstream delete release <trigger-id>
-```
-
-`GET` on the same path lists relations and `DELETE
-/api/v1/projects/<downstream>/upstream-triggers/<trigger-id>` removes one.
-Only a persisted `passed` upstream build queues the downstream project. The
-delivery claim is durable and idempotent, cycles are rejected, and pending
-passed builds are reconciled when the server starts. The downstream build uses
-the common local or remote-agent queue path; it does not install or start
-Docker or Podman.
-
-Provider workflow completion triggers connect an external GitHub Actions,
-GitLab pipeline, or Bitbucket commit-status stream to one Rivet project.
-Configure the downstream mapping with a provider repository and, optionally,
-an exact workflow/pipeline name:
-
-```sh
-curl -X POST http://127.0.0.1:7878/api/v1/projects/release/provider-triggers \
-  -H 'content-type: application/json' \
-  -d '{"provider":"github","source_repository":"acme/widgets","source_pipeline":"Release"}'
-curl http://127.0.0.1:7878/api/v1/projects/release/provider-triggers
-curl -X DELETE http://127.0.0.1:7878/api/v1/projects/release/provider-triggers/<trigger-id>
-```
-
-The same local operator flow is available without HTTP:
-
-```sh
-cargo run -p rivet -- provider-trigger create release \
-  --provider github --source-repository acme/widgets \
-  --source-pipeline Release
-cargo run -p rivet -- provider-trigger list release
-cargo run -p rivet -- provider-trigger delete release <trigger-id>
-```
-
-After the signed webhook is received, a successful GitHub `workflow_run`,
-GitLab `Pipeline Hook`, or Bitbucket `repo:commit_status_created` /
-`repo:commit_status_updated` completion queues the exact provider commit
-through Rivet's normal SCM and queue path. Running, failed, cancelled, or
-unmatched completions are acknowledged without a build. Delivery claims
-are durable per mapping and provider event ID, so retries do not create a
-second build. The mapping stores only provider identifiers and never webhook
-or SCM secrets.
-
-## Run headless
-
-The same engine can run without the desktop client:
-
-```sh
-cargo run -p rivet -- --data-dir .rivet server --bind 127.0.0.1:7878
-```
-
-Loopback server mode is intended for the local desktop flow. A non-loopback
-bind requires a private token file:
-
-```sh
-chmod 600 /secure/path/rivet.token
-cargo run -p rivet -- --data-dir .rivet server \
-  --bind 0.0.0.0:7878 --token-file /secure/path/rivet.token
-```
-
-The token is held in memory, never printed, and never stored in the Rivet
-database. Liveness and readiness checks remain public; API and WebSocket routes require
-`Authorization: Bearer <token>` when authentication is enabled.
-
-The desktop client attaches a bounded request ID to each API call. It retries
-only idempotent reads while the engine is unreachable; state-changing requests
-are deliberately not retried automatically, so a lost response cannot create
-duplicate builds or mutations.
-
-Browser access uses an exact local/Tauri origin allow-list by default,
-including the HTTP origin used by Tauri 2 webviews. Add an exact remote
-console origin explicitly when needed; wildcard origins are rejected:
-
-```sh
-cargo run -p rivet -- --data-dir .rivet server \
-  --allow-origin https://console.example
-```
-
-For a server deployment with multiple roles, use a private authentication
-policy file. It stores only token digests, never raw Bearer tokens:
-
-```json
-{
-  "version": 1,
-  "tokens": [
-    {
-      "id": "operator",
-      "sha256": "<64 lowercase hex characters>",
-      "role": "operator",
-      "projects": ["rivet"],
-      "expires_at": "2026-12-31T23:59:59Z"
-    }
-  ]
-}
-```
-
-Protect the file and pass it to the server with
-`--auth-policy-file /secure/path/rivet.auth.json`. Supported roles are
-`admin`, `operator`, `viewer`, and `agent`; project routes are filtered and
-mutations require the corresponding role and scope. The legacy private
-`--token-file` remains available for a single unrestricted deployment.
-Operators can manage policy tokens locally without hand-computing digests. The
-create command generates the token, stores it in a new private `0600` file, and
-writes only its SHA-256 digest to the policy. Create a replacement before
-revoking the old token during rotation:
-
-```sh
-cargo run -p rivet -- auth token create operator \
-  --role operator --project rivet \
-  --expires-at 2026-12-31T23:59:59Z \
-  --policy-file /secure/path/rivet.auth.json \
-  --token-file /secure/path/rivet.operator.token
-cargo run -p rivet -- auth token list \
-  --policy-file /secure/path/rivet.auth.json
-cargo run -p rivet -- auth token revoke old-operator \
-  --policy-file /secure/path/rivet.auth.json
-```
-
-The token value is not printed by the command and is not recoverable from the
-policy. The optional RFC3339 `expires_at` value is enforced at request time;
-legacy records without it remain non-expiring. Authenticated requests also
-produce bounded audit records available to administrators at
-`GET /api/v1/audit`; request bodies and Bearer values are never recorded.
-
-For a server deployment, local human accounts can be kept in a separate private
-file. The CLI stores only Argon2id password verifiers and enforces a minimum
-password length, while account lifecycle output never includes password data:
-
-```sh
-cargo run -p rivet -- auth user create admin@example.test \
-  --role admin --users-file /secure/path/rivet.users.json \
-  --password-file /secure/path/admin.password
-cargo run -p rivet -- auth user list \
-  --users-file /secure/path/rivet.users.json
-cargo run -p rivet -- --data-dir .rivet server \
-  --bind 0.0.0.0:7878 --auth-users-file /secure/path/rivet.users.json
-```
-
-The users file must be a private regular file. Accounts can be enabled,
-disabled, removed, or have their password rotated with the corresponding
-`auth user` commands; the last active administrator cannot be disabled or
-removed. `POST /api/v1/auth/login` accepts a username and password and returns
-one opaque twelve-hour session token. Use it as `Authorization: Bearer
-<session-token>` and revoke it with `DELETE /api/v1/auth/sessions/current`.
-Rivet stores only the session digest in SQLite, expires sessions at lookup time,
-prunes expired/revoked rows, and records login and session lifecycle events in
-the administrator audit stream. External identity providers remain a future
-gate.
-
-Recorded Jenkins/Rivet behavior snapshots can be compared locally with the
-same explicit normalizer used by the live capture adapters:
-
-```sh
-cargo run -p rivet -- compat compare ./compat/fixtures/sequential-build.json
-```
-
-The command exits non-zero when normalized stage, step, parameter, artifact, or
-log semantics differ. The checked-in fixture exercises provider status spelling,
-CRLF handling, checksum prefixes, and redaction markers. Capture a real Rivet
-build or a Jenkins build through their HTTP APIs, using private token files and
-private `0600` snapshot outputs:
-
-```sh
-cargo run -p rivet -- compat capture-rivet rivet-e2e \
-  --server http://127.0.0.1:7878 --build 1 \
-  --output /secure/path/rivet.snapshot.json
-cargo run -p rivet -- compat capture-jenkins "folder/service" \
-  --server https://jenkins.example.test --build 42 \
-  --username ci-bot --token-file /secure/path/jenkins.token \
-  --output /secure/path/jenkins.snapshot.json
-cargo run -p rivet -- compat assemble \
-  --scenario sequential-build \
-  --jenkins /secure/path/jenkins.snapshot.json \
-  --rivet /secure/path/rivet.snapshot.json \
-  --output /secure/path/comparison.json
-```
-
-Responses are bounded before JSON parsing, Jenkins secret-looking parameter
-names are redacted, and console/log capture is opt-in with `--include-logs`.
-The local release gate exercises both adapters against a real local Rivet server
-and a protocol-compatible Jenkins HTTP fixture; a permanent corpus captured
-from a deployed Jenkins instance remains a future gate.
-
-Extension manifests can be loaded by the headless server from an explicit
-local directory:
-
-```sh
-cargo run -p rivet -- --data-dir .rivet server \
-  --extension-manifest-dir /secure/path/rivet-extensions
-```
-
-Only `.json` regular files are considered. Manifests are validated for
-protocol version, relative entrypoint, unique ID, and declared permissions;
-the catalog does not execute or auto-grant an extension.
-
-The versioned API currently exposes public liveness at `/api/v1/health` and a
-public SQLite-backed readiness probe at `/api/v1/ready`, plus projects, queued
-builds, build details, persisted logs, cancellation, a live queue snapshot, durable replay,
-and a per-build WebSocket event stream under `/api/v1/`. It also exposes
-persisted UTC cron schedules with create/list/pause/resume/delete operations,
-automatic server dispatch, Git repository inspection, and an explicit prepare
-operation for fetch/checkout/clean workflows. The CLI supports explicit
-repository cloning into a new or empty destination, and `project create` can
-register a project from a remote repository in one command when
-`--repository-url` and an explicit `--clone-destination` are supplied. The API
-can also clone a remote repository when the request supplies `repository_url`
-and an explicit empty `clone_destination`; optional `branch`, `depth`, `revision`,
-`submodules`, and non-secret `credential_id` fields use the same bounded Git
-adapter and deployment SSH host-key policy. The server returns
-`202 Accepted` when a build is queued. A build request may opt into Git
-fetching, revision checkout, workspace cleaning, and explicit recursive
-submodule initialization; the default remains inspection-only. Clients read
-durable state from the build resource and
-subscribe to live events separately. Log reads are bounded by default and
-support `?after=<sequence>&limit=<1..10000>` pagination; a full page exposes
-`X-Rivet-Log-Next-After` for the next cursor.
-
-For repositories that do not have a provider webhook configured, an
-authenticated `POST /api/v1/projects/<project>/repository-changes` endpoint
-polls the local Git checkout and compares its observed revision with the
-latest build. It can optionally fetch a named remote with an explicit Rivet
-credential ID, then queues the exact observed revision once. Concurrent or
-repeated polls are durably deduplicated and report `queued`, `unchanged`,
-`already_queued`, or `already_checking`; this is a local repository poller,
-not a claim of provider-side event delivery.
-
-Generic webhook delivery is available at `POST /api/v1/webhooks/generic`. The
-server verifies `X-Rivet-Signature: sha256=<hex HMAC-SHA256 of the raw body>`
-before accepting this payload shape:
-
-```json
-{
-  "event_id": "provider-delivery-123",
-  "project": "rivet",
-  "revision": "main",
-  "remote": "origin",
-  "fetch": true,
-  "parameters": { "TARGET": "release" }
-}
-```
-
-Configure the signing key through a private file; Rivet trims the file's final
-newline, keeps the value in memory, and never stores or prints it:
-
-```sh
-chmod 600 /secure/path/rivet.webhook.secret
-cargo run -p rivet -- --data-dir .rivet server \
-  --webhook-secret-file /secure/path/rivet.webhook.secret
-```
-
-The same `event_id` can be retried safely: the first request queues one build,
-and later deliveries return a deduplicated response without creating another
-build. A non-loopback server still requires the separate Bearer token.
-
-The signed generic webhook also accepts an optional upstream reference:
-`{"upstream":{"project":"build","build":4,"status":"passed"}}`.
-Only a positive upstream build that is actually persisted as `passed` admits the
-downstream build; failed or cancelled upstream deliveries return `ignored`, and
-unknown or unrecorded upstream builds are rejected. This is a bounded trigger
-contract, not a claim of Jenkins upstream-job compatibility.
-
-Provider webhook adapters are available when their provider secret is supplied.
-The project name is part of the route, so the receiver never guesses a Rivet
-project from an untrusted repository name:
-
-```text
-POST /api/v1/webhooks/github/<rivet-project>
-POST /api/v1/webhooks/gitlab/<rivet-project>
-POST /api/v1/webhooks/bitbucket/<rivet-project>
-```
-
-GitHub accepts signed `push` and `pull_request` deliveries (and acknowledges
-`ping`) using `X-Hub-Signature-256`, `X-GitHub-Event`, and `X-GitHub-Delivery`.
-Signed `workflow_run` `completed` events can also feed an explicitly
-configured provider trigger using the run's exact `head_sha`; successful runs
-queue, while non-success conclusions are acknowledged as ignored. Other
-known signed GitHub repository lifecycle, review, deployment, and check events
-are acknowledged as ignored because they do not identify a new source
-revision; unknown event names remain explicitly rejected. GitLab
-accepts `Push Hook`, `Tag Push Hook`, and `Merge Request Hook` deliveries
-using the signed
-`webhook-id`/`webhook-timestamp`/`webhook-signature` headers; the legacy
-`X-Gitlab-Token` form is also accepted for installations that have not enabled
-the newer signing headers. Push adapters validate the commit SHA; PR/MR
-adapters accept only opened, reopened, or updated/synchronized actions, fetch
-the provider head ref through a bounded refspec, and then normalize to the same
-idempotent build admission path. A signed `Pipeline Hook` with `status =
-success` can feed an explicitly configured provider trigger using the exact
-pipeline SHA; other pipeline states are acknowledged as ignored. All adapters can attach a default non-secret
-Rivet credential ID for the fetch. Bitbucket Cloud accepts signed `repo:push`,
-`pullrequest:created`, and `pullrequest:updated` deliveries using
-`X-Hub-Signature`, `X-Event-Key`, and the per-delivery `X-Request-UUID` header.
-Deleted pushes are ignored, multi-ref pushes are rejected as ambiguous, and
-pull-request source refs are fetched through a bounded Bitbucket refspec.
-Other known signed Bitbucket repository, review, comment, commit-status, and
-pipeline-span lifecycle deliveries are acknowledged as ignored because they do
-not identify a new source revision for a Rivet build; unknown event keys remain
-explicitly rejected.
-Known signed GitLab issue, comment, release, deployment, job, and project
-lifecycle events are acknowledged as ignored for the same reason; configured
-pipeline completions are handled as described above, and unknown event names
-remain explicitly rejected.
-
-Configure the provider keys through private files and, when needed, point each
-adapter at its vault credential ID:
-
-```sh
-chmod 600 /secure/path/rivet.github-webhook.secret
-chmod 600 /secure/path/rivet.gitlab-webhook.secret
-chmod 600 /secure/path/rivet.bitbucket-webhook.secret
-cargo run -p rivet -- --data-dir .rivet server \
-  --github-webhook-secret-file /secure/path/rivet.github-webhook.secret \
-  --gitlab-webhook-secret-file /secure/path/rivet.gitlab-webhook.secret \
-  --bitbucket-webhook-secret-file /secure/path/rivet.bitbucket-webhook.secret \
-  --github-webhook-credential-id github \
-  --gitlab-webhook-credential-id gitlab \
-  --bitbucket-webhook-credential-id bitbucket \
-  --credentials-file /secure/path/rivet.credentials.vault \
-  --credentials-passphrase-file /secure/path/rivet.credentials.passphrase
-```
-
-The provider contracts are documented by [GitHub's webhook signature
-validation guide](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)
-and [GitLab's webhook integration documentation](https://docs.gitlab.com/user/project/integrations/webhooks/).
-Bitbucket's [event payload reference](https://support.atlassian.com/bitbucket-cloud/docs/event-payloads/)
-and [webhook security documentation](https://support.atlassian.com/bitbucket-cloud/docs/manage-webhooks/)
-define the event headers and HMAC contract used by this adapter.
-The current provider-side mapping is deliberately bounded to GitHub workflow
-completion, GitLab pipeline completion, and Bitbucket successful commit-status
-completion, with exact repository/workflow/status-name selectors and no
-provider API polling. Broader provider-event mapping and additional external
-pipeline systems remain future gates; event types that do not identify a
-source revision are acknowledged safely, while unknown event types remain
-rejected.
-
-SCM credentials use a local passphrase-encrypted vault. The CLI reads the
-passphrase and provider secret from private files, so neither value is placed
-in shell history or command-line arguments:
-
-```sh
-chmod 600 /secure/path/rivet.credentials.passphrase
-chmod 600 /secure/path/github.token
-cargo run -p rivet -- credential set github \
-  --username oauth2 \
-  --project release \
-  --secret-file /secure/path/github.token \
-  --passphrase-file /secure/path/rivet.credentials.passphrase \
-  --vault-file /secure/path/rivet.credentials.vault
-cargo run -p rivet -- credential set deploy-key \
-  --kind ssh-key --username git \
-  --secret-file /secure/path/deploy.key \
-  --passphrase-file /secure/path/rivet.credentials.passphrase \
-  --vault-file /secure/path/rivet.credentials.vault
-cargo run -p rivet -- credential list \
-  --passphrase-file /secure/path/rivet.credentials.passphrase \
-  --vault-file /secure/path/rivet.credentials.vault
-cargo run -p rivet -- scm prepare . --fetch --credential-id github \
-  --project release \
-  --credentials-file /secure/path/rivet.credentials.vault \
-  --credentials-passphrase-file /secure/path/rivet.credentials.passphrase
-cargo run -p rivet -- scm prepare . --fetch --revision main --clean --submodules
-cargo run -p rivet -- scm clone https://github.com/example/project.git ./project \
-  --branch main --depth 20 --submodules
-cargo run -p rivet -- scm prepare . --fetch --credential-id deploy-key \
-  --project release \
-  --ssh-known-hosts-file /secure/path/known_hosts \
-  --credentials-file /secure/path/rivet.credentials.vault \
-  --credentials-passphrase-file /secure/path/rivet.credentials.passphrase
-```
-
-Start the server with the same vault and a private passphrase file:
-
-```sh
-cargo run -p rivet -- --data-dir .rivet server \
-  --credentials-file /secure/path/rivet.credentials.vault \
-  --credentials-passphrase-file /secure/path/rivet.credentials.passphrase \
-  --ssh-known-hosts-file /secure/path/known_hosts
-```
-
-Build admission and explicit SCM preparation accept only the non-secret
-credential ID, for example `{ "remote": "origin", "fetch": true,
-"credential_id": "github" }`. Provider PR/MR deliveries additionally carry a
-validated `fetch_ref`. Rivet resolves the ID locally, passes HTTP Basic auth
-through ephemeral Git configuration or writes an SSH private key to a private
-temporary file for the lifetime of the Git process, and redacts credential
-material from command errors. SSH uses `BatchMode` and `IdentitiesOnly`; its
-`StrictHostKeyChecking=yes` policy now fails closed against unknown keys. By
-default OpenSSH's normal system/user known-hosts files are used. Operators can
-provide `--ssh-known-hosts-file` to `rivet run`, `scm prepare`, or `server`; the
-file must be a canonical regular non-symlink file that is not world-writable,
-and the server applies that deployment trust root to API, build, and webhook
-fetches. Rivet passes the file only to OpenSSH and never returns its contents.
-The vault stores authenticated ciphertext only. When the server is configured with the vault,
-administrators can manage its lifecycle through `GET /api/v1/credentials`,
-`PUT /api/v1/credentials/<id>`, and `DELETE /api/v1/credentials/<id>`.
-Responses contain only IDs, credential kinds, usernames, and non-secret project scopes;
-replacement and removal require the administrator permission and append a
-bounded audit event without recording the secret. A credential with no project
-scope is global for backwards compatibility; `--project` (repeatable) or the
-API `projects` array restricts it to named projects. Build admission, webhooks,
-`rivet run`, and `scm prepare --project` enforce that allow-list. The vault
-passphrase can also live in the operating-system credential store instead of a
-file:
-
-```sh
-cargo run -p rivet -- credential keychain-set rivet-server \
-  --passphrase-file /secure/path/rivet.credentials.passphrase
-cargo run -p rivet -- --data-dir .rivet server \
-  --credentials-file /secure/path/rivet.credentials.vault \
-  --credentials-keychain-account rivet-server
-```
-
-The keychain command uses a private passphrase file only during setup; Rivet
-then reads the passphrase from the OS store at server startup. There is no
-automatic plaintext-file fallback when the keychain mode is selected. A local
-macOS write/read/delete round-trip is covered by an explicit opt-in test;
-deployment-specific keychain prompts and policies still require validation on
-each target OS. Deployments can isolate the service namespace explicitly by
-passing `--service rivet-production` to `credential keychain-set` and
-`credential keychain-remove`, then passing
-`--credentials-keychain-service rivet-production` to `server`; omitting it
-preserves the compatibility service name `Rivet`. A custom service is rejected
-unless a keychain account is also selected.
-
-The desktop control room exposes the same admin-only lifecycle when the server
-has a vault configured: it shows credential IDs, usernames, and non-secret
-scopes, supports secure replacement/removal and project allow-lists, and clears
-the entered secret after each save. The API response still contains no secret
-material.
-
-The Pipelines view can pass the same non-secret SCM preparation options to a
-manual run or retry: explicit remote fetch, revision checkout, controlled
-cleanup, and a vault credential ID selected from the loaded summaries.
-
-It also loads the project's declared pipeline parameters through
-`GET /api/v1/projects/<name>/parameters`. Non-secret defaults and required
-fields are shown in the run form; choice, boolean, text, and password kinds use
-their corresponding controls. Choice and boolean values are validated by the
-engine, secret parameters use password inputs, are sent only with the explicit
-queue/retry request, and are cleared from the form after a successful
-admission. The server remains the source of truth for unknown, missing, or
-ill-typed values and never returns secret parameter contents.
-
-The same `--credential-id`, `--credentials-file`, and
-`--credentials-passphrase-file` flags can be passed to `rivet run` when a
-local build needs an authenticated fetch.
-
-Remote agents use a versioned WebSocket contract at
-`GET /api/v1/agents/connect`. Agents register capabilities such as operating
-system, architecture, Docker availability, labels, and executor capacity, then
-send monotone heartbeats. They may also advertise explicit allocatable
-`cpu_cores` and `memory_mb` capacity. `GET /api/v1/agents` reports the current
-ephemeral registry; silent agents become `stale` after the heartbeat window.
-`POST /api/v1/agents/match` accepts exact capability and resource requirements and
-excludes stale or saturated agents. Reservations account for every explicitly
-requested executor, CPU, and memory unit; an unknown running build fails closed
-for resource-constrained matching. A build with a remote step reserves a matching
-online agent, transfers the repository workspace in bounded chunks, executes it
-with the shared Rust runner, and persists the agent's typed build events and output.
-Cancellation is propagated to the agent, and declared artifacts return through
-the same bounded transfer with checksum verification before local storage.
-After an agent disconnect, the server makes one bounded replacement attempt and
-persists a terminal failed state when no replacement is available. The bounded
-replacement budget and selected agent are persisted, so a server restart
-resumes the current recovery slot instead of granting another one. Non-secret
-remote attempts can also be preserved and redispatched with the same build
-identity after a server restart. Remote event attempt IDs and sequences are
-persisted atomically with the event projection, making replay after restart
-idempotent and rejecting a conflicting sequence payload.
-
-Connect a worker for heartbeat and capability discovery:
-
-```sh
-cargo run -p rivet -- agent \
-  --server ws://127.0.0.1:7878/api/v1/agents/connect \
-  --name linux-builder --os linux --arch x86_64 \
-  --label build --executors 2 --cpu-cores 8 --memory-mb 16384
-```
-
-The CPU and memory flags are optional. A pipeline that declares either resource
-dimension only matches an agent that explicitly advertises that dimension; Rivet
-does not infer host memory or pretend that an unknown capacity is available.
-
-The command keeps its stable agent ID and reconnects with bounded backoff after a
-transport interruption. It accepts assignments, stages each workspace under an
-isolated build-specific directory, and uses the same Rust process runner as local
-execution. `--workspace-root` can select the local parent directory; the default
-is a temporary agent workspace. The transport is currently bounded to a 512 MiB
-workspace archive and rejects unsafe archive entries.
-
-The CLI exposes the same explicit SCM boundary, for example:
-
-```sh
-cargo run -p rivet -- run rivet --fetch --revision main --clean
-```
-
-Cleaning is never implicit.
-
-Completed builds can be retried without losing their original history. The
-retry creates a new build number and reuses the original non-secret resolved
-parameters unless the API caller supplies replacements. Secret parameters must
-be supplied again explicitly with `--param NAME=VALUE` on the CLI or in the
-API request body. SCM credential IDs are references only; their secret values
-are not persisted in build data or API responses.
-
-Schedules can also be managed from the CLI. Expressions use UTC and accept
-the familiar five-field form:
-
-```sh
-cargo run -p rivet -- schedule create rivet \
-  --name nightly --expression "0 2 * * *"
-cargo run -p rivet -- schedule create rivet \
-  --name poll-main --expression "*/5 * * * *" --trigger repository-poll \
-  --remote origin --fetch --credential-id scm-read
-cargo run -p rivet -- schedule list rivet
-```
-
-Schedules default to `build`, which admits one pipeline run at each due UTC
-occurrence. `--trigger repository-poll` instead inspects the project's local
-Git checkout at each occurrence and admits a build only for a revision not yet
-recorded for that project. Repository-poll schedules persist the selected
-remote, whether a fetch is requested, and only the opaque credential ID used
-to resolve a vault entry at dispatch time. The API accepts the same values in
-a `poll` object, and the desktop schedule form exposes the same controls.
-
-The first executable pipeline format is deliberately explicit:
-
-```toml
-version = 1
-name = "sample"
-
-[[stages]]
-name = "Test"
-
-[[stages.steps]]
-name = "unit"
-program = "cargo"
-args = ["test"]
-timeout_seconds = 300
-retries = 2
-retry_delay_seconds = 3
-[stages.steps.container]
-runtime = "podman"
-image = "rust:1.85"
-
-[environment]
-RUST_BACKTRACE = "1"
-```
-
-Build parameters and local artifacts are also explicit:
-
-```toml
-[[parameters]]
-name = "TARGET"
-default = "debug"
-
-[[parameters]]
-name = "RELEASE_CHANNEL"
-kind = "choice"
-choices = ["staging", "production"]
-default = "staging"
-
-[[parameters]]
-name = "PUBLISH"
-kind = "boolean"
-default = "false"
-
-[[parameters]]
-name = "DEPLOY_TOKEN"
-kind = "password"
-secret = true
-
-[[caches]]
-name = "rust-target"
-key = "rust-target-v1"
-fallback_keys = ["rust-target-default"]
-paths = ["target"]
-
-[[artifacts]]
-name = "bundle"
-paths = ["dist/**"]
-```
-
-Pipeline `environment` entries are non-secret defaults inherited by every
-step; step-level `env` entries override them, and resolved build parameters
-override pipeline defaults. Reserved `CI`/`RIVET_*` names are controlled by
-the runner. Keep secrets in secret parameters or the encrypted credential
-vault, never in the versioned pipeline file. Parameters are resolved per
-build and exposed to direct processes as environment variables. `string` and
-`text` values remain free-form, `boolean` accepts only `true` or `false`, and
-`choice` accepts only one of its declared values. Non-secret values are persisted for history; secret
-parameters cannot define defaults, are represented as `[redacted]` in stored
-build data and API responses, and are replaced with `***` in emitted logs.
-Failed or timed-out steps may request up to five additional attempts with a
-bounded, cancellation-aware delay. Every attempt emits its own step state and
-output while the build keeps one stable identity; this is distinct from
-retrying a completed build into a new build number.
-Cache paths use exact project-scoped primary and fallback keys, restore before
-the first stage, and save only after a successful build to an atomic archive
-under Rivet's local data directory; a missing or corrupt cache never fails the
-build. Artifact
-files stay inside the pipeline workspace, are copied to local Rivet storage
-with a SHA-256 checksum, and are available through the build artifacts API or
-`rivet artifacts`. Remote agents package only declared artifact matches and
-return them through bounded checksum-verified archive chunks before the build
-is marked passed. Retention pruning removes the oldest artifacts from completed
-builds under an explicit byte budget; active-build artifacts, symlinks, and
-non-regular paths are preserved.
-
-Old local cache archives can be removed with an explicit byte budget; only
-regular `.tar` entries are eligible, while symlinks and temporary files are
-left untouched:
-
-```sh
-cargo run -p rivet -- cache prune --max-bytes 5368709120
-cargo run -p rivet -- artifact prune --max-bytes 10737418240
-```
-
-Create a portable local recovery snapshot and restore it into an explicit
-directory:
-
-```sh
-cargo run -p rivet -- --data-dir .rivet backup --output /secure/rivet-backup
-cargo run -p rivet -- restore --backup /secure/rivet-backup --target /secure/rivet-restored
-```
-
-The backup uses SQLite's consistent snapshot operation, includes stored
-artifacts, and records a SHA-256 manifest. Existing restore targets require
-`--replace`; the previous directory is moved aside and never deleted. Derived
-caches and external credential vaults are intentionally separate and must be
-preserved independently. Stop the active server before replacing its data
-directory.
-
-A step can opt into explicit OCI runtime execution with `[stages.steps.container]`.
-Set `runtime = "podman"` to use Podman on a machine without Docker; the default
-is the legacy `docker` executable for existing pipeline files. The declaration
-supports bounded image pull policy, network selection, workspace-relative bind
-volumes, environment forwarding, validated working directories, separated
-arguments, `--init`, signal proxying, and automatic container cleanup. Rivet
-checks that the explicitly selected runtime executable exists before spawning
-anything and never installs or starts it. Local runtime-shim tests exercise
-both executable selections and the direct command handoff without installing
-Docker, starting a daemon, or pulling an image. Real
-Docker/Podman daemon behavior, image policy enforcement, and end-to-end artifact
-and cancellation behavior remain unverified on this machine.
-
-Inspect a Jenkinsfile locally before attempting a migration, or request a
-safe draft for simple quoted commands:
-
-```sh
-cargo run -p rivet -- analyze jenkinsfile --draft ./Jenkinsfile
-```
-
-The analyzer emits versioned JSON with supported, partial, and unsupported
-constructs, source line numbers, and Rivet mapping guidance. The optional
-draft emits a valid Rivetfile for simple, explicitly quoted `sh`/`bat` steps,
-static environment assignments, `string`, `text`, `booleanParam`, `choice`, and
-`password` parameters, and safe `archiveArtifacts` patterns. Ambiguous
-commands, dynamic values, unsupported parameter types, credentials, plugins,
-and lifecycle behavior stay in warnings.
-It never executes Groovy or plugin code; complex migration semantics still
-need manual review. Generated declarative stages retain Jenkins' sequential
-order through explicit Rivet dependencies, and the fixture suite keeps
-unsupported approval stages visible instead of silently dropping them.
-
-Shell parsing is not implicit. A later pipeline feature may add an explicit
-shell step with a documented threat boundary; direct process execution is the
-safe default.
-
-Inspect the source state behind a project with direct Git arguments:
-
-```sh
-cargo run -p rivet -- scm inspect .
-cargo run -p rivet -- scm prepare . --revision main --clean
-```
-
-`prepare --clean` is intentionally opt-in because it removes untracked files.
-The SCM test suite also exercises a real authenticated local HTTP fetch followed
-by detached checkout and untracked-file cleanup. Authentication is injected
-only into the Git child process; the credential does not enter `.git/config`,
-the returned snapshot, or persisted checkout state. Tracked local edits remain
-protected and must be resolved before checkout.
+The gate checks repository hygiene and progress consistency, Rust formatting
+and tests, the optimized CLI, the desktop web client, the native Tauri host,
+the unsigned macOS bundle and packaged loopback engine, real temporary-data
+SCM/CLI workflows, queue priority and cancellation, backup/restore,
+authentication, compatibility adapters, and deployment hardening. It writes a
+versioned SHA-256 manifest to a temporary release directory. The gate is local
+by design; this repository intentionally has no GitHub Actions workflow.
+
+## Roadmap
+
+The next meaningful gates are:
+
+- final packaged Tauri-window interaction and clean-install QA;
+- broader provider lifecycle/event coverage and deployment-specific keychain
+  evidence;
+- external identity providers and richer ownership workflows;
+- permanent differential compatibility evidence from a deployed Jenkins
+  instance;
+- broader container runtime, migration, platform, observability, and release
+  packaging coverage.
+
+Read [ROADMAP.md](ROADMAP.md) before treating a partial or experimental slice
+as production-ready.
+
+## Contributing
+
+The most useful contributions are reproducible and focused:
+
+1. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the relevant roadmap gate.
+2. Run the local checks before opening an issue or pull request.
+3. Include the operating system, exact command, fixture/repository shape, and
+   observed result.
+4. Contribute tests, fixtures, protocol evidence, documentation, or a small
+   vertical slice with its boundary clearly labelled.
+
+Please do not include secrets, private keys, provider tokens, real hostnames,
+customer repositories, or personal configuration in issues, screenshots, or
+pull requests.
+
+## License
+
+Rivet is released under the [Apache License 2.0](LICENSE).
