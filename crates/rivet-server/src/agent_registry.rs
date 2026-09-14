@@ -125,6 +125,7 @@ impl AgentRegistry {
         }
     }
 
+    #[cfg(test)]
     pub async fn register(
         &self,
         registration: AgentRegistration,
