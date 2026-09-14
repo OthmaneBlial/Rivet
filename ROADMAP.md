@@ -6,7 +6,7 @@ a Jenkins parity claim. A workstream advances only when its stated evidence is
 present in the current repository and the relevant checks pass.
 
 The current verified total is **95 / 100 points** (**95.02 weighted evidence
-points**, displayed conservatively as 94%).
+points**, displayed conservatively as 95%).
 
 | Workstream | Weight | Current state | Gate for completion |
 | --- | ---: | --- | --- |
