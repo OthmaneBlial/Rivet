@@ -672,8 +672,51 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::fs;
+    use std::path::Path;
     use std::time::Instant;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn install_runtime_shim(directory: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fake_runtime = directory.join("fake-runtime");
+        fs::create_dir(&fake_runtime).expect("runtime directory");
+        let podman = fake_runtime.join("podman");
+        fs::write(
+            &podman,
+            r#"#!/bin/sh
+set -eu
+workspace=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    run) shift ;;
+    --volume)
+      [ -n "$workspace" ] || workspace=${2%%:/rivet/workspace:rw}
+      shift 2
+      ;;
+    --env|--network|--pull|--workdir) shift 2 ;;
+    --rm|--init|--sig-proxy=true) shift ;;
+    *)
+      image=$1
+      shift
+      break
+      ;;
+  esac
+done
+test -n "$workspace"
+cd "$workspace"
+exec "$@"
+"#,
+        )
+        .expect("write runtime shim");
+        let mut permissions = fs::metadata(&podman)
+            .expect("runtime metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&podman, permissions).expect("make runtime executable");
+        fake_runtime
+    }
 
     #[tokio::test]
     async fn executes_stages_in_order_and_emits_live_output() {
@@ -1239,45 +1282,9 @@ pull = "never"
     #[cfg(unix)]
     #[tokio::test]
     async fn executes_container_command_through_a_runtime_shim_without_shell_interpolation() {
-        use std::os::unix::fs::PermissionsExt;
-
         let directory = tempdir().expect("workspace");
         fs::create_dir(directory.path().join("cache")).expect("cache directory");
-        let fake_runtime = directory.path().join("fake-runtime");
-        fs::create_dir(&fake_runtime).expect("runtime directory");
-        let podman = fake_runtime.join("podman");
-        fs::write(
-            &podman,
-            r#"#!/bin/sh
-set -eu
-workspace=
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    run) shift ;;
-    --volume)
-      [ -n "$workspace" ] || workspace=${2%%:/rivet/workspace:rw}
-      shift 2
-      ;;
-    --env|--network|--pull|--workdir) shift 2 ;;
-    --rm|--init|--sig-proxy=true) shift ;;
-    *)
-      image=$1
-      shift
-      break
-      ;;
-  esac
-done
-test -n "$workspace"
-cd "$workspace"
-exec "$@"
-"#,
-        )
-        .expect("write runtime shim");
-        let mut permissions = fs::metadata(&podman)
-            .expect("runtime metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&podman, permissions).expect("make runtime executable");
+        let fake_runtime = install_runtime_shim(directory.path());
 
         let pipeline = Pipeline::from_toml_str(
             r#"
@@ -1321,6 +1328,97 @@ network = "none"
         }
         assert_eq!(result.outcome, ProcessOutcome::Passed);
         assert!(lines.iter().any(|line| line == "container-ok"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn container_timeout_is_enforced_through_a_runtime_shim() {
+        let directory = tempdir().expect("workspace");
+        let fake_runtime = install_runtime_shim(directory.path());
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "container-timeout"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "sh"
+args = ["-c", "sleep 30"]
+timeout_seconds = 1
+[stages.steps.container]
+runtime = "podman"
+image = "fixture/runtime:1"
+pull = "never"
+"#,
+        )
+        .expect("container pipeline");
+        let plan =
+            ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut spec = build_process_spec(
+            &plan.stages[0].steps[0],
+            directory.path(),
+            directory.path().to_owned(),
+            BTreeMap::new(),
+        );
+        let original_path = std::env::var_os("PATH").expect("PATH");
+        let mut runtime_path = fake_runtime.into_os_string();
+        runtime_path.push(":");
+        runtime_path.push(original_path);
+        spec.env
+            .insert("PATH".into(), runtime_path.to_string_lossy().into_owned());
+        let (tx, _rx) = mpsc::channel(8);
+        let result = run_process(spec, CancellationToken::new(), tx)
+            .await
+            .expect("container timeout");
+        assert_eq!(result.outcome, ProcessOutcome::TimedOut);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn container_cancellation_is_enforced_through_a_runtime_shim() {
+        let directory = tempdir().expect("workspace");
+        let fake_runtime = install_runtime_shim(directory.path());
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "container-cancellation"
+[[stages]]
+name = "Test"
+[[stages.steps]]
+name = "unit"
+program = "sh"
+args = ["-c", "sleep 30"]
+[stages.steps.container]
+runtime = "podman"
+image = "fixture/runtime:1"
+pull = "never"
+"#,
+        )
+        .expect("container pipeline");
+        let plan =
+            ExecutionPlan::from_pipeline(&pipeline, uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut spec = build_process_spec(
+            &plan.stages[0].steps[0],
+            directory.path(),
+            directory.path().to_owned(),
+            BTreeMap::new(),
+        );
+        let original_path = std::env::var_os("PATH").expect("PATH");
+        let mut runtime_path = fake_runtime.into_os_string();
+        runtime_path.push(":");
+        runtime_path.push(original_path);
+        spec.env
+            .insert("PATH".into(), runtime_path.to_string_lossy().into_owned());
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(run_process(spec, cancellation.clone(), mpsc::channel(8).0));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancellation.cancel();
+        let result = task
+            .await
+            .expect("container cancellation")
+            .expect("process");
+        assert_eq!(result.outcome, ProcessOutcome::Cancelled);
     }
 
     #[tokio::test]
