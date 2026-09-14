@@ -134,7 +134,6 @@ impl CacheStore {
             if archive_path.is_file() {
                 return Ok(false);
             }
-            fs::rename(&temporary_path, &archive_path)?;
             let digest_path = digest_path(&archive_path);
             let digest_temporary_path =
                 self.root
@@ -155,6 +154,12 @@ impl CacheStore {
                 let _ = fs::remove_file(&digest_temporary_path);
             }
             digest_result?;
+            // Publish the checksum first. A reader can therefore never see a
+            // newly published archive without its integrity metadata.
+            if let Err(error) = fs::rename(&temporary_path, &archive_path) {
+                let _ = fs::remove_file(&digest_path);
+                return Err(error.into());
+            }
             Ok(true)
         })();
         if result.is_err() {
