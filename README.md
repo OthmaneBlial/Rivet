@@ -453,7 +453,10 @@ POST /api/v1/webhooks/bitbucket/<rivet-project>
 
 GitHub accepts signed `push` and `pull_request` deliveries (and acknowledges
 `ping`) using `X-Hub-Signature-256`, `X-GitHub-Event`, and `X-GitHub-Delivery`.
-GitLab accepts `Push Hook`, `Tag Push Hook`, and `Merge Request Hook` deliveries
+Known signed GitHub repository lifecycle, review, deployment, check, and
+workflow events are acknowledged as ignored because they do not identify a
+new source revision; unknown event names remain explicitly rejected. GitLab
+accepts `Push Hook`, `Tag Push Hook`, and `Merge Request Hook` deliveries
 using the signed
 `webhook-id`/`webhook-timestamp`/`webhook-signature` headers; the legacy
 `X-Gitlab-Token` form is also accepted for installations that have not enabled
@@ -470,6 +473,9 @@ Other known signed Bitbucket repository, review, comment, commit-status, and
 pipeline-span lifecycle deliveries are acknowledged as ignored because they do
 not identify a new source revision for a Rivet build; unknown event keys remain
 explicitly rejected.
+Known signed GitLab issue, comment, release, deployment, job, pipeline, and
+project lifecycle events are acknowledged as ignored for the same reason;
+unknown event names remain explicitly rejected.
 
 Configure the provider keys through private files and, when needed, point each
 adapter at its vault credential ID:
@@ -495,8 +501,9 @@ and [GitLab's webhook integration documentation](https://docs.gitlab.com/user/pr
 Bitbucket's [event payload reference](https://support.atlassian.com/bitbucket-cloud/docs/event-payloads/)
 and [webhook security documentation](https://support.atlassian.com/bitbucket-cloud/docs/manage-webhooks/)
 define the event headers and HMAC contract used by this adapter.
-Broader provider event coverage and provider-side upstream-trigger mapping
-remain future gates.
+Provider-side upstream-trigger mapping remains a future gate; event types that
+do not identify a source revision are acknowledged safely, while unknown event
+types remain rejected.
 
 SCM credentials use a local passphrase-encrypted vault. The CLI reads the
 passphrase and provider secret from private files, so neither value is placed

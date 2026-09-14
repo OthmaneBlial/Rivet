@@ -3141,6 +3141,77 @@ fn normalize_github_webhook(
                 upstream: None,
             }))
         }
+        // Repository webhooks can be configured for many non-source events.
+        // They are valid signed deliveries, but they do not identify a new
+        // revision for a Rivet build. Acknowledge them after authentication
+        // and delivery-ID validation so GitHub does not retry a successful
+        // delivery as an integration failure.
+        "branch_protection_configuration"
+        | "branch_protection_rule"
+        | "check_run"
+        | "check_suite"
+        | "code_scanning_alert"
+        | "commit_comment"
+        | "create"
+        | "custom_property"
+        | "custom_property_values"
+        | "delete"
+        | "dependabot_alert"
+        | "deployment"
+        | "deployment_protection_rule"
+        | "deployment_review"
+        | "deployment_status"
+        | "discussion"
+        | "discussion_comment"
+        | "fork"
+        | "gollum"
+        | "installation"
+        | "installation_repositories"
+        | "installation_target"
+        | "issue_comment"
+        | "issues"
+        | "label"
+        | "marketplace_purchase"
+        | "member"
+        | "membership"
+        | "merge_group"
+        | "meta"
+        | "milestone"
+        | "org_block"
+        | "organization"
+        | "package"
+        | "page_build"
+        | "personal_access_token_request"
+        | "project"
+        | "project_card"
+        | "project_column"
+        | "projects_v2"
+        | "projects_v2_item"
+        | "projects_v2_status_update"
+        | "public"
+        | "pull_request_review"
+        | "pull_request_review_comment"
+        | "pull_request_review_thread"
+        | "release"
+        | "repository"
+        | "repository_advisory"
+        | "repository_import"
+        | "repository_ruleset"
+        | "repository_vulnerability_alert"
+        | "secret_scanning_alert"
+        | "secret_scanning_alert_location"
+        | "secret_scanning_scan"
+        | "security_advisory"
+        | "security_and_analysis"
+        | "sponsorship"
+        | "star"
+        | "status"
+        | "team"
+        | "team_add"
+        | "watch"
+        | "workflow_dispatch"
+        | "workflow_job"
+        | "workflow_run" => Ok(None),
         _ => Err(ApiError::BadRequest(format!(
             "unsupported GitHub webhook event: {event}"
         ))),
@@ -3223,6 +3294,28 @@ fn normalize_gitlab_webhook(
                 upstream: None,
             }))
         }
+        // GitLab project/group webhooks also deliver issue, review, release,
+        // deployment, job, and pipeline lifecycle events. They are valid
+        // signed messages, but none of these event types identifies a new
+        // source revision for the current adapter.
+        "Comment Hook"
+        | "Confidential Comment Hook"
+        | "Confidential Issue Hook"
+        | "Deployment Hook"
+        | "Emoji Hook"
+        | "Feature Flag Hook"
+        | "Issue Hook"
+        | "Job Hook"
+        | "Member Hook"
+        | "Milestone Hook"
+        | "Note Hook"
+        | "Package Hook"
+        | "Pipeline Hook"
+        | "Project Hook"
+        | "Release Hook"
+        | "Subgroup Hook"
+        | "Vulnerability Hook"
+        | "Wiki Page Hook" => Ok(None),
         _ => Err(ApiError::BadRequest(format!(
             "unsupported GitLab webhook event: {event}"
         ))),
@@ -9300,6 +9393,88 @@ program = "true"
     }
 
     #[test]
+    fn github_signed_lifecycle_events_are_acknowledged_without_builds() {
+        let ignored_events = [
+            "branch_protection_rule",
+            "check_run",
+            "check_suite",
+            "commit_comment",
+            "create",
+            "delete",
+            "deployment",
+            "deployment_status",
+            "discussion",
+            "discussion_comment",
+            "fork",
+            "issue_comment",
+            "issues",
+            "member",
+            "milestone",
+            "pull_request_review",
+            "pull_request_review_comment",
+            "release",
+            "repository",
+            "status",
+            "workflow_job",
+            "workflow_run",
+        ];
+
+        for (index, event) in ignored_events.into_iter().enumerate() {
+            let body = br#"{}"#;
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-github-event",
+                HeaderValue::from_str(event).expect("event header"),
+            );
+            headers.insert(
+                "x-github-delivery",
+                HeaderValue::from_str(&format!("github-ignored-{index}")).expect("delivery header"),
+            );
+            headers.insert(
+                "x-hub-signature-256",
+                HeaderValue::from_str(&sign_webhook("github-fixture-secret", body))
+                    .expect("signature"),
+            );
+
+            assert!(
+                normalize_github_webhook(
+                    b"github-fixture-secret",
+                    &headers,
+                    body,
+                    "demo".into(),
+                    None,
+                )
+                .expect("lifecycle event should be accepted")
+                .is_none(),
+                "event {event} should not queue a build"
+            );
+        }
+
+        let unknown = br#"{}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", HeaderValue::from_static("future_event"));
+        headers.insert(
+            "x-github-delivery",
+            HeaderValue::from_static("github-unknown-1"),
+        );
+        headers.insert(
+            "x-hub-signature-256",
+            HeaderValue::from_str(&sign_webhook("github-fixture-secret", unknown))
+                .expect("signature"),
+        );
+        assert!(matches!(
+            normalize_github_webhook(
+                b"github-fixture-secret",
+                &headers,
+                unknown,
+                "demo".into(),
+                None,
+            ),
+            Err(ApiError::BadRequest(message)) if message.contains("future_event")
+        ));
+    }
+
+    #[test]
     fn gitlab_signed_push_webhook_checks_timestamp_and_normalizes_event_id() {
         let signing_key = b"gitlab-signing-fixture";
         let signing_token = format!("whsec_{}", STANDARD.encode(signing_key));
@@ -9384,6 +9559,105 @@ program = "true"
             Some("+refs/merge-requests/7/head:refs/remotes/origin/merge-requests/7")
         );
         assert!(request.fetch);
+    }
+
+    #[test]
+    fn gitlab_signed_lifecycle_events_are_acknowledged_without_builds() {
+        let ignored_events = [
+            "Comment Hook",
+            "Confidential Comment Hook",
+            "Confidential Issue Hook",
+            "Deployment Hook",
+            "Emoji Hook",
+            "Feature Flag Hook",
+            "Issue Hook",
+            "Job Hook",
+            "Member Hook",
+            "Milestone Hook",
+            "Note Hook",
+            "Package Hook",
+            "Pipeline Hook",
+            "Project Hook",
+            "Release Hook",
+            "Subgroup Hook",
+            "Vulnerability Hook",
+            "Wiki Page Hook",
+        ];
+        let signing_key = b"gitlab-signing-fixture";
+        let signing_token = format!("whsec_{}", STANDARD.encode(signing_key));
+
+        for (index, event) in ignored_events.into_iter().enumerate() {
+            let message_id = format!("gitlab-ignored-{index}");
+            let timestamp = Utc::now().timestamp();
+            let body = br#"{}"#;
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-gitlab-event",
+                HeaderValue::from_str(event).expect("event header"),
+            );
+            headers.insert(
+                "webhook-id",
+                HeaderValue::from_str(&message_id).expect("message ID"),
+            );
+            headers.insert(
+                "webhook-timestamp",
+                HeaderValue::from_str(&timestamp.to_string()).expect("timestamp"),
+            );
+            headers.insert(
+                "webhook-signature",
+                HeaderValue::from_str(&sign_gitlab_webhook(
+                    signing_key,
+                    &message_id,
+                    timestamp,
+                    body,
+                ))
+                .expect("signature"),
+            );
+
+            assert!(
+                normalize_gitlab_webhook(
+                    signing_token.as_bytes(),
+                    &headers,
+                    body,
+                    "demo".into(),
+                    None,
+                )
+                .expect("lifecycle event should be accepted")
+                .is_none(),
+                "event {event} should not queue a build"
+            );
+        }
+
+        let body = br#"{}"#;
+        let message_id = "gitlab-unknown-1";
+        let timestamp = Utc::now().timestamp();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", HeaderValue::from_static("Future Hook"));
+        headers.insert("webhook-id", HeaderValue::from_static(message_id));
+        headers.insert(
+            "webhook-timestamp",
+            HeaderValue::from_str(&timestamp.to_string()).expect("timestamp"),
+        );
+        headers.insert(
+            "webhook-signature",
+            HeaderValue::from_str(&sign_gitlab_webhook(
+                signing_key,
+                message_id,
+                timestamp,
+                body,
+            ))
+            .expect("signature"),
+        );
+        assert!(matches!(
+            normalize_gitlab_webhook(
+                signing_token.as_bytes(),
+                &headers,
+                body,
+                "demo".into(),
+                None,
+            ),
+            Err(ApiError::BadRequest(message)) if message.contains("Future Hook")
+        ));
     }
 
     #[test]
