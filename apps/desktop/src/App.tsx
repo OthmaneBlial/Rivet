@@ -6,9 +6,11 @@ import {
   credentials as fetchCredentials,
   createProject,
   createSchedule,
+  createProviderTrigger,
   createUpstreamTrigger,
   deleteCredential,
   deleteSchedule,
+  deleteProviderTrigger,
   deleteUpstreamTrigger,
   artifactUrl,
   analyzeJenkinsfile,
@@ -35,6 +37,7 @@ import {
   stopExtension,
   setCredential,
   schedules,
+  providerTriggers,
   upstreamTriggers,
   updateSchedule,
 } from "./api";
@@ -49,6 +52,7 @@ import type {
   MigrationResponse,
   PipelineParameter,
   PipelineTriggerRecord,
+  ProviderTriggerRecord,
   Project,
   QueueItem,
   QueueStats,
@@ -181,6 +185,7 @@ function App() {
   const [artifactList, setArtifactList] = useState<ArtifactRecord[]>([]);
   const [scheduleList, setScheduleList] = useState<ScheduleRecord[]>([]);
   const [upstreamTriggerList, setUpstreamTriggerList] = useState<PipelineTriggerRecord[]>([]);
+  const [providerTriggerList, setProviderTriggerList] = useState<ProviderTriggerRecord[]>([]);
   const [parameterDefinitions, setParameterDefinitions] = useState<PipelineParameter[]>([]);
   const [parameterValues, setParameterValues] = useState<Record<string, string>>({});
   const [activeNav, setActiveNav] = useState("Pipelines");
@@ -197,6 +202,7 @@ function App() {
   const [showCreate, setShowCreate] = useState(false);
   const [showScheduleCreate, setShowScheduleCreate] = useState(false);
   const [showUpstreamCreate, setShowUpstreamCreate] = useState(false);
+  const [showProviderTriggerCreate, setShowProviderTriggerCreate] = useState(false);
   const [migrationSource, setMigrationSource] = useState(DEFAULT_JENKINSFILE);
   const [migrationResult, setMigrationResult] = useState<MigrationResponse | null>(null);
   const [migrationBusy, setMigrationBusy] = useState(false);
@@ -265,6 +271,19 @@ function App() {
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not load upstream triggers");
+    }
+  }, [engineOnline, projectName]);
+
+  const loadProviderTriggerList = useCallback(async () => {
+    if (!engineOnline || !projectName) {
+      setProviderTriggerList([]);
+      return;
+    }
+    try {
+      setProviderTriggerList(await providerTriggers(projectName));
+      setError(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not load provider triggers");
     }
   }, [engineOnline, projectName]);
 
@@ -360,6 +379,10 @@ function App() {
   useEffect(() => {
     void loadUpstreamTriggerList();
   }, [loadUpstreamTriggerList]);
+
+  useEffect(() => {
+    void loadProviderTriggerList();
+  }, [loadProviderTriggerList]);
 
   useEffect(() => {
     if (!engineOnline || !projectName) {
@@ -773,6 +796,45 @@ function App() {
     }
   }
 
+  async function submitProviderTrigger(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!projectName) return;
+    const form = new FormData(event.currentTarget);
+    const provider = String(form.get("provider_trigger_provider") ?? "github") as "github" | "gitlab";
+    const sourceRepository = String(form.get("provider_trigger_repository") ?? "").trim();
+    const sourcePipeline = String(form.get("provider_trigger_pipeline") ?? "").trim();
+    if (!sourceRepository) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await createProviderTrigger(projectName, {
+        provider,
+        source_repository: sourceRepository,
+        ...(sourcePipeline ? { source_pipeline: sourcePipeline } : {}),
+      });
+      await loadProviderTriggerList();
+      setShowProviderTriggerCreate(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not create provider trigger");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeProviderTrigger(trigger: ProviderTriggerRecord) {
+    if (!projectName) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await deleteProviderTrigger(projectName, trigger.id);
+      await loadProviderTriggerList();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not delete provider trigger");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function runMigrationAnalysis() {
     if (!migrationSource.trim()) {
       setError("Paste a Jenkinsfile before running the migration analysis.");
@@ -1025,6 +1087,7 @@ function App() {
                     setParameterValues({});
                     setPollMessage(null);
                     setShowUpstreamCreate(false);
+                    setShowProviderTriggerCreate(false);
                   }}
                 >
                   {projectsList.map((project) => <option key={project.id} value={project.name}>{project.name}</option>)}
@@ -1088,6 +1151,15 @@ function App() {
               onToggleCreate={() => setShowUpstreamCreate((current) => !current)}
               onSubmit={submitUpstreamTrigger}
               onDelete={removeUpstreamTrigger}
+            />
+
+            <ProviderTriggerPanel
+              triggers={providerTriggerList}
+              busy={busy || !engineOnline}
+              showCreate={showProviderTriggerCreate}
+              onToggleCreate={() => setShowProviderTriggerCreate((current) => !current)}
+              onSubmit={submitProviderTrigger}
+              onDelete={removeProviderTrigger}
             />
 
             <section className="section-head">
@@ -1473,6 +1545,60 @@ function UpstreamTriggerPanel({
               </div>
             );
           })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ProviderTriggerPanel({
+  triggers,
+  busy,
+  showCreate,
+  onToggleCreate,
+  onSubmit,
+  onDelete,
+}: {
+  triggers: ProviderTriggerRecord[];
+  busy: boolean;
+  showCreate: boolean;
+  onToggleCreate: () => void;
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
+  onDelete: (trigger: ProviderTriggerRecord) => void;
+}) {
+  return (
+    <section className="panel provider-trigger-panel" aria-label="Provider pipeline completion triggers">
+      <div className="panel-heading">
+        <div><span className="overline">External handoffs</span><h2>Provider triggers</h2></div>
+        <div className="provider-trigger-heading-actions">
+          <span className="panel-count">{triggers.length.toString().padStart(2, "0")}</span>
+          <button className="button button-quiet" type="button" disabled={busy} onClick={onToggleCreate}>{showCreate ? "Close" : "＋ Add provider"}</button>
+        </div>
+      </div>
+      <div className="provider-trigger-intro">
+        <span className="provider-trigger-signal" aria-hidden="true"><i /><i /><i /></span>
+        <p>Let a signed GitHub Actions or GitLab pipeline completion open this project at its exact commit.</p>
+      </div>
+      {showCreate && (
+        <form className="provider-trigger-form" onSubmit={onSubmit}>
+          <label>Provider<select name="provider_trigger_provider" defaultValue="github"><option value="github">GitHub Actions</option><option value="gitlab">GitLab CI</option></select></label>
+          <label>Source repository<input name="provider_trigger_repository" required placeholder="acme/widgets" autoComplete="off" /><small>Exact provider identity.</small></label>
+          <label>Workflow / pipeline <span className="optional">optional</span><input name="provider_trigger_pipeline" placeholder="Release" autoComplete="off" /><small>Blank matches any completion.</small></label>
+          <button className="button button-primary" type="submit" disabled={busy}>{busy ? "Connecting…" : "Connect handoff"}</button>
+        </form>
+      )}
+      {triggers.length === 0 ? (
+        <EmptyState text={showCreate ? "Add an exact repository selector to listen for completions." : "No external completion handoff is configured."} />
+      ) : (
+        <div className="provider-trigger-list">
+          {triggers.map((trigger) => (
+            <div className="provider-trigger-row" key={trigger.id}>
+              <span className={`provider-trigger-badge provider-${trigger.provider}`} aria-hidden="true">{trigger.provider === "github" ? "GH" : "GL"}</span>
+              <div className="provider-trigger-copy"><strong>{trigger.source_repository}</strong><small>{trigger.provider} · {trigger.source_pipeline ?? "any workflow / pipeline"} · signed success → current project</small></div>
+              <span className="provider-trigger-status">{trigger.enabled ? "listening" : "paused"}</span>
+              <button className="schedule-delete" type="button" disabled={busy} aria-label={`Delete ${trigger.provider} provider trigger`} onClick={() => onDelete(trigger)}>×</button>
+            </div>
+          ))}
         </div>
       )}
     </section>

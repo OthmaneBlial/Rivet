@@ -122,6 +122,16 @@ export interface PipelineTriggerRecord {
   created_at: string;
 }
 
+export interface ProviderTriggerRecord {
+  id: string;
+  downstream_project_id: string;
+  provider: "github" | "gitlab";
+  source_repository: string;
+  source_pipeline: string | null;
+  enabled: boolean;
+  created_at: string;
+}
+
 export interface QueueResponse {
   build: BuildRecord;
   status: BuildStatus;

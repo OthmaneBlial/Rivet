@@ -9,6 +9,7 @@ import type {
   PipelineParameter,
   Project,
   PipelineTriggerRecord,
+  ProviderTriggerRecord,
   QueueItem,
   QueueResponse,
   QueueStats,
@@ -394,6 +395,33 @@ export function createUpstreamTrigger(
 export function deleteUpstreamTrigger(project: string, id: string): Promise<void> {
   return request<void>(
     `/api/v1/projects/${encodeURIComponent(project)}/upstream-triggers/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function providerTriggers(project: string): Promise<ProviderTriggerRecord[]> {
+  return request<ProviderTriggerRecord[]>(
+    `/api/v1/projects/${encodeURIComponent(project)}/provider-triggers`,
+  );
+}
+
+export function createProviderTrigger(
+  project: string,
+  input: {
+    provider: "github" | "gitlab";
+    source_repository: string;
+    source_pipeline?: string;
+  },
+): Promise<ProviderTriggerRecord> {
+  return request<ProviderTriggerRecord>(
+    `/api/v1/projects/${encodeURIComponent(project)}/provider-triggers`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+export function deleteProviderTrigger(project: string, id: string): Promise<void> {
+  return request<void>(
+    `/api/v1/projects/${encodeURIComponent(project)}/provider-triggers/${encodeURIComponent(id)}`,
     { method: "DELETE" },
   );
 }
