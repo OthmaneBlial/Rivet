@@ -6,7 +6,7 @@
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -39,7 +39,7 @@ use rivet_scm::{
     GitSnapshot, GitSshCredential, ScmError, validate_known_hosts_file,
 };
 use rivet_storage::{
-    AnnotationRecord, ArtifactRecord, AuditEventRecord, BuildDetails, BuildRecord, LogRecord,
+    AnnotationRecord, ArtifactRecord, AuditEventRecord, BuildDetails, BuildRecord,
     RemoteAttemptRecord, SchedulePollConfig, ScheduleRecord, ScheduleTrigger, Storage,
     StorageError,
 };
@@ -120,6 +120,8 @@ const MAX_EXTENSION_LOG_RECORDS: usize = 500;
 const MAX_EXTENSION_ARTIFACT_RECORDS: usize = 100;
 const MAX_EXTENSION_ANNOTATION_RECORDS: usize = 100;
 const MAX_EXTENSION_TRIGGER_PARAMETERS: usize = 64;
+const DEFAULT_LOG_PAGE_SIZE: usize = 2_000;
+const MAX_LOG_PAGE_SIZE: usize = 10_000;
 
 struct PendingAgentDelivery {
     envelope: AgentTransportMessage,
@@ -650,6 +652,14 @@ struct PipelineParameterResponse {
     default: Option<String>,
     required: bool,
     choices: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LogQuery {
+    #[serde(default)]
+    after: Option<i64>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3731,11 +3741,36 @@ async fn get_logs(
     State(state): State<AppState>,
     AxumPath((name, number)): AxumPath<(String, i64)>,
     Extension(principal): Extension<Principal>,
-) -> Result<Json<Vec<LogRecord>>, ApiError> {
+    Query(query): Query<LogQuery>,
+) -> Result<Response, ApiError> {
     require_project(&principal, Permission::Read, &name)?;
     let project = project_by_name(&state.storage, &name)?;
     let build = build_by_number(&state.storage, project.id, &name, number)?;
-    Ok(Json(state.storage.logs(build.id)?))
+    let after = query.after.unwrap_or(-1);
+    if after < -1 {
+        return Err(ApiError::BadRequest(
+            "log cursor must be -1 or a non-negative sequence".into(),
+        ));
+    }
+    let limit = query.limit.unwrap_or(DEFAULT_LOG_PAGE_SIZE);
+    if !(1..=MAX_LOG_PAGE_SIZE).contains(&limit) {
+        return Err(ApiError::BadRequest(format!(
+            "log limit must be between 1 and {MAX_LOG_PAGE_SIZE}"
+        )));
+    }
+    let logs = state.storage.logs_page(build.id, after, limit)?;
+    let next_after = (logs.len() == limit)
+        .then(|| logs.last().map(|log| log.sequence))
+        .flatten();
+    let mut response = Json(logs).into_response();
+    if let Some(next_after) = next_after
+        && let Ok(value) = HeaderValue::from_str(&next_after.to_string())
+    {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-rivet-log-next-after"), value);
+    }
+    Ok(response)
 }
 
 async fn get_artifacts(
@@ -5589,6 +5624,73 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn logs_route_returns_bounded_pages_with_a_next_cursor() {
+        let pipeline = Pipeline::from_toml_str(
+            "version = 1\nname = \"logs-page\"\n[[stages]]\nname = \"Test\"\n[[stages.steps]]\nname = \"unit\"\nprogram = \"true\"\n",
+        )
+        .expect("pipeline");
+        let project = Project::new("logs-page", ".", "Rivetfile.toml").expect("project");
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let plan = ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), project.id);
+        let build = storage
+            .create_build(&project, &plan, &pipeline, None)
+            .expect("build");
+        let stage = &plan.stages[0];
+        let step = &stage.steps[0];
+        for line in ["first", "second"] {
+            storage
+                .apply_event(&BuildEvent::StepOutput {
+                    build_id: build.id,
+                    stage_id: stage.id,
+                    step_id: step.id,
+                    stream: rivet_core::LogStream::Stdout,
+                    line: line.into(),
+                    timestamp: Utc::now(),
+                })
+                .expect("log");
+        }
+
+        let response = router(AppState::new(storage.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/logs-page/builds/1/logs?limit=1")
+                    .body(Body::empty())
+                    .expect("logs request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-rivet-log-next-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body"),
+        )
+        .expect("JSON");
+        assert_eq!(body[0]["line"], "first");
+
+        let response = router(AppState::new(storage))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/logs-page/builds/1/logs?after=1&limit=10001")
+                    .body(Body::empty())
+                    .expect("invalid logs request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@
     {"id": "runner", "weight": 6, "completion": 1.0, "status": "verified"},
     {"id": "scheduler", "weight": 6, "completion": 0.998, "status": "partial"},
     {"id": "storage", "weight": 6, "completion": 1.0, "status": "verified"},
-    {"id": "api", "weight": 6, "completion": 0.998, "status": "partial"},
+    {"id": "api", "weight": 6, "completion": 0.999, "status": "partial"},
     {"id": "cli", "weight": 3, "completion": 1.0, "status": "verified"},
     {"id": "desktop", "weight": 10, "completion": 0.99, "status": "partial"},
     {"id": "scm", "weight": 8, "completion": 0.9998, "status": "partial"},

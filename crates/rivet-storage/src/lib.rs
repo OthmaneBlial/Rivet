@@ -23,6 +23,7 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 const MAX_AUDIT_PAGE_SIZE: usize = 1000;
+const MAX_LOG_PAGE_SIZE: usize = 10_000;
 const MAX_AUDIT_FIELD_BYTES: usize = 256;
 const SESSION_DIGEST_BYTES: usize = 32;
 const MAX_ANNOTATION_KIND_BYTES: usize = 64;
@@ -132,6 +133,8 @@ pub enum StorageError {
     InvalidSessionDigest,
     #[error("authentication session principal is invalid")]
     InvalidSessionPrincipal,
+    #[error("log page is invalid")]
+    InvalidLogPage,
     #[error("authentication session role is invalid")]
     InvalidSessionRole,
     #[error("invalid remote recovery attempt count in database: {0}")]
@@ -1716,6 +1719,41 @@ impl Storage {
             .collect()
     }
 
+    /// Read a bounded slice of build output after an inclusive sequence
+    /// cursor. The API layer can use this without loading an unbounded log
+    /// history into one response.
+    pub fn logs_page(
+        &self,
+        build_id: BuildId,
+        after_sequence: i64,
+        limit: usize,
+    ) -> Result<Vec<LogRecord>, StorageError> {
+        if after_sequence < -1 || !(1..=MAX_LOG_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::InvalidLogPage);
+        }
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT sequence, build_id, timestamp, stream, line
+             FROM build_logs
+             WHERE build_id = ?1 AND sequence > ?2
+             ORDER BY sequence ASC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![build_id.to_string(), after_sequence, limit as i64],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )?;
+        rows.map(|row| row.map_err(StorageError::from).and_then(parse_log))
+            .collect()
+    }
+
     pub fn events(&self, build_id: BuildId) -> Result<Vec<BuildEvent>, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
@@ -2840,6 +2878,53 @@ program = "true"
         assert_eq!(events.len(), 8);
         assert!(matches!(events[0], BuildEvent::BuildQueued { .. }));
         assert!(matches!(events[7], BuildEvent::BuildFinished { .. }));
+    }
+
+    #[test]
+    fn logs_page_uses_a_sequence_cursor_and_rejects_unbounded_limits() {
+        let (project, pipeline, plan) = fixture();
+        let storage = Storage::open_in_memory().expect("storage");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let build = storage
+            .create_build(&project, &plan, &pipeline, None)
+            .expect("build");
+        let stage = &plan.stages[0];
+        let step = &stage.steps[0];
+        for line in ["one", "two", "three"] {
+            storage
+                .apply_event(&BuildEvent::StepOutput {
+                    build_id: build.id,
+                    stage_id: stage.id,
+                    step_id: step.id,
+                    stream: LogStream::Stdout,
+                    line: line.into(),
+                    timestamp: Utc::now(),
+                })
+                .expect("log");
+        }
+
+        let first = storage.logs_page(build.id, -1, 2).expect("first page");
+        assert_eq!(
+            first
+                .iter()
+                .map(|log| log.line.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        let second = storage
+            .logs_page(build.id, first[1].sequence, 2)
+            .expect("second page");
+        assert_eq!(second[0].line, "three");
+        assert!(matches!(
+            storage.logs_page(build.id, -2, 2),
+            Err(StorageError::InvalidLogPage)
+        ));
+        assert!(matches!(
+            storage.logs_page(build.id, -1, 10_001),
+            Err(StorageError::InvalidLogPage)
+        ));
     }
 
     #[test]

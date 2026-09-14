@@ -389,7 +389,9 @@ adapter and deployment SSH host-key policy. The server returns
 fetching, revision checkout, workspace cleaning, and explicit recursive
 submodule initialization; the default remains inspection-only. Clients read
 durable state from the build resource and
-subscribe to live events separately.
+subscribe to live events separately. Log reads are bounded by default and
+support `?after=<sequence>&limit=<1..10000>` pagination; a full page exposes
+`X-Rivet-Log-Next-After` for the next cursor.
 
 For repositories that do not have a provider webhook configured, an
 authenticated `POST /api/v1/projects/<project>/repository-changes` endpoint
