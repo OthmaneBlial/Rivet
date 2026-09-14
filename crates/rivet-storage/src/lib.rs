@@ -34,7 +34,69 @@ pub struct Storage {
     connection: Arc<Mutex<Connection>>,
     database_path: Option<Arc<PathBuf>>,
     artifact_root: Arc<std::path::PathBuf>,
+    artifact_backend: Arc<dyn ArtifactBackend>,
     cache_root: Arc<std::path::PathBuf>,
+}
+
+/// Storage contract for build artifact objects. The database owns metadata;
+/// this backend owns bytes, allowing a future S3-compatible implementation to
+/// replace filesystem objects without changing pipeline or API records.
+pub trait ArtifactBackend: Send + Sync {
+    fn store(
+        &self,
+        build_id: BuildId,
+        artifact_id: Uuid,
+        source: &Path,
+    ) -> Result<(), StorageError>;
+    fn resolve(&self, build_id: BuildId, artifact_id: Uuid) -> Result<PathBuf, StorageError>;
+    fn remove(&self, build_id: BuildId, artifact_id: Uuid) -> Result<bool, StorageError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct FilesystemArtifactBackend {
+    root: Arc<PathBuf>,
+}
+
+impl FilesystemArtifactBackend {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root: Arc::new(root),
+        }
+    }
+}
+
+impl ArtifactBackend for FilesystemArtifactBackend {
+    fn store(
+        &self,
+        build_id: BuildId,
+        artifact_id: Uuid,
+        source: &Path,
+    ) -> Result<(), StorageError> {
+        let destination_dir = self.root.join(build_id.to_string());
+        fs::create_dir_all(&destination_dir)?;
+        fs::copy(source, destination_dir.join(artifact_id.to_string()))?;
+        Ok(())
+    }
+
+    fn resolve(&self, build_id: BuildId, artifact_id: Uuid) -> Result<PathBuf, StorageError> {
+        Ok(self
+            .root
+            .join(build_id.to_string())
+            .join(artifact_id.to_string()))
+    }
+
+    fn remove(&self, build_id: BuildId, artifact_id: Uuid) -> Result<bool, StorageError> {
+        let path = self.resolve(build_id, artifact_id)?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Ok(false),
+            Ok(_) => {
+                fs::remove_file(path)?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(StorageError::Filesystem(error)),
+        }
+    }
 }
 
 /// Counts produced by a consistent local storage backup.
@@ -545,7 +607,8 @@ impl Storage {
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             database_path: (path != Path::new(":memory:")).then(|| Arc::new(path.to_path_buf())),
-            artifact_root: Arc::new(artifact_root),
+            artifact_root: Arc::new(artifact_root.clone()),
+            artifact_backend: Arc::new(FilesystemArtifactBackend::new(artifact_root)),
             cache_root: Arc::new(cache_root),
         })
     }
@@ -2321,9 +2384,8 @@ impl Storage {
                 let expires_at = specification
                     .retention_days
                     .map(|days| created_at + chrono::Duration::days(i64::from(days)));
-                let destination_dir = self.artifact_root.join(build_id.to_string());
-                fs::create_dir_all(&destination_dir)?;
-                fs::copy(&source_path, destination_dir.join(artifact_id.to_string()))?;
+                self.artifact_backend
+                    .store(build_id, artifact_id, &source_path)?;
                 collected.push(ArtifactRecord {
                     id: artifact_id,
                     build_id,
@@ -2516,15 +2578,14 @@ impl Storage {
                 },
             )
             .optional()?;
-        row.map(parse_artifact).transpose().map(|artifact| {
-            artifact.map(|record| {
-                let path = self
-                    .artifact_root
-                    .join(record.build_id.to_string())
-                    .join(record.id.to_string());
-                (record, path)
+        let artifact = row.map(parse_artifact).transpose()?;
+        artifact
+            .map(|record| {
+                self.artifact_backend
+                    .resolve(record.build_id, record.id)
+                    .map(|path| (record, path))
             })
-        })
+            .transpose()
     }
 
     /// Remove oldest artifacts from completed builds until their recorded
@@ -2557,36 +2618,30 @@ impl Storage {
             })?;
             rows.map(|row| {
                 let artifact = parse_artifact(row?)?;
-                let path = self
-                    .artifact_root
-                    .join(artifact.build_id.to_string())
-                    .join(artifact.id.to_string());
-                Ok::<_, StorageError>((artifact, path))
+                Ok::<_, StorageError>(artifact)
             })
             .collect::<Result<Vec<_>, _>>()?
         };
 
-        let mut remaining_bytes = candidates.iter().fold(0_u64, |total, (artifact, _)| {
+        let mut remaining_bytes = candidates.iter().fold(0_u64, |total, artifact| {
             total.saturating_add(artifact.size_bytes)
         });
         let mut removed_entries = 0;
         let mut removed_bytes = 0_u64;
         let now = Utc::now();
-        for (artifact, path) in candidates {
+        for artifact in candidates {
             let expired = artifact
                 .expires_at
                 .is_some_and(|expires_at| expires_at <= now);
             if !expired && remaining_bytes <= max_bytes {
                 break;
             }
-            match fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.file_type().is_symlink() => continue,
-                Ok(metadata) if metadata.is_file() => fs::remove_file(&path)?,
-                Ok(_) => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(StorageError::Filesystem(error)),
+            if !self
+                .artifact_backend
+                .remove(artifact.build_id, artifact.id)?
+            {
+                continue;
             }
-
             let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
             let deleted = connection.execute(
                 "DELETE FROM build_artifacts WHERE id = ?1",
@@ -3401,6 +3456,38 @@ program = "true"
         .expect("pipeline");
         let plan = ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), project.id);
         (project, pipeline, plan)
+    }
+
+    #[test]
+    fn filesystem_artifact_backend_stores_resolves_and_removes_objects() {
+        let directory = tempdir().expect("tempdir");
+        let source = directory.path().join("artifact.txt");
+        fs::write(&source, "artifact payload").expect("source");
+        let backend = FilesystemArtifactBackend::new(directory.path().join("objects"));
+        let build_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+
+        backend
+            .store(build_id, artifact_id, &source)
+            .expect("store artifact");
+        let resolved = backend
+            .resolve(build_id, artifact_id)
+            .expect("resolve artifact");
+        assert_eq!(
+            fs::read_to_string(&resolved).expect("read artifact"),
+            "artifact payload"
+        );
+        assert!(
+            backend
+                .remove(build_id, artifact_id)
+                .expect("remove artifact")
+        );
+        assert!(!resolved.exists());
+        assert!(
+            backend
+                .remove(build_id, artifact_id)
+                .expect("remove missing artifact")
+        );
     }
 
     #[test]
