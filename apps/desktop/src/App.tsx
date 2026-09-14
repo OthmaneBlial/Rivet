@@ -180,6 +180,7 @@ function App() {
   const [credentialUsername, setCredentialUsername] = useState("");
   const [credentialSecret, setCredentialSecret] = useState("");
   const [credentialProjects, setCredentialProjects] = useState("");
+  const [credentialOwnerFilter, setCredentialOwnerFilter] = useState("");
   const [selectedBuild, setSelectedBuild] = useState<number | null>(null);
   const [details, setDetails] = useState<BuildDetails | null>(null);
   const [logLines, setLogLines] = useState<LogRecord[]>([]);
@@ -352,7 +353,7 @@ function App() {
   const loadCredentialList = useCallback(async (showError = activeNav === "Credentials") => {
     if (!engineOnline) return;
     try {
-      setCredentialList(await fetchCredentials());
+      setCredentialList(await fetchCredentials(credentialOwnerFilter.trim() || undefined));
       setCredentialsReady(true);
       if (showError) setCredentialError(null);
     } catch (cause) {
@@ -362,7 +363,7 @@ function App() {
         setCredentialError(cause instanceof Error ? cause.message : "Credential vault unavailable");
       }
     }
-  }, [activeNav, engineOnline]);
+  }, [activeNav, credentialOwnerFilter, engineOnline]);
 
   useEffect(() => {
     void initializeEngineOrigin();
@@ -1058,11 +1059,14 @@ function App() {
             username={credentialUsername}
             secret={credentialSecret}
             projects={credentialProjects}
+            ownerFilter={credentialOwnerFilter}
             onIdChange={setCredentialId}
             onKindChange={setCredentialKind}
             onUsernameChange={setCredentialUsername}
             onSecretChange={setCredentialSecret}
             onProjectsChange={setCredentialProjects}
+            onOwnerFilterChange={setCredentialOwnerFilter}
+            onApplyOwnerFilter={() => void loadCredentialList(true)}
             onSubmit={submitCredential}
             onEdit={editCredential}
             onRemove={removeCredential}
@@ -1681,11 +1685,14 @@ function CredentialsPanel({
   username,
   secret,
   projects,
+  ownerFilter,
   onIdChange,
   onKindChange,
   onUsernameChange,
   onSecretChange,
   onProjectsChange,
+  onOwnerFilterChange,
+  onApplyOwnerFilter,
   onSubmit,
   onEdit,
   onRemove,
@@ -1706,6 +1713,9 @@ function CredentialsPanel({
   onUsernameChange: (value: string) => void;
   onSecretChange: (value: string) => void;
   onProjectsChange: (value: string) => void;
+  ownerFilter: string;
+  onOwnerFilterChange: (value: string) => void;
+  onApplyOwnerFilter: () => void;
   onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
   onEdit: (credential: CredentialSummary) => void;
   onRemove: (credential: CredentialSummary) => void;
@@ -1775,6 +1785,10 @@ function CredentialsPanel({
               <div className="panel-heading">
                 <div><span className="overline">Inventory</span><h2>Known credentials</h2></div>
                 <span className="panel-count">{String(credentials.length).padStart(2, "0")}</span>
+              </div>
+              <div className="credential-filter">
+                <label htmlFor="credential-owner-filter">Owner filter<input id="credential-owner-filter" value={ownerFilter} onChange={(event) => onOwnerFilterChange(event.target.value)} placeholder="all identities" autoComplete="off" /></label>
+                <button className="button button-quiet" type="button" disabled={busy} onClick={onApplyOwnerFilter}>{ownerFilter.trim() ? "Filter" : "Show all"}</button>
               </div>
               {credentials.length === 0 ? (
                 <div className="credentials-list-empty"><span>∅</span><p>No provider credential is stored yet.</p></div>
