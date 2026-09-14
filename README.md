@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **94% verified** · `███████████████████░`<br>
-Weighted evidence score: **94.53 / 100** · displayed conservatively as the
+Weighted evidence score: **94.73 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -87,7 +87,9 @@ checking its embedded loopback engine, exercises real SCM clone plus
 create-project/run/history/inspect/logs workflows against temporary data,
 exercises a real server queue with priority ordering and queued cancellation,
 captures live compatibility snapshots, exercises authenticated local deployment
-hardening, copies the CLI into a temporary release directory, and writes a
+hardening, verifies a checksum-backed local backup/restore of SQLite state and
+stored artifacts with a non-destructive replacement path, copies the CLI into a
+temporary release directory, and writes a
 versioned SHA-256 manifest:
 
 ```sh
@@ -736,6 +738,21 @@ left untouched:
 cargo run -p rivet -- cache prune --max-bytes 5368709120
 cargo run -p rivet -- artifact prune --max-bytes 10737418240
 ```
+
+Create a portable local recovery snapshot and restore it into an explicit
+directory:
+
+```sh
+cargo run -p rivet -- --data-dir .rivet backup --output /secure/rivet-backup
+cargo run -p rivet -- restore --backup /secure/rivet-backup --target /secure/rivet-restored
+```
+
+The backup uses SQLite's consistent snapshot operation, includes stored
+artifacts, and records a SHA-256 manifest. Existing restore targets require
+`--replace`; the previous directory is moved aside and never deleted. Derived
+caches and external credential vaults are intentionally separate and must be
+preserved independently. Stop the active server before replacing its data
+directory.
 
 A step can opt into explicit OCI runtime execution with `[stages.steps.container]`.
 Set `runtime = "podman"` to use Podman on a machine without Docker; the default

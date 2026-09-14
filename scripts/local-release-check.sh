@@ -10,25 +10,25 @@ fi
 
 cd "$repo_root"
 
-echo "[1/13] checking local progress and repository boundaries"
+echo "[1/14] checking local progress and repository boundaries"
 ./scripts/local-progress-check.sh
 
-echo "[2/13] checking Rust formatting"
+echo "[2/14] checking Rust formatting"
 cargo fmt --all -- --check
 
-echo "[3/13] running the local Rust workspace tests"
+echo "[3/14] running the local Rust workspace tests"
 cargo test --workspace
 
-echo "[4/13] building the release CLI"
+echo "[4/14] building the release CLI"
 cargo build --release -p rivet
 
-echo "[5/13] building the desktop client"
+echo "[5/14] building the desktop client"
 (cd apps/desktop && npm run build)
 
-echo "[6/13] checking the native Tauri host"
+echo "[6/14] checking the native Tauri host"
 cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
 
-echo "[7/13] building the local Tauri macOS bundle"
+echo "[7/14] building the local Tauri macOS bundle"
 ./scripts/local-tauri-bundle-smoke.sh
 
 mkdir -p "$release_output"
@@ -43,22 +43,25 @@ else
     exit 1
 fi
 
-echo "[8/13] exercising the real local CLI workflow"
+echo "[8/14] exercising the real local CLI workflow"
 ./scripts/local-e2e-smoke.sh
 
-echo "[9/13] exercising the real server queue workflow"
+echo "[9/14] exercising the real server queue workflow"
 ./scripts/local-queue-smoke.sh
 
-echo "[10/13] exercising local user authentication"
+echo "[10/14] exercising local backup and restore"
+./scripts/local-backup-restore-smoke.sh
+
+echo "[11/14] exercising local user authentication"
 ./scripts/local-auth-smoke.sh
 
-echo "[11/13] exercising live compatibility capture adapters"
+echo "[12/14] exercising live compatibility capture adapters"
 ./scripts/local-compat-capture-smoke.sh
 
-echo "[12/13] exercising local deployment hardening"
+echo "[13/14] exercising local deployment hardening"
 ./scripts/local-deployment-smoke.sh
 
-echo "[13/13] writing the local release manifest"
+echo "[14/14] writing the local release manifest"
 jq -n \
     --arg commit "$(git rev-parse HEAD)" \
     --arg generated_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
@@ -67,7 +70,7 @@ jq -n \
     '{schema_version: 1, source_commit: $commit, generated_at: $generated_at,
       github_actions: false, checks: {format: true, workspace_tests: true,
       cli_release_build: true, desktop_web_build: true, tauri_host_check: true,
-      tauri_bundle_smoke: true, local_e2e_smoke: true, local_queue_smoke: true, local_auth_smoke: true, compat_capture_smoke: true,
+      tauri_bundle_smoke: true, local_e2e_smoke: true, local_queue_smoke: true, local_backup_restore_smoke: true, local_auth_smoke: true, compat_capture_smoke: true,
       local_deployment_smoke: true},
       artifacts: [{name: $binary, path: $binary, sha256: $sha256}]}' \
     > "$release_output/manifest.json"

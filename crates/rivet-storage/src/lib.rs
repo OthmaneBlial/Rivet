@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
@@ -31,8 +31,17 @@ const MAX_ANNOTATION_MESSAGE_BYTES: usize = 4096;
 #[derive(Clone)]
 pub struct Storage {
     connection: Arc<Mutex<Connection>>,
+    database_path: Option<Arc<PathBuf>>,
     artifact_root: Arc<std::path::PathBuf>,
     cache_root: Arc<std::path::PathBuf>,
+}
+
+/// Counts produced by a consistent local storage backup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageBackupReport {
+    pub database_bytes: u64,
+    pub artifact_files: usize,
+    pub artifact_bytes: u64,
 }
 
 fn apply_migration(
@@ -133,6 +142,14 @@ pub enum StorageError {
     InvalidRemoteEventIdentity,
     #[error("remote event sequence {sequence} was already recorded with a different payload")]
     RemoteEventSequenceConflict { sequence: u64 },
+    #[error("backups are unavailable for an in-memory database")]
+    BackupUnavailable,
+    #[error("backup destination already exists: {0}")]
+    BackupDestinationExists(PathBuf),
+    #[error("backup destination is inside the artifact store: {0}")]
+    BackupDestinationInsideArtifactStore(PathBuf),
+    #[error("artifact store contains an unsupported path: {0}")]
+    BackupUnsupportedArtifactPath(PathBuf),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -461,6 +478,7 @@ impl Storage {
         backfill_event_hashes(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            database_path: (path != Path::new(":memory:")).then(|| Arc::new(path.to_path_buf())),
             artifact_root: Arc::new(artifact_root),
             cache_root: Arc::new(cache_root),
         })
@@ -472,6 +490,73 @@ impl Storage {
 
     pub fn cache_root(&self) -> std::path::PathBuf {
         self.cache_root.as_ref().clone()
+    }
+
+    pub fn artifact_root(&self) -> PathBuf {
+        self.artifact_root.as_ref().clone()
+    }
+
+    /// Create a consistent, portable snapshot of the database and stored
+    /// artifacts. The destination must not already exist. Derived cache data
+    /// and external credential vaults are intentionally not included.
+    pub fn backup_to(&self, destination: &Path) -> Result<StorageBackupReport, StorageError> {
+        if self.database_path.is_none() {
+            return Err(StorageError::BackupUnavailable);
+        }
+        if destination.exists() {
+            return Err(StorageError::BackupDestinationExists(
+                destination.to_path_buf(),
+            ));
+        }
+
+        let artifact_root = fs::canonicalize(self.artifact_root.as_ref()).ok();
+        if let Some(artifact_root) = artifact_root.as_ref() {
+            let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+            fs::create_dir_all(parent)?;
+            let destination_name = destination
+                .file_name()
+                .ok_or_else(|| StorageError::BackupDestinationExists(destination.to_path_buf()))?;
+            let canonical_destination = fs::canonicalize(parent)?.join(destination_name);
+            if canonical_destination.starts_with(artifact_root) {
+                return Err(StorageError::BackupDestinationInsideArtifactStore(
+                    destination.to_path_buf(),
+                ));
+            }
+        } else if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        fs::create_dir(destination)?;
+        let result = (|| {
+            let database_destination = destination.join("rivet.db");
+            let database_destination = database_destination.to_string_lossy().into_owned();
+            let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+            connection.execute("VACUUM INTO ?1", [&database_destination])?;
+            drop(connection);
+
+            let database_bytes = fs::metadata(destination.join("rivet.db"))?.len();
+            let mut artifact_files = 0;
+            let mut artifact_bytes = 0_u64;
+            if let Some(artifact_root) = artifact_root {
+                let destination_root = destination.join("artifacts");
+                copy_artifact_tree(
+                    &artifact_root,
+                    &destination_root,
+                    &mut artifact_files,
+                    &mut artifact_bytes,
+                )?;
+            }
+            Ok(StorageBackupReport {
+                database_bytes,
+                artifact_files,
+                artifact_bytes,
+            })
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_dir_all(destination);
+        }
+        result
     }
 
     /// Run a read-only probe used by deployment readiness checks.
@@ -1964,6 +2049,46 @@ impl Storage {
     }
 }
 
+fn copy_artifact_tree(
+    source: &Path,
+    destination: &Path,
+    file_count: &mut usize,
+    byte_count: &mut u64,
+) -> Result<(), StorageError> {
+    if !source.is_dir() {
+        return Ok(());
+    }
+    for entry in WalkDir::new(source).follow_links(false) {
+        let entry = entry.map_err(|error| StorageError::ArtifactWalk(error.to_string()))?;
+        let relative = entry
+            .path()
+            .strip_prefix(source)
+            .map_err(|_| StorageError::BackupUnsupportedArtifactPath(entry.path().to_path_buf()))?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let target = destination.join(relative);
+        let file_type = entry.file_type();
+        if file_type.is_symlink() || (!file_type.is_dir() && !file_type.is_file()) {
+            return Err(StorageError::BackupUnsupportedArtifactPath(
+                relative.to_path_buf(),
+            ));
+        }
+        if file_type.is_dir() {
+            fs::create_dir_all(target)?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = fs::metadata(entry.path())?.len();
+        fs::copy(entry.path(), &target)?;
+        *file_count = (*file_count).saturating_add(1);
+        *byte_count = byte_count.saturating_add(bytes);
+    }
+    Ok(())
+}
+
 type RawProject = (String, String, String, String, String);
 type RawBuild = (
     String,
@@ -2913,6 +3038,71 @@ program = "true"
         drop(storage);
         let reopened = Storage::open(&database).expect("reopen");
         assert_eq!(reopened.artifacts(build.id).expect("artifacts"), collected);
+    }
+
+    #[test]
+    fn backup_is_consistent_and_copies_artifact_store() {
+        let directory = tempdir().expect("tempdir");
+        let workspace = directory.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("result.txt"), "backup me\n").expect("artifact");
+        let database = directory.path().join("rivet.db");
+        let project = Project::new(
+            "backup",
+            workspace.to_string_lossy().into_owned(),
+            workspace
+                .join("Rivetfile.toml")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .expect("project");
+        let pipeline = Pipeline::from_toml_str(
+            r#"
+version = 1
+name = "backup"
+[[artifacts]]
+name = "result"
+paths = ["result.txt"]
+[[stages]]
+name = "Build"
+[[stages.steps]]
+name = "unit"
+program = "true"
+"#,
+        )
+        .expect("pipeline");
+        let plan = ExecutionPlan::from_pipeline(&pipeline, Uuid::new_v4(), project.id);
+        let storage = Storage::open(&database).expect("open");
+        storage
+            .create_project(&project, &pipeline)
+            .expect("project");
+        let build = storage
+            .create_build(&project, &plan, &pipeline, None)
+            .expect("build");
+        let artifacts = storage
+            .collect_artifacts(build.id, &pipeline, &workspace)
+            .expect("collect artifacts");
+        let backup = directory.path().join("backup");
+        let report = storage.backup_to(&backup).expect("backup");
+        assert_eq!(report.artifact_files, 1);
+        assert_eq!(report.artifact_bytes, b"backup me\n".len() as u64);
+        assert_eq!(
+            fs::read_to_string(
+                backup
+                    .join("artifacts")
+                    .join(build.id.to_string())
+                    .join(artifacts[0].id.to_string())
+            )
+            .expect("backed up artifact"),
+            "backup me\n"
+        );
+
+        let reopened = Storage::open(backup.join("rivet.db")).expect("reopen backup");
+        assert_eq!(reopened.artifacts(build.id).expect("artifacts"), artifacts);
+        assert!(matches!(
+            storage.backup_to(&storage.artifact_root().join("nested")),
+            Err(StorageError::BackupDestinationInsideArtifactStore(_))
+        ));
     }
 
     #[test]

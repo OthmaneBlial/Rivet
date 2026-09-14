@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::future::Future;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -364,6 +364,24 @@ enum Command {
     Cache {
         #[command(subcommand)]
         command: CacheCommand,
+    },
+    /// Create a consistent local backup of SQLite state and stored artifacts.
+    Backup {
+        /// New directory that will contain rivet.db, artifacts/, and manifest.json.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Restore a local backup into an explicit target directory.
+    Restore {
+        /// Backup directory previously created by `rivet backup`.
+        #[arg(long)]
+        backup: PathBuf,
+        /// Target data directory. It must be empty/nonexistent unless --replace is set.
+        #[arg(long)]
+        target: PathBuf,
+        /// Move an existing target aside instead of overwriting or deleting it.
+        #[arg(long)]
+        replace: bool,
     },
     /// Analyze a Jenkinsfile without executing Groovy or plugin code.
     Analyze {
@@ -977,6 +995,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Credential { command } => manage_credentials(&cli.data_dir, command)?,
         Command::Auth { command } => manage_auth(&cli.data_dir, command)?,
         Command::Cache { command } => manage_cache(&cli.data_dir, command)?,
+        Command::Backup { output } => backup_storage(&cli.data_dir, &output)?,
+        Command::Restore {
+            backup,
+            target,
+            replace,
+        } => restore_storage(&backup, &target, replace)?,
         Command::Analyze { command } => analyze_file(command)?,
         Command::Compat { command } => compare_compatibility(command).await?,
         Command::Agent(args) => run_agent(args).await?,
@@ -2541,6 +2565,252 @@ async fn inspect_scm(command: ScmCommand) -> Result<(), Box<dyn std::error::Erro
 
 fn open_storage(data_dir: &Path) -> Result<Storage, Box<dyn std::error::Error>> {
     Ok(Storage::open(data_dir.join("rivet.db"))?)
+}
+
+const STORAGE_BACKUP_FORMAT: &str = "rivet-local-backup";
+const STORAGE_BACKUP_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StorageBackupManifest {
+    format: String,
+    version: u32,
+    created_at: String,
+    database_bytes: u64,
+    database_sha256: String,
+    artifact_files: usize,
+    artifact_bytes: u64,
+    includes_cache: bool,
+    includes_credentials: bool,
+}
+
+fn backup_storage(data_dir: &Path, output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = open_storage(data_dir)?;
+    let report = storage.backup_to(output)?;
+    let database_path = output.join("rivet.db");
+    let database_sha256 = sha256_regular_file(&database_path)?;
+    let manifest = StorageBackupManifest {
+        format: STORAGE_BACKUP_FORMAT.to_owned(),
+        version: STORAGE_BACKUP_VERSION,
+        created_at: Utc::now().to_rfc3339(),
+        database_bytes: report.database_bytes,
+        database_sha256,
+        artifact_files: report.artifact_files,
+        artifact_bytes: report.artifact_bytes,
+        includes_cache: false,
+        includes_credentials: false,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&manifest)?;
+    bytes.push(b'\n');
+    write_private_atomic(
+        &output.join("manifest.json"),
+        &bytes,
+        false,
+        "storage backup manifest",
+    )?;
+    println!(
+        "Created Rivet backup at {} ({} database bytes, {} artifact files)",
+        output.display(),
+        report.database_bytes,
+        report.artifact_files
+    );
+    println!(
+        "External credential vaults and derived caches are not included; preserve them separately."
+    );
+    Ok(())
+}
+
+fn restore_storage(
+    backup: &Path,
+    target: &Path,
+    replace: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = backup.join("manifest.json");
+    let manifest_metadata = fs::symlink_metadata(&manifest_path)?;
+    if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
+        return Err(format!(
+            "backup manifest must be a regular file: {}",
+            manifest_path.display()
+        )
+        .into());
+    }
+    let manifest: StorageBackupManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    if manifest.format != STORAGE_BACKUP_FORMAT || manifest.version != STORAGE_BACKUP_VERSION {
+        return Err(format!(
+            "unsupported Rivet backup format in {}",
+            manifest_path.display()
+        )
+        .into());
+    }
+    let database_path = backup.join("rivet.db");
+    let database_metadata = fs::symlink_metadata(&database_path)?;
+    if database_metadata.file_type().is_symlink() || !database_metadata.is_file() {
+        return Err(format!(
+            "backup database must be a regular file: {}",
+            database_path.display()
+        )
+        .into());
+    }
+    if database_metadata.len() != manifest.database_bytes {
+        return Err(format!(
+            "backup database size mismatch: expected {}, found {}",
+            manifest.database_bytes,
+            database_metadata.len()
+        )
+        .into());
+    }
+    let actual_database_sha256 = sha256_regular_file(&database_path)?;
+    if actual_database_sha256 != manifest.database_sha256 {
+        return Err(format!(
+            "backup database checksum mismatch: expected {}, found {}",
+            manifest.database_sha256, actual_database_sha256
+        )
+        .into());
+    }
+    let artifact_source = backup.join("artifacts");
+    let (artifact_files, artifact_bytes) = copy_backup_artifacts(&artifact_source, None)?;
+    if artifact_files != manifest.artifact_files || artifact_bytes != manifest.artifact_bytes {
+        return Err(format!(
+            "backup artifact manifest mismatch: expected {} files/{} bytes, found {} files/{} bytes",
+            manifest.artifact_files,
+            manifest.artifact_bytes,
+            artifact_files,
+            artifact_bytes
+        )
+        .into());
+    }
+
+    let target_exists = match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "restore target must not be a symbolic link: {}",
+                target.display()
+            )
+            .into());
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(format!("restore target must be a directory: {}", target.display()).into());
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if target_exists && !replace {
+        return Err(format!(
+            "restore target already exists; pass --replace to move it aside: {}",
+            target.display()
+        )
+        .into());
+    }
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(format!(
+            "restore target parent must be a directory: {}",
+            parent.display()
+        )
+        .into());
+    }
+    let staging = parent.join(format!(".rivet-restore-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&staging)?;
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        fs::copy(&database_path, staging.join("rivet.db"))?;
+        copy_backup_artifacts(&artifact_source, Some(&staging.join("artifacts")))?;
+        let restored = Storage::open(staging.join("rivet.db"))?;
+        restored.health_check()?;
+        drop(restored);
+
+        if target_exists {
+            let target_name = target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("restore target has no valid directory name")?;
+            let previous = parent.join(format!(
+                ".{target_name}.pre-restore-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::rename(target, &previous)?;
+            fs::rename(&staging, target)?;
+            println!("Moved previous data directory to {}", previous.display());
+        } else {
+            fs::rename(&staging, target)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result?;
+    println!("Restored Rivet backup into {}", target.display());
+    println!("External credential vaults and derived caches remain separate from this restore.");
+    Ok(())
+}
+
+fn sha256_regular_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!("expected a regular file: {}", path.display()).into());
+    }
+    let mut file = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn copy_backup_artifacts(
+    source: &Path,
+    destination: Option<&Path>,
+) -> Result<(usize, u64), Box<dyn std::error::Error>> {
+    let source_metadata = match fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) => return Err(error.into()),
+    };
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        return Err(format!("backup artifacts must be a directory: {}", source.display()).into());
+    }
+    let mut file_count = 0_usize;
+    let mut byte_count = 0_u64;
+    for entry in WalkDir::new(source).follow_links(false) {
+        let entry = entry?;
+        let relative = entry.path().strip_prefix(source)?.to_path_buf();
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        validate_archive_path(&relative)?;
+        let file_type = entry.file_type();
+        if file_type.is_symlink() || (!file_type.is_dir() && !file_type.is_file()) {
+            return Err(format!(
+                "backup artifacts contain an unsupported path: {}",
+                relative.display()
+            )
+            .into());
+        }
+        let target = destination.map(|root| root.join(&relative));
+        if file_type.is_dir() {
+            if let Some(target) = target {
+                fs::create_dir_all(target)?;
+            }
+            continue;
+        }
+        let bytes = fs::symlink_metadata(entry.path())?.len();
+        if let Some(target) = target {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(entry.path(), target)?;
+        }
+        file_count = file_count.saturating_add(1);
+        byte_count = byte_count.saturating_add(bytes);
+    }
+    Ok((file_count, byte_count))
 }
 
 fn manage_schedule(
