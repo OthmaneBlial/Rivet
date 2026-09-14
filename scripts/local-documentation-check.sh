@@ -13,6 +13,7 @@ test -s SUPPORT.md
 test -s CODE_OF_CONDUCT.md
 test -s CHANGELOG.md
 test -s .github/pull_request_template.md
+test -s .github/CODEOWNERS
 test -s .github/ISSUE_TEMPLATE/bug_report.md
 test -s .github/ISSUE_TEMPLATE/feature_request.md
 test -s .github/ISSUE_TEMPLATE/config.yml
