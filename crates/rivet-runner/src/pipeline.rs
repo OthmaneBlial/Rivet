@@ -1,10 +1,11 @@
 use crate::{CacheStore, ProcessOutcome, ProcessSpec, run_process};
 use chrono::Utc;
 use rivet_core::{
-    BuildEvent, BuildStatus, ExecutionPlan, ExecutionStage, ExecutionStep, Pipeline, StageStatus,
-    StepStatus,
+    BuildEvent, BuildStatus, ContainerRuntime, ExecutionPlan, ExecutionStage, ExecutionStep,
+    Pipeline, StageStatus, StepStatus,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -23,6 +24,10 @@ pub enum RunnerError {
     WorkingDirectoryOutsideWorkspace(PathBuf),
     #[error("step {step:?} requires a remote agent; local execution was refused")]
     RemoteAgentRequired { step: String },
+    #[error(
+        "container runtime {runtime:?} is unavailable on PATH; Rivet never installs or starts container runtimes"
+    )]
+    ContainerRuntimeUnavailable { runtime: ContainerRuntime },
     #[error("validated execution graph could not make progress")]
     GraphBlocked,
     #[error("stage execution task failed: {0}")]
@@ -402,6 +407,9 @@ async fn execute_step_attempt(
     env.insert("CI".into(), "true".into());
     env.insert("RIVET_BUILD_ID".into(), plan.build_id.to_string());
     env.insert("RIVET_PROJECT_ID".into(), plan.project_id.to_string());
+    if let Some(container) = step.definition.container.as_ref() {
+        ensure_container_runtime(container.runtime)?;
+    }
     let spec = build_process_spec(step, workspace, working_dir, env);
 
     let (output_tx, mut output_rx) = mpsc::channel(256);
@@ -540,6 +548,28 @@ fn build_process_spec(
         working_dir: workspace.to_owned(),
         timeout,
     }
+}
+
+fn ensure_container_runtime(runtime: ContainerRuntime) -> Result<(), RunnerError> {
+    ensure_container_runtime_on_path(runtime, std::env::var_os("PATH").as_deref())
+}
+
+fn ensure_container_runtime_on_path(
+    runtime: ContainerRuntime,
+    path: Option<&OsStr>,
+) -> Result<(), RunnerError> {
+    find_executable_on_path(runtime.executable(), path)
+        .map(|_| ())
+        .ok_or(RunnerError::ContainerRuntimeUnavailable { runtime })
+}
+
+fn find_executable_on_path(executable: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    path.and_then(|path| {
+        std::env::split_paths(path).find_map(|directory| {
+            let candidate = directory.join(executable);
+            candidate.is_file().then_some(candidate)
+        })
+    })
 }
 
 fn mask_line(line: &str, secret_values: &[String]) -> String {
@@ -1187,6 +1217,21 @@ pull = "never"
 
         assert_eq!(spec.program, "podman");
         assert!(spec.args.windows(2).any(|args| args == ["--pull", "never"]));
+    }
+
+    #[test]
+    fn missing_container_runtime_is_rejected_by_path_preflight() {
+        let missing_path = OsStr::new("/rivet/no-container-runtime");
+        assert!(matches!(
+            find_executable_on_path("docker", Some(missing_path)),
+            None
+        ));
+        assert!(matches!(
+            ensure_container_runtime_on_path(ContainerRuntime::Docker, Some(missing_path)),
+            Err(RunnerError::ContainerRuntimeUnavailable {
+                runtime: ContainerRuntime::Docker
+            })
+        ));
     }
 
     #[cfg(unix)]

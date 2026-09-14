@@ -6,7 +6,7 @@ from Jenkins.
 ## Delivery progress
 
 **94% verified** · `███████████████████░`<br>
-Weighted evidence score: **94.92 / 100** · displayed conservatively as the
+Weighted evidence score: **94.96 / 100** · displayed conservatively as the
 whole-number floor<br>
 Measured against the weighted product scope in [ROADMAP.md](ROADMAP.md),
 not against a claim of Jenkins feature parity. The percentage only counts
@@ -779,9 +779,11 @@ Set `runtime = "podman"` to use Podman on a machine without Docker; the default
 is the legacy `docker` executable for existing pipeline files. The declaration
 supports bounded image pull policy, network selection, workspace-relative bind
 volumes, environment forwarding, validated working directories, separated
-arguments, `--init`, signal proxying, and automatic container cleanup. Local
-runtime-shim tests exercise both executable selections and the direct command
-handoff without installing Docker, starting a daemon, or pulling an image. Real
+arguments, `--init`, signal proxying, and automatic container cleanup. Rivet
+checks that the explicitly selected runtime executable exists before spawning
+anything and never installs or starts it. Local runtime-shim tests exercise
+both executable selections and the direct command handoff without installing
+Docker, starting a daemon, or pulling an image. Real
 Docker/Podman daemon behavior, image policy enforcement, and end-to-end artifact
 and cancellation behavior remain unverified on this machine.
 

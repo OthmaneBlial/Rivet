@@ -76,7 +76,7 @@
       "feature": "Explicit OCI container runtime steps",
       "status": "partial",
       "evidence": ["crates/rivet-core/src/pipeline.rs", "crates/rivet-runner/src/pipeline.rs"],
-      "notes": "Container declarations validate an image, select Docker or Podman, and assemble a direct runtime run command with a bounded workspace mount, separated arguments, timeout propagation, and automatic removal; daemon execution, image policy, and end-to-end artifact/cancellation behavior remain unverified locally."
+      "notes": "Container declarations validate an image, select Docker or Podman, fail before spawning when the selected executable is absent, and assemble a direct runtime run command with a bounded workspace mount, separated arguments, timeout propagation, and automatic removal; Rivet never installs or starts a runtime. Daemon execution, image policy, and end-to-end artifact/cancellation behavior remain unverified locally."
     },
     {
       "category": "Jenkinsfile",
